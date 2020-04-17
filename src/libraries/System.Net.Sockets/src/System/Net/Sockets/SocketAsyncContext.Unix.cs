@@ -826,7 +826,7 @@ namespace System.Net.Sockets
             }
 
             // Called on the epoll thread whenever we receive an epoll notification.
-            public void HandleEvent(SocketAsyncContext context)
+            public void HandleEvent(SocketAsyncContext context, List<IThreadPoolWorkItem> toEnqueue)
             {
                 AsyncOperation op;
                 using (Lock())
@@ -866,7 +866,15 @@ namespace System.Net.Sockets
                 }
 
                 // Dispatch the op so we can try to process it.
-                op.Dispatch();
+                var e = op.Event;
+                if (e is null)
+                {
+                    toEnqueue.Add(op);
+                }
+                else
+                {
+                    e.Set();
+                }
             }
 
             internal void ProcessAsyncOperation(TOperation op)
@@ -1946,7 +1954,7 @@ namespace System.Net.Sockets
             return SocketError.IOPending;
         }
 
-        public unsafe void HandleEvents(Interop.Sys.SocketEvents events)
+        public unsafe void HandleEvents(Interop.Sys.SocketEvents events, List<IThreadPoolWorkItem> toEnqueue)
         {
             if ((events & Interop.Sys.SocketEvents.Error) != 0)
             {
@@ -1957,12 +1965,12 @@ namespace System.Net.Sockets
 
             if ((events & Interop.Sys.SocketEvents.Read) != 0)
             {
-                _receiveQueue.HandleEvent(this);
+                _receiveQueue.HandleEvent(this, toEnqueue);
             }
 
             if ((events & Interop.Sys.SocketEvents.Write) != 0)
             {
-                _sendQueue.HandleEvent(this);
+                _sendQueue.HandleEvent(this, toEnqueue);
             }
         }
 

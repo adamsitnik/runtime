@@ -4,6 +4,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -308,6 +309,7 @@ namespace System.Net.Sockets
             try
             {
                 bool shutdown = false;
+                List<IThreadPoolWorkItem> toEnqueue = new List<IThreadPoolWorkItem>(EventBufferCount);
                 while (!shutdown)
                 {
                     int numEvents = EventBufferCount;
@@ -333,10 +335,17 @@ namespace System.Net.Sockets
                             _handleToContextMap.TryGetValue(handle, out SocketAsyncContext? context);
                             if (context != null)
                             {
-                                context.HandleEvents(_buffer[i].Events);
+                                context.HandleEvents(_buffer[i].Events, toEnqueue);
                                 context = null;
                             }
                         }
+                    }
+
+                    if (toEnqueue.Count > 0)
+                    {
+                        ThreadPool.UnsafeQueueUserWorkItem(toEnqueue, preferLocal: false);
+
+                        toEnqueue.Clear();
                     }
                 }
 

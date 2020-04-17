@@ -489,6 +489,30 @@ namespace System.Threading
             EnsureThreadRequested();
         }
 
+        public void Enqueue(List<IThreadPoolWorkItem> callbacks, bool forceGlobal)
+        {
+            ThreadPoolWorkQueueThreadLocals? tl = null;
+            if (!forceGlobal)
+                tl = ThreadPoolWorkQueueThreadLocals.threadLocals;
+
+            if (null != tl)
+            {
+                foreach (var callback in callbacks)
+                {
+                    tl.workStealingQueue.LocalPush(callback);
+                }
+            }
+            else
+            {
+                foreach (var callback in callbacks)
+                {
+                    workItems.Enqueue(callback);
+                }
+            }
+
+            EnsureThreadRequested();
+        }
+
         internal bool LocalFindAndPop(object callback)
         {
             ThreadPoolWorkQueueThreadLocals? tl = ThreadPoolWorkQueueThreadLocals.threadLocals;
@@ -1176,6 +1200,14 @@ namespace System.Threading
             }
 
             UnsafeQueueUserWorkItemInternal(callBack!, preferLocal);
+            return true;
+        }
+
+        public static bool UnsafeQueueUserWorkItem(List<IThreadPoolWorkItem> callBacks, bool preferLocal)
+        {
+            EnsureInitialized();
+
+            ThreadPoolGlobals.workQueue.Enqueue(callBacks, forceGlobal: !preferLocal);
             return true;
         }
 
