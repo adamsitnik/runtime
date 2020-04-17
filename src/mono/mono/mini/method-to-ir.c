@@ -1101,6 +1101,9 @@ type_from_op (MonoCompile *cfg, MonoInst *ins, MonoInst *src1, MonoInst *src2)
 		case STACK_I8:
 			ins->opcode = OP_LCONV_TO_R_UN; 
 			break;
+		case STACK_R4:
+			ins->opcode = OP_RCONV_TO_R8;
+			break;
 		case STACK_R8:
 			ins->opcode = OP_FMOVE;
 			break;
@@ -1367,8 +1370,19 @@ mono_create_rgctx_var (MonoCompile *cfg)
 	if (!cfg->rgctx_var) {
 		cfg->rgctx_var = mono_compile_create_var (cfg, mono_get_int_type (), OP_LOCAL);
 		/* force the var to be stack allocated */
-		cfg->rgctx_var->flags |= MONO_INST_VOLATILE;
+		if (!cfg->llvm_only)
+			cfg->rgctx_var->flags |= MONO_INST_VOLATILE;
 	}
+}
+
+static MonoInst *
+mono_get_mrgctx_var (MonoCompile *cfg)
+{
+	g_assert (cfg->gshared);
+
+	mono_create_rgctx_var (cfg);
+
+	return cfg->rgctx_var;
 }
 
 static MonoInst *
@@ -1376,6 +1390,7 @@ mono_get_vtable_var (MonoCompile *cfg)
 {
 	g_assert (cfg->gshared);
 
+	/* The mrgctx and the vtable are stored in the same var */
 	mono_create_rgctx_var (cfg);
 
 	return cfg->rgctx_var;
@@ -2467,17 +2482,27 @@ emit_get_rgctx (MonoCompile *cfg, int context_used)
 			g_assert (method->is_inflated && mono_method_get_context (method)->method_inst);
 		}
 
-		mrgctx_loc = mono_get_vtable_var (cfg);
-		EMIT_NEW_TEMPLOAD (cfg, mrgctx_var, mrgctx_loc->inst_c0);
-
+		if (cfg->llvm_only) {
+			mrgctx_var = mono_get_mrgctx_var (cfg);
+		} else {
+			/* Volatile */
+			mrgctx_loc = mono_get_mrgctx_var (cfg);
+			g_assert (mrgctx_loc->flags & MONO_INST_VOLATILE);
+			EMIT_NEW_TEMPLOAD (cfg, mrgctx_var, mrgctx_loc->inst_c0);
+		}
 		return mrgctx_var;
 	} else if (method->flags & METHOD_ATTRIBUTE_STATIC || m_class_is_valuetype (method->klass)) {
 		MonoInst *vtable_loc, *vtable_var;
 
 		g_assert (!this_ins);
 
-		vtable_loc = mono_get_vtable_var (cfg);
-		EMIT_NEW_TEMPLOAD (cfg, vtable_var, vtable_loc->inst_c0);
+		if (cfg->llvm_only) {
+			vtable_var = mono_get_vtable_var (cfg);
+		} else {
+			vtable_loc = mono_get_vtable_var (cfg);
+			g_assert (vtable_loc->flags & MONO_INST_VOLATILE);
+			EMIT_NEW_TEMPLOAD (cfg, vtable_var, vtable_loc->inst_c0);
+		}
 
 		if (method->is_inflated && mono_method_get_context (method)->method_inst) {
 			MonoInst *mrgctx_var = vtable_var;
@@ -8408,8 +8433,13 @@ calli_end:
 		case MONO_CEE_CONV_OVF_I1:
 		case MONO_CEE_CONV_OVF_I2:
 		case MONO_CEE_CONV_OVF_I:
-		case MONO_CEE_CONV_OVF_U:
+		case MONO_CEE_CONV_OVF_I1_UN:
+		case MONO_CEE_CONV_OVF_I2_UN:
+		case MONO_CEE_CONV_OVF_I4_UN:
+		case MONO_CEE_CONV_OVF_I8_UN:
+		case MONO_CEE_CONV_OVF_I_UN:
 			if (sp [-1]->type == STACK_R8 || sp [-1]->type == STACK_R4) {
+				/* floats are always signed, _UN has no effect */
 				ADD_UNOP (CEE_CONV_OVF_I8);
 				ADD_UNOP (il_op);
 			} else {
@@ -8419,23 +8449,20 @@ calli_end:
 		case MONO_CEE_CONV_OVF_U1:
 		case MONO_CEE_CONV_OVF_U2:
 		case MONO_CEE_CONV_OVF_U4:
+		case MONO_CEE_CONV_OVF_U:
+		case MONO_CEE_CONV_OVF_U1_UN:
+		case MONO_CEE_CONV_OVF_U2_UN:
+		case MONO_CEE_CONV_OVF_U4_UN:
+		case MONO_CEE_CONV_OVF_U8_UN:
+		case MONO_CEE_CONV_OVF_U_UN:
 			if (sp [-1]->type == STACK_R8 || sp [-1]->type == STACK_R4) {
+				/* floats are always signed, _UN has no effect */
 				ADD_UNOP (CEE_CONV_OVF_U8);
 				ADD_UNOP (il_op);
 			} else {
 				ADD_UNOP (il_op);
 			}
 			break;
-		case MONO_CEE_CONV_OVF_I1_UN:
-		case MONO_CEE_CONV_OVF_I2_UN:
-		case MONO_CEE_CONV_OVF_I4_UN:
-		case MONO_CEE_CONV_OVF_I8_UN:
-		case MONO_CEE_CONV_OVF_U1_UN:
-		case MONO_CEE_CONV_OVF_U2_UN:
-		case MONO_CEE_CONV_OVF_U4_UN:
-		case MONO_CEE_CONV_OVF_U8_UN:
-		case MONO_CEE_CONV_OVF_I_UN:
-		case MONO_CEE_CONV_OVF_U_UN:
 		case MONO_CEE_CONV_U2:
 		case MONO_CEE_CONV_U1:
 		case MONO_CEE_CONV_I:
@@ -8700,19 +8727,29 @@ calli_end:
 			if (mini_class_is_system_array (cmethod->klass)) {
 				*sp = emit_get_rgctx_method (cfg, context_used,
 											 cmethod, MONO_RGCTX_INFO_METHOD);
-				/* Optimize the common cases */
-				MonoJitICallId function = MONO_JIT_ICALL_ZeroIsReserved;;
+				MonoJitICallId function = MONO_JIT_ICALL_ZeroIsReserved;
 				int n = fsig->param_count;
-				switch (n) {
-				case 1: function = MONO_JIT_ICALL_mono_array_new_1;
-					break;
-				case 2: function = MONO_JIT_ICALL_mono_array_new_2;
-					break;
-				case 3: function = MONO_JIT_ICALL_mono_array_new_3;
-					break;
-				case 4: function = MONO_JIT_ICALL_mono_array_new_4;
-					break;
-				default:
+				/* Optimize the common cases, use ctor using length for each rank (no lbound). */
+				if (n == m_class_get_rank (cmethod->klass)) {
+					switch (n) {
+					case 1: function = MONO_JIT_ICALL_mono_array_new_1;
+						break;
+					case 2: function = MONO_JIT_ICALL_mono_array_new_2;
+						break;
+					case 3: function = MONO_JIT_ICALL_mono_array_new_3;
+						break;
+					case 4: function = MONO_JIT_ICALL_mono_array_new_4;
+						break;
+					default:
+						break;
+					}
+				}
+
+				/* Instancing jagged arrays should not end up here since ctor (int32, int32) for an array with rank 1 represent lenght and lbound. */
+				g_assert (!(m_class_get_rank (cmethod->klass) == 1 && fsig->param_count == 2 && m_class_get_rank (m_class_get_element_class (cmethod->klass))));
+
+				/* Regular case, rank > 4 or legnth, lbound specified per rank. */
+				if (function == MONO_JIT_ICALL_ZeroIsReserved) {
 					// FIXME Maximum value of param_count? Realistically 64. Fits in imm?
 					if  (!array_new_localalloc_ins) {
 						MONO_INST_NEW (cfg, array_new_localalloc_ins, OP_LOCALLOC_IMM);
@@ -8733,7 +8770,6 @@ calli_end:
 					sp [2] = ins;
 					// FIXME Adjust sp by n - 3? Attempts failed.
 					function = MONO_JIT_ICALL_mono_array_new_n_icall;
-					break;
 				}
 				alloc = mono_emit_jit_icall_id (cfg, function, sp);
 			} else if (cmethod->string_ctor) {
@@ -9262,7 +9298,10 @@ calli_end:
 				klass = field->parent;
 			}
 			else {
+				klass = NULL;
 				field = mono_field_from_token_checked (image, token, &klass, generic_context, cfg->error);
+				if (!field)
+					CHECK_TYPELOAD (klass);
 				CHECK_CFG_ERROR;
 			}
 			if (!dont_verify && !cfg->skip_visibility && !mono_method_can_access_field (method, field))
