@@ -424,7 +424,7 @@ namespace System.Threading
             return ThreadPoolWorkQueueThreadLocals.threadLocals = new ThreadPoolWorkQueueThreadLocals(this);
         }
 
-        internal void EnsureThreadRequested()
+        internal bool EnsureThreadRequested()
         {
             //
             // If we have not yet requested #procs threads, then request a new thread.
@@ -439,10 +439,12 @@ namespace System.Threading
                 if (prev == count)
                 {
                     ThreadPool.RequestWorkerThread();
-                    break;
+                    return true;
                 }
                 count = prev;
             }
+
+            return false;
         }
 
         internal void MarkThreadRequestSatisfied()
@@ -489,7 +491,7 @@ namespace System.Threading
             EnsureThreadRequested();
         }
 
-        public void Enqueue(List<IThreadPoolWorkItem> callbacks, bool forceGlobal)
+        public bool Enqueue(List<IThreadPoolWorkItem> callbacks, bool forceGlobal)
         {
             ThreadPoolWorkQueueThreadLocals? tl = null;
             if (!forceGlobal)
@@ -510,7 +512,7 @@ namespace System.Threading
                 }
             }
 
-            EnsureThreadRequested();
+            return EnsureThreadRequested();
         }
 
         internal bool LocalFindAndPop(object callback)
@@ -1207,8 +1209,7 @@ namespace System.Threading
         {
             EnsureInitialized();
 
-            ThreadPoolGlobals.workQueue.Enqueue(callBacks, forceGlobal: !preferLocal);
-            return true;
+            return ThreadPoolGlobals.workQueue.Enqueue(callBacks, forceGlobal: !preferLocal);
         }
 
         internal static void UnsafeQueueUserWorkItemInternal(object callBack, bool preferLocal)
