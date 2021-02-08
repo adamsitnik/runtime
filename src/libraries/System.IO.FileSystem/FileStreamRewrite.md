@@ -27,7 +27,7 @@
       - [System.IO.FileSystem tests failing on FreeBSD](#systemiofilesystem-tests-failing-on-freebsd)
       - [SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle](#setcreationtime--setlastaccesstime--setlastwritetime-should-not-open-a-new-stream-to-obtain-a-safefilehandle)
       - [Support SeBackupPrivilege in System.IO.Filestream API](#support-sebackupprivilege-in-systemiofilestream-api)
-  * [Plan](#plan)
+  * [Priorities](#priorities)
     + [Must have](#must-have)
     + [Great to have](#great-to-have)
     + [Nice to have](#nice-to-have)
@@ -45,7 +45,7 @@ And answer the following questions:
 * In what scenarios our users use `FileStream.Position` and `Seek`?
 * Are there any popular types that derive from `FileStream`? What methods do they override an why?
 * What users complain about the most? Could be a StackOverflow search.
-* Which `FileStream` methods pop up in Azure Profiler?
+* Which `FileStream` methods are hot in Azure Profiler?
 
 ### Cooperate
 
@@ -407,7 +407,7 @@ https://github.com/dotnet/runtime/issues/27086
 TODO: It needs further triage, but from a quick look it seems that the request is to expose `FILE_FLAG_BACKUP_SEMANTICS ` on Windows. We should find out if Unix offers a similar feature. We should avoid OS-specific features in cross platform .NET so if it's not possible on Unix, then just explain and close it.
 
 
-## Plan
+## Priorities
 
 Suggested work items (grouped and ordered by context, should be independent from each other):
 
@@ -423,40 +423,43 @@ Suggested work items (grouped and ordered by context, should be independent from
   * #27643 FileStream.FlushAsync ends up doing synchronous writes
 * File size preallocation:  
   * #29666 File allocation inconsistency between Windows and Linux and sparse allocations (**possible breaking changes**)
-  * #45946 FileStream file preallocation performance (new API)
+  * #45946 FileStream file preallocation performance (**new API**)
   * #23196 File.WriteAllTextAsync performance issues (using the API from above and possibly tuning asyn Unix implementation)
     * add more `File` microbenchmarks (`File.ReadAll*`, `File.WriteAll*`, `File.CopyTo*`, `File.Open`)
 * Memory allocations
-  * #15088 Avoid unnecessary allocations when using FileStream
+  * #15088 Avoid unnecessary allocations when using FileStream (**new API**)
   * Memory Profiling
   * Stephen `IValueTaskSource` suggestion
 * **Validation of new implementation with Windows Performance Team**
 * **Blog post**
 * **Best practices doc**
+  * check all existing code examples, make sure we recommend the best solutions
 
 ### Great to have
 
 * Opening FileStream in async way (user experience improvement):
    * #25314 Do we need `File.OpenAsync`? Do we have a bug or the current behaviour is expected?
-   * #24698 Add new APIs that allow for opening file for async IO 
+   * #24698 Add new APIs that allow for opening file for async IO (**new API**)
+     * we should start the API review process as soon as possible
+* Trully asynchronous File IO on Windows:
+  * #25074 micro optimization suggestion
+
+### Nice to have
+
 * Cancellation support
   * #1606 "Fully support cancellation on all FileStream operations that take CancellationToken"
   * #24052 "Linux: unable to cancel async read of /dev/input/input0 file" 
   * #28583 "proc.StandardOutput.ReadAsync doesn't cancel properly if no output is sent from the process"
-
-### Nice to have
-
 * Trully asynchronous File IO on Windows:
-  * #25074 micro optimization suggestion
   * #24847 feature request (Async File IO APIs mimicking Win32 OVERLAPPED)
 * #27408 NoBuffering:
   * very likely to get rejected, but we need to understand customer needs first
   * dependent on #33244 and #27146 which might add APIs for aligned memory allocation
-* Locking:
-  * #24432 Platform-dependent FileStream permissions behavior
-  * #26726 System.IO.FileSystem tests failing on FreeBSD
 
 ### Future
 
 * #20234 New APIs for SetCreationTime, SetLastAccessTime, SetLastWriteTime etc
 * #27086 Support SeBackupPrivilege in System.IO.Filestream API
+* * Locking:
+  * #24432 Platform-dependent FileStream permissions behavior
+  * #26726 System.IO.FileSystem tests failing on FreeBSD
