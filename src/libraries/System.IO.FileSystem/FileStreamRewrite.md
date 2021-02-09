@@ -1,3 +1,5 @@
+# FileStream 6.0
+
 - [Things to do before starting the rewrite](#things-to-do-before-starting-the-rewrite)
   * [Gather API usage statistics](#gather-api-usage-statistics)
   * [Cooperate](#cooperate)
