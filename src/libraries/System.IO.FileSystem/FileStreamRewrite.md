@@ -460,6 +460,47 @@ Suggested work items (grouped and ordered by context, should be independent from
 
 * #20234 New APIs for SetCreationTime, SetLastAccessTime, SetLastWriteTime etc
 * #27086 Support SeBackupPrivilege in System.IO.Filestream API
-* * Locking:
+* Locking:
   * #24432 Platform-dependent FileStream permissions behavior
   * #26726 System.IO.FileSystem tests failing on FreeBSD
+
+## Planning
+
+Work items:
+
+* [ ] API statistics
+  * [ ] Azure Profiler
+  * [ ] nuget.org
+  * [ ] GitHub
+  * [ ] StackOverflow
+* [ ] Cooperation
+  * [ ] Windows Performance Team
+  * [ ] Benchmarks from Partners
+    * [ ] Reach Out
+    * [ ] Review PRs
+* [ ] Introducing new abstraction layer (#47128)
+  * [ ] Review PR
+  * [ ] Address PR feedback
+* [ ] Async File IO on Windows
+  * [ ] #16354 (Seek)
+  * [ ] #16341 async reads are sync
+  * [ ] #27047 ReadAsync is slow
+  * [ ] #25905 WriteAsync calls blocking resize
+  * [ ] #27643 FlushAsync calls sync writes
+* [ ] File size preallocation
+  * [ ] #29666 File allocation inconsistency
+  * [ ] #45946 File preallocation performance
+  * [ ] #23196 File.WriteAllTextAsync (Linux)
+* [ ] Memory Allocations
+  * [ ] Memory Profiling
+    * [ ] Read* code-path (top X based on stats)
+    * [ ] Write* code-path (top X based on stats)
+    * [ ] Other code paths (top X based on stats)
+  * [ ] #15088 Avoid unnecessary allocations
+  * [ ] Stephen `IValueTaskSource` suggestion
+
+Dependencies:
+* Getting API statistics and Cooperation are independent from actual coding.
+* Async File IO on Windows is dependent on the introduction of new abstraction layer (#47128). Each of it's work items are listed above in the dependency order
+* File size preallocation should be independent from `Strategy`
+* Memory Allocations should also be independent from `Strategy`, but it would be better to start the analysis after #47128 is merged.
