@@ -57,7 +57,7 @@ And answer the following questions:
 
 ### Creating FileStream
 
-#### Add new APIs that allow for opening file for async IO 
+<h1 id="24698">Add new APIs that allow for opening file for async IO </h1>
 
 https://github.com/dotnet/runtime/issues/24698
 
@@ -308,7 +308,7 @@ https://github.com/dotnet/runtime/issues/25314
 
 TODO: It needs further triage. From a quick look it seems that `FileStream` ctor is blocking for inaccessible network files. What is the expected behaviour?? Would adding an `FileStream.OpenAsync` method help?
 
-We should investigate it before working on #24698;
+We should investigate it before working on [#24698](#24698)
 
 #### FileStream file preallocation performance
 
@@ -439,7 +439,7 @@ Suggested work items (grouped and ordered by context, should be independent from
 
 * Opening FileStream in async way (user experience improvement):
    * #25314 Do we need `File.OpenAsync`? Do we have a bug or the current behaviour is expected?
-   * #24698 Add new APIs that allow for opening file for async IO (**new API**)
+   * [#24698](#24698) Add new APIs that allow for opening file for async IO (**new API**)
      * we should start the API review process as soon as possible
 * Trully asynchronous File IO on Windows:
   * #25074 micro optimization suggestion
