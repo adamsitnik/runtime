@@ -5,27 +5,27 @@
   * [Cooperate](#cooperate)
 - [Existing issues](#existing-issues)
   * [Creating FileStream](#creating-filestream)
-    + [Add new APIs that allow for opening file for async IO](#add-new-apis-that-allow-for-opening-file-for-async-io)
-    + [Avoid unnecessary allocations when using FileStream](#avoid-unnecessary-allocations-when-using-filestream)
-    + [Expose FileOptions.NoBuffering flag and support O_DIRECT on Linux](#expose-fileoptionsnobuffering-flag-and-support-o-direct-on-linux)
+    + [Add new APIs that allow for opening file for async IO](#24698)
+    + [Avoid unnecessary allocations when using FileStream](#15088)
+    + [Expose FileOptions.NoBuffering flag and support O_DIRECT on Linux](#27408)
   * [Async IO](#async-io)
-    + [Win32 FileStream will issue a seek on every ReadAsync call](#win32-filestream-will-issue-a-seek-on-every-readasync-call)
-    + [Win32 FileStream turns async reads into sync reads](#win32-filestream-turns-async-reads-into-sync-reads)
-    + [Asynchronous random file access with FileStream Read vs ReadAsync in a loop / parallel (ReadAsync is slow)](#asynchronous-random-file-access-with-filestream-read-vs-readasync-in-a-loop---parallel--readasync-is-slow-)
-    + [FileStream.Windows useAsync WriteAsync calls blocking apis](#filestreamwindows-useasync-writeasync-calls-blocking-apis)
-    + [FileStream.FlushAsync ends up doing synchronous writes](#filestreamflushasync-ends-up-doing-synchronous-writes)
-    + [Use PreallocatedOverlapped when internal FileStream buffer isn't being used on Windows](#use-preallocatedoverlapped-when-internal-filestream-buffer-isn-t-being-used-on-windows)
-    + [Async File IO APIs mimicking Win32 OVERLAPPED](#async-file-io-apis-mimicking-win32-overlapped)
-    + [File.ReadAllTextAsync not behaving asynchronously when called on inaccessible network files](#filereadalltextasync-not-behaving-asynchronously-when-called-on-inaccessible-network-files)
-    + [FileStream file preallocation performance](#filestream-file-preallocation-performance)
-    + [File.WriteAllTextAsync performance issues](#filewritealltextasync-performance-issues)
+    + [Win32 FileStream will issue a seek on every ReadAsync call](#16354)
+    + [Win32 FileStream turns async reads into sync reads](#16341)
+    + [Asynchronous random file access with FileStream Read vs ReadAsync in a loop / parallel (ReadAsync is slow)](#27047)
+    + [FileStream.Windows useAsync WriteAsync calls blocking apis](#25905)
+    + [FileStream.FlushAsync ends up doing synchronous writes](#27643)
+    + [Use PreallocatedOverlapped when internal FileStream buffer isn't being used on Windows](#25074)
+    + [Async File IO APIs mimicking Win32 OVERLAPPED](#24847)
+    + [File.ReadAllTextAsync not behaving asynchronously when called on inaccessible network files](#25314)
+    + [FileStream file preallocation performance](#45946)
+    + [File.WriteAllTextAsync performance issues](#23196)
     + [Cancellation support](#cancellation-support)
   * [Other APIs](#other-apis)
-    + [File allocation inconsistency between Windows and Linux and sparse allocations](#file-allocation-inconsistency-between-windows-and-linux-and-sparse-allocations)
-    + [Platform-dependent FileStream permissions behavior](#platform-dependent-filestream-permissions-behavior)
-    + [System.IO.FileSystem tests failing on FreeBSD](#systemiofilesystem-tests-failing-on-freebsd)
-    + [SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle](#setcreationtime--setlastaccesstime--setlastwritetime-should-not-open-a-new-stream-to-obtain-a-safefilehandle)
-    + [Support SeBackupPrivilege in System.IO.Filestream API](#support-sebackupprivilege-in-systemiofilestream-api)
+    + [File allocation inconsistency between Windows and Linux and sparse allocations](#29666)
+    + [Platform-dependent FileStream permissions behavior](#24432)
+    + [System.IO.FileSystem tests failing on FreeBSD](#26726)
+    + [SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle](#20234)
+    + [Support SeBackupPrivilege in System.IO.Filestream API](#27086)
 - [Priorities](#priorities)
   * [Must have](#must-have)
   * [Great to have](#great-to-have)
@@ -102,9 +102,9 @@ public sealed partial class FileInfo : System.IO.FileSystemInfo
 
 Alternative solution: add static methods with `Async` suffix like `File.OpenAsync(path)`. This would require more work and we don't have async `FileStream` ctors as of today.
 
-We should investigate #25314 first to ensure that we really don't need `OpenAsync`.
+We should investigate [#25314](#25314) first to ensure that we really don't need `OpenAsync`.
 
-#### Avoid unnecessary allocations when using FileStream
+<h1 id="15088">Avoid unnecessary allocations when using FileStream</h1>
 
 https://github.com/dotnet/runtime/issues/15088
 
@@ -139,7 +139,7 @@ Possible solutions:
 
 It can be independent from rewrite as long as we don't decide to remove all buffering logic from strategies and wrap Strategy with `BufferedStream`. This could eliminate a LOT of code duplication.
 
-#### Expose FileOptions.NoBuffering flag and support O_DIRECT on Linux
+<h1 id="27408">Expose FileOptions.NoBuffering flag and support O_DIRECT on Linux</h1>
 
 https://github.com/dotnet/runtime/issues/27408
 
@@ -181,7 +181,7 @@ Proposal: Explain the limitations and ask for a good justification (what problem
 
 ### Async IO
 
-#### Win32 FileStream will issue a seek on every ReadAsync call
+<h1 id="16354">Win32 FileStream will issue a seek on every ReadAsync call</h1>
 
 https://github.com/dotnet/runtime/issues/16354
 
@@ -205,9 +205,9 @@ To make things worse, the check can be performed twice for every `AsyncRead`. If
 
 For `ReadAsync` we should just follow Windows best practices, but ensure that the [comment which explains why it was added in the first place](https://github.com/dotnet/runtime/blob/4a8cddb5eec16f546407c85fd1cee9d2c1352041/src/libraries/System.Private.CoreLib/src/System/IO/FileStream.Windows.cs#L879-L883) is **well understood** and we are not missing any edge case scenario support.
 
-When it comes to checks caused by `_exposedHandle` set to true, we can either just remove the checks (breaking change) or use syscalls that accept the offset and don't modify it for others (`pread` and `pwrite` on Linux). This would be also atomic (someone can perform an offset manipulation between seek and read or write). It would also allow for exposing a public method that accepts and offset (see #24847).
+When it comes to checks caused by `_exposedHandle` set to true, we can either just remove the checks (breaking change) or use syscalls that accept the offset and don't modify it for others (`pread` and `pwrite` on Linux). This would be also atomic (someone can perform an offset manipulation between seek and read or write). It would also allow for exposing a public method that accepts and offset (see [#24847](#24847)).
 
-#### Win32 FileStream turns async reads into sync reads
+<h1 id="16341">Win32 FileStream turns async reads into sync reads</h1>
 
 https://github.com/dotnet/runtime/issues/16341
 
@@ -230,23 +230,23 @@ FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.N
 await fs.ReadAsync(userBuffer, 0, userBuffer.Length); // performs the blocking call to fill the internal buffer
 ```
 
-Dependent on #16354. We could most probably fix it by ALWAYS using `NativeOverlapped`, even for synchronous IO:
+Dependent on [#16354](#16354). We could most probably fix it by ALWAYS using `NativeOverlapped`, even for synchronous IO:
 
 > The old DOS SetFilePointer API is an anachronism. One should specify the file offset in the overlapped structure even for synchronous I/O. It should never be necessary to resort to the hack of having private file handles for each thread.
 
-#### Asynchronous random file access with FileStream Read vs ReadAsync in a loop / parallel (ReadAsync is slow)
+<h1 id="27047">Asynchronous random file access with FileStream Read vs ReadAsync in a loop / parallel (ReadAsync is slow)</h1>
 
 https://github.com/dotnet/runtime/issues/27047
 
 Reading entire file with `ReadAsync` is few times slower compared to `Read`.
 
-It's very likely caused by an additional `Seek` from #16354. The blocking call from #16341 is also involved as the [StackOverflow question](https://stackoverflow.com/q/51560443/5852046) allocates user buffer of a size smaller that default `FileStream` buffer (1000). 
+It's very likely caused by an additional `Seek` from [#16354](#16354). The blocking call from [#16341](#16341) is also involved as the [StackOverflow question](https://stackoverflow.com/q/51560443/5852046) allocates user buffer of a size smaller that default `FileStream` buffer (1000). 
 
-#16354 should be addressed first, then #16341 and then the repro should be profiled and fixed if there is still a gap.
+[#16354](#16354) should be addressed first, then [#16341](#16341) and then the repro should be profiled and fixed if there is still a gap.
 
-Dependent on #16354 and #16341.
+Dependent on [#16354](#16354) and [#16341](#16341).
 
-#### FileStream.Windows useAsync WriteAsync calls blocking apis
+<h1 id="25905">FileStream.Windows useAsync WriteAsync calls blocking apis</h1>
 
 https://github.com/dotnet/runtime/issues/25905
 
@@ -278,9 +278,9 @@ Important if we decide to use `OVERLAPPED`:
 
 >  If lpOverlapped is not NULL, the write operation starts at the offset that is specified in the OVERLAPPED structure and WriteFile does not return until the write operation is complete. The system updates the OVERLAPPED Internal and InternalHigh fields before WriteFile returns.
 
-Can be dependent on #16354 if we decide that we should use `OVERLAPPED` everywhere.
+Can be dependent on [#16354](#16354) if we decide that we should use `OVERLAPPED` everywhere.
 
-#### FileStream.FlushAsync ends up doing synchronous writes
+<h1 id="27643">FileStream.FlushAsync ends up doing synchronous writes</h1>
 
 https://github.com/dotnet/runtime/issues/27643
 
@@ -288,21 +288,21 @@ https://github.com/dotnet/runtime/issues/27643
 
 If the internal write buffer is not empty, `FlushAsync` writes it do disk in synchronous way.
 
-#### Use PreallocatedOverlapped when internal FileStream buffer isn't being used on Windows
+<h1 id="25074">Use PreallocatedOverlapped when internal FileStream buffer isn't being used on Windows</h1>
 
 https://github.com/dotnet/runtime/issues/25074
 
 Micro optimization idea, needs profiling and better understanding of the code.
 
-#### Async File IO APIs mimicking Win32 OVERLAPPED
+<h1 id="24847">Async File IO APIs mimicking Win32 OVERLAPPED</h1>
 
 https://github.com/dotnet/runtime/issues/24847
 
 It's basically a request for extending `FileStream` API with methods that accept a file offset.
 
-IMO if we fix #16354, #16341, #27047 and #25905 by using `OVERLAPPED` for both sync and async IO on Windows it should not be hard to implement. On Unix we could use `pread` and `pwrtie` and also give the OS a hint about random access.
+IMO if we fix [#16354](#16354), [#16341](#16341), [#27047](#27047) and [#25905](#25905) by using `OVERLAPPED` for both sync and async IO on Windows it should not be hard to implement. On Unix we could use `pread` and `pwrtie` and also give the OS a hint about random access.
 
-#### File.ReadAllTextAsync not behaving asynchronously when called on inaccessible network files
+<h1 id="25314">File.ReadAllTextAsync not behaving asynchronously when called on inaccessible network files</h1>
 
 https://github.com/dotnet/runtime/issues/25314
 
@@ -310,15 +310,15 @@ TODO: It needs further triage. From a quick look it seems that `FileStream` ctor
 
 We should investigate it before working on [#24698](#24698)
 
-#### FileStream file preallocation performance
+<h1 id="45946">FileStream file preallocation performance</h1>
 
 https://github.com/dotnet/runtime/issues/45946
 
 We don't offer a possibility to create a file with a predefined size (with a single call). We should expose a `FileStream` `ctor` and `File.Create` overloads that allows for that.
 
-When we do that, we should ensure that all our methods that know the size up-front (`File.WriteAllText*`, `File.CopyTo*`) are using these overloads and taking advantage of that. This will allow us to avoid #25905 (expensive file expanding) in framework code.
+When we do that, we should ensure that all our methods that know the size up-front (`File.WriteAllText*`, `File.CopyTo*`) are using these overloads and taking advantage of that. This will allow us to avoid [#25905](#25905) (expensive file expanding) in framework code.
 
-#### File.WriteAllTextAsync performance issues
+<h1 id="23196">File.WriteAllTextAsync performance issues</h1>
 
 https://github.com/dotnet/runtime/issues/23196
 
@@ -326,11 +326,11 @@ On Linux, `File.WriteAllTextAsync` is few times slower than `File.WriteAllText`:
 
 * It's most probably caused by the fact that on Unix, we just perform sync IO on ThreadPool and pretend it to by async. This adds overhead, but we don't know where exactly. We should minimize it.
 * The [buffer](https://github.com/dotnet/runtime/blob/3d9bef939ad4edb0aff6cca1c0bcb0e6e7eb3d39/src/libraries/System.IO.FileSystem/src/System/IO/File.cs#L979) used by the method is small (4096 bytes) and it causes a LOT of syscalls and also multiplies the "async" overhead. 
-* We should take advantage of knowing the size up-front and specify it when creating the file (#45946).
+* We should take advantage of knowing the size up-front and specify it when creating the file ([#45946](#45946)).
 
 TODO: Everyone has been guessing so far, we need a proper profiling and investigation
 
-It's independent from `Windows` work items, would be good to address #45946 first.
+It's independent from `Windows` work items, would be good to address [#45946](#45946) first.
 
 #### Cancellation support
 
@@ -355,7 +355,7 @@ This would be possible with `Strategies` because we could dynamically detect Lin
 
 ### Other APIs
 
-#### File allocation inconsistency between Windows and Linux and sparse allocations
+<h1 id="29666">File allocation inconsistency between Windows and Linux and sparse allocations</h1>
 
 https://github.com/dotnet/runtime/issues/29666
 
@@ -376,13 +376,13 @@ Algining the behaviours would be a breaking change, which is why we might consid
 
 TODO: would it possibly help to write a faster `File.CopyTo` for Unix OSes?
 
-#### Platform-dependent FileStream permissions behavior
+<h1 id="24432">Platform-dependent FileStream permissions behavior</h1>
 
 https://github.com/dotnet/runtime/issues/24432
 
 TODO: It needs further triage, but from a quick look it seems that we could do a better job when locking a file.
 
-#### System.IO.FileSystem tests failing on FreeBSD
+<h1 id="26726">System.IO.FileSystem tests failing on FreeBSD</h1>
 
 https://github.com/dotnet/runtime/issues/26726
 
@@ -390,7 +390,7 @@ TODO: It needs further triage, but from a quick look it seems that similarly to 
 
 Should be easy to fix (add a throw for FreeBSD like we do for OSX) or just disable the test on FreeBSD (like we do with OSX), independent from rewrite.
 
-#### SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle
+<h1 id="20234">SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle</h1>
 
 https://github.com/dotnet/runtime/issues/20234
 
@@ -400,12 +400,11 @@ TODO: verify if the proposed API could be implemented without setting `_exposedH
 
 Should be easy to implement, independent from rewrite but rather low priority.
 
-#### Support SeBackupPrivilege in System.IO.Filestream API
+<h1 id="27086">Support SeBackupPrivilege in System.IO.Filestream API</h1>
 
 https://github.com/dotnet/runtime/issues/27086
 
 TODO: It needs further triage, but from a quick look it seems that the request is to expose `FILE_FLAG_BACKUP_SEMANTICS ` on Windows. We should find out if Unix offers a similar feature. We should avoid OS-specific features in cross platform .NET so if it's not possible on Unix, then just explain and close it.
-
 
 ## Priorities
 
@@ -416,18 +415,18 @@ Suggested work items (grouped and ordered by context, should be independent from
 * Gather API usage statistics and get a good understanding of how `FileStream` is used by our customers
 * Introduce new abstraction layer and choose file strategy at runtime
 * Trully asynchronous File IO on Windows:
-  * #16354 Win32 FileStream will issue a seek on every ReadAsync call
-  * #16341 Win32 FileStream turns async reads into sync reads
-  * #27047 ReadAsync is slow: #16354 and #16341 and some additional profiling
-  * #25905 FileStream.Windows useAsync WriteAsync calls blocking apis
-  * #27643 FileStream.FlushAsync ends up doing synchronous writes
+  * [#16354](#16354) Win32 FileStream will issue a seek on every ReadAsync call
+  * [#16341](#16341) Win32 FileStream turns async reads into sync reads
+  * [#27047](#27047) ReadAsync is slow: [#16354](#16354) and [#16341](#16341) and some additional profiling
+  * [#25905](#25905) FileStream.Windows useAsync WriteAsync calls blocking apis
+  * [#27643](#27643) FileStream.FlushAsync ends up doing synchronous writes
 * File size preallocation:  
-  * #29666 File allocation inconsistency between Windows and Linux and sparse allocations (**possible breaking changes**)
-  * #45946 FileStream file preallocation performance (**new API**)
-  * #23196 File.WriteAllTextAsync performance issues (using the API from above and possibly tuning asyn Unix implementation)
+  * [#29666](#29666) File allocation inconsistency between Windows and Linux and sparse allocations (**possible breaking changes**)
+  * [#45946](#45946) FileStream file preallocation performance (**new API**)
+  * [#23196](#23196) File.WriteAllTextAsync performance issues (using the API from above and possibly tuning asyn Unix implementation)
     * add more `File` microbenchmarks (`File.ReadAll*`, `File.WriteAll*`, `File.CopyTo*`, `File.Open`)
 * Memory allocations
-  * #15088 Avoid unnecessary allocations when using FileStream (**new API**)
+  * [#15088](#15088) Avoid unnecessary allocations when using FileStream (**new API**)
   * Memory Profiling
   * Stephen `IValueTaskSource` suggestion
 * **Validation of new implementation with Windows Performance Team**
@@ -438,20 +437,20 @@ Suggested work items (grouped and ordered by context, should be independent from
 ### Great to have
 
 * Opening FileStream in async way (user experience improvement):
-   * #25314 Do we need `File.OpenAsync`? Do we have a bug or the current behaviour is expected?
+   * [#25314](#25314) Do we need `File.OpenAsync`? Do we have a bug or the current behaviour is expected?
    * [#24698](#24698) Add new APIs that allow for opening file for async IO (**new API**)
      * we should start the API review process as soon as possible
 * Trully asynchronous File IO on Windows:
-  * #25074 micro optimization suggestion
+  * [#25074](#25074) micro optimization suggestion
 
 ### Nice to have
 
 * Cancellation support
-  * #1606 "Fully support cancellation on all FileStream operations that take CancellationToken"
-  * #24052 "Linux: unable to cancel async read of /dev/input/input0 file" 
-  * #28583 "proc.StandardOutput.ReadAsync doesn't cancel properly if no output is sent from the process"
+  * [#1606](#1606) "Fully support cancellation on all FileStream operations that take CancellationToken"
+  * [#24052](#24052) "Linux: unable to cancel async read of /dev/input/input0 file" 
+  * [#28583](#28583) "proc.StandardOutput.ReadAsync doesn't cancel properly if no output is sent from the process"
 * Trully asynchronous File IO on Windows:
-  * #24847 feature request (Async File IO APIs mimicking Win32 OVERLAPPED)
+  * [#24847](#24847) feature request (Async File IO APIs mimicking Win32 OVERLAPPED)
 * #27408 NoBuffering:
   * very likely to get rejected, but we need to understand customer needs first
   * dependent on #33244 and #27146 which might add APIs for aligned memory allocation
@@ -482,21 +481,21 @@ Work items:
   * [ ] Review PR
   * [ ] Address PR feedback
 * [ ] Async File IO on Windows
-  * [ ] #16354 (Seek)
-  * [ ] #16341 async reads are sync
-  * [ ] #27047 ReadAsync is slow
-  * [ ] #25905 WriteAsync calls blocking resize
-  * [ ] #27643 FlushAsync calls sync writes
+  * [ ] [#16354](#16354) ReadAsync performs at least one sync Seek
+  * [ ] [#16341](#16341) async reads are sync when filling internal buffer
+  * [ ] [#27047](#27047) ReadAsync is slow
+  * [ ] [#25905](#25905) WriteAsync calls blocking resize
+  * [ ] [#27643](#27643) FlushAsync calls sync writes
 * [ ] File size preallocation
-  * [ ] #29666 File allocation inconsistency
-  * [ ] #45946 File preallocation performance
-  * [ ] #23196 File.WriteAllTextAsync (Linux)
+  * [ ] [#29666](#29666) File allocation inconsistency
+  * [ ] [#45946](#45946) File preallocation performance
+  * [ ] [#23196](#23196) File.WriteAllTextAsync (Linux)
 * [ ] Memory Allocations
   * [ ] Memory Profiling
     * [ ] Read* code-path (top X based on stats)
     * [ ] Write* code-path (top X based on stats)
     * [ ] Other code paths (top X based on stats)
-  * [ ] #15088 Avoid unnecessary allocations
+  * [ ] [#15088](#15088) Avoid unnecessary allocations
   * [ ] Stephen `IValueTaskSource` suggestion
 
 Dependencies:
