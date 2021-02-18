@@ -920,8 +920,10 @@ namespace System.Threading
         {
             if (m_lockObjAndDisposed.Value)
             {
-                throw new ObjectDisposedException(null, SR.SemaphoreSlim_Disposed);
+                Throw();
             }
+
+            static void Throw() => throw new ObjectDisposedException(null, SR.SemaphoreSlim_Disposed);
         }
         #endregion
     }
