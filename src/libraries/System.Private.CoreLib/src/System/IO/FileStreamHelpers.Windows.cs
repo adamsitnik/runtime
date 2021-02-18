@@ -12,19 +12,21 @@ namespace System.IO
     {
         internal static FileStreamStrategy ChooseStrategy(FileStream fileStream, SafeFileHandle handle, FileAccess access, int bufferSize, bool isAsync)
         {
-            // the switch exitst to measure the overhead of introducing a factory method to the FileStream ctor
-            // we are going to have more implementations soon and then it's going to make more sense
-            switch (isAsync)
-            {
-                case true:
-                    return new WindowsFileStreamStrategy(fileStream, handle, access, bufferSize, true);
-                case false:
-                    return new WindowsFileStreamStrategy(fileStream, handle, access, bufferSize, false);
-            }
+            FileStreamStrategy actualStrategy = isAsync
+                ? new AsyncWindowsFileStreamStrategy(handle, access)
+                : new SyncWindowsFileStreamStrategy(handle, access);
+
+            return new BufferedFileStreamStrategy(fileStream, actualStrategy, bufferSize);
         }
 
         internal static FileStreamStrategy ChooseStrategy(FileStream fileStream, string path, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options)
-            => new WindowsFileStreamStrategy(fileStream, path, mode, access, share, bufferSize, options);
+        {
+            FileStreamStrategy actualStrategy = ((options & FileOptions.Asynchronous) != 0)
+                ? new AsyncWindowsFileStreamStrategy(path, mode, access, share, options)
+                : new SyncWindowsFileStreamStrategy(path, mode, access, share, options);
+
+            return new BufferedFileStreamStrategy(fileStream, actualStrategy, bufferSize);
+        }
 
         internal static SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
             => CreateFileOpenHandle(path, mode, access, share, options);
@@ -68,7 +70,7 @@ namespace System.IO
             return handle.IsAsync ?? !IsHandleSynchronous(handle, ignoreInvalid: true) ?? defaultIsAsync;
         }
 
-        private static unsafe bool? IsHandleSynchronous(SafeFileHandle fileHandle, bool ignoreInvalid)
+        internal static unsafe bool? IsHandleSynchronous(SafeFileHandle fileHandle, bool ignoreInvalid)
         {
             if (fileHandle.IsInvalid)
                 return null;
@@ -104,20 +106,6 @@ namespace System.IO
 
             // If either of these two flags are set, the file handle is synchronous (not overlapped)
             return (fileMode & (Interop.NtDll.FILE_SYNCHRONOUS_IO_ALERT | Interop.NtDll.FILE_SYNCHRONOUS_IO_NONALERT)) > 0;
-        }
-
-        internal static void VerifyHandleIsSync(SafeFileHandle handle)
-        {
-            // As we can accurately check the handle type when we have access to NtQueryInformationFile we don't need to skip for
-            // any particular file handle type.
-
-            // If the handle was passed in without an explicit async setting, we already looked it up in GetDefaultIsAsync
-            if (!handle.IsAsync.HasValue)
-                return;
-
-            // If we can't check the handle, just assume it is ok.
-            if (!(IsHandleSynchronous(handle, ignoreInvalid: false) ?? true))
-                throw new ArgumentException(SR.Arg_HandleNotSync, nameof(handle));
         }
 
         private static unsafe Interop.Kernel32.SECURITY_ATTRIBUTES GetSecAttrs(FileShare share)
