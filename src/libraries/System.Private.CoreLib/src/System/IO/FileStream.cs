@@ -218,7 +218,10 @@ namespace System.IO
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            ValidateReadWriteArgs(buffer, offset, count);
+            // to avoid duplicating the call to ValidateBufferArguments with BufferedStream,
+            // each strategy is supposed to validate the input of this method on their own
+            if (_strategy.IsClosed)
+                throw Error.GetFileNotOpen();
 
             return _strategy.Read(buffer, offset, count);
         }
@@ -255,7 +258,10 @@ namespace System.IO
 
         public override void Write(byte[] buffer, int offset, int count)
         {
-            ValidateReadWriteArgs(buffer, offset, count);
+            // to avoid duplicating the call to ValidateBufferArguments with BufferedStream,
+            // each strategy is supposed to validate the input of this method on their own
+            if (_strategy.IsClosed)
+                throw Error.GetFileNotOpen();
 
             _strategy.Write(buffer, offset, count);
         }
@@ -315,17 +321,6 @@ namespace System.IO
 
         /// <summary>Gets a value indicating whether the current stream supports writing.</summary>
         public override bool CanWrite => _strategy.CanWrite;
-
-        /// <summary>Validates arguments to Read and Write and throws resulting exceptions.</summary>
-        /// <param name="buffer">The buffer to read from or write to.</param>
-        /// <param name="offset">The zero-based offset into the buffer.</param>
-        /// <param name="count">The maximum number of bytes to read or write.</param>
-        private void ValidateReadWriteArgs(byte[] buffer, int offset, int count)
-        {
-            ValidateBufferArguments(buffer, offset, count);
-            if (_strategy.IsClosed)
-                throw Error.GetFileNotOpen();
-        }
 
         /// <summary>Sets the length of this stream to the given value.</summary>
         /// <param name="value">The new length of the stream.</param>
@@ -397,21 +392,9 @@ namespace System.IO
         /// <param name="value">The byte to write to the stream.</param>
         public override void WriteByte(byte value) => _strategy.WriteByte(value);
 
-        ~FileStream()
-        {
-            // Preserved for compatibility since FileStream has defined a
-            // finalizer in past releases and derived classes may depend
-            // on Dispose(false) call.
-            Dispose(false);
-        }
+        internal void DisposeInternal(bool disposing) => Dispose(disposing);
 
-        protected override void Dispose(bool disposing)
-        {
-            if (_strategy != null) // possible in finalizer
-            {
-                _strategy.DisposeInternal(disposing);
-            }
-        }
+        protected override void Dispose(bool disposing) => _strategy.DisposeInternal(disposing);
 
         public override ValueTask DisposeAsync() => _strategy.DisposeAsync();
 

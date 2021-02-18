@@ -18,6 +18,7 @@ namespace System.IO
         protected byte[]? _buffer;
         protected readonly int _bufferLength;
         protected readonly SafeFileHandle _fileHandle; // only ever null if ctor throws
+        protected readonly FileStream _fileStream;
 
         /// <summary>Whether the file is opened for reading, writing, or both.</summary>
         protected readonly FileAccess _access;
@@ -64,12 +65,13 @@ namespace System.IO
         /// <summary>Whether the file stream's handle has been exposed.</summary>
         protected bool _exposedHandle;
 
-        protected FileStreamStrategyBase(FileStream fileStream, SafeFileHandle handle, FileAccess access, int bufferSize, bool isAsync) : base(fileStream)
+        protected FileStreamStrategyBase(FileStream fileStream, SafeFileHandle handle, FileAccess access, int bufferSize, bool isAsync)
         {
             _exposedHandle = true;
             _bufferLength = bufferSize;
 
             InitFromHandle(handle, access, isAsync);
+            _fileStream = fileStream;
 
             // Note: Cleaner to set the following fields in ValidateAndInitFromHandle,
             // but we can't as they're readonly.
@@ -81,7 +83,7 @@ namespace System.IO
             _fileHandle = handle;
         }
 
-        protected FileStreamStrategyBase(FileStream fileStream, string path, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options) : base(fileStream)
+        protected FileStreamStrategyBase(FileStream fileStream, string path, FileMode mode, FileAccess access, FileShare share, int bufferSize, FileOptions options)
         {
             string fullPath = Path.GetFullPath(path);
 
@@ -93,6 +95,7 @@ namespace System.IO
                 _useAsyncIO = true;
 
             _fileHandle = FileStreamHelpers.OpenHandle(fullPath, mode, access, share, options);
+            _fileStream = fileStream;
 
             try
             {
@@ -167,6 +170,8 @@ namespace System.IO
 
         public override int Read(byte[] buffer, int offset, int count)
         {
+            ValidateBufferArguments(buffer, offset, count);
+
             return _useAsyncIO ?
                 ReadAsyncTask(buffer, offset, count, CancellationToken.None).GetAwaiter().GetResult() :
                 ReadSpan(new Span<byte>(buffer, offset, count));
@@ -242,6 +247,8 @@ namespace System.IO
 
         public override void Write(byte[] buffer, int offset, int count)
         {
+            ValidateBufferArguments(buffer, offset, count);
+
             if (_useAsyncIO)
             {
                 WriteAsyncInternal(new ReadOnlyMemory<byte>(buffer, offset, count), CancellationToken.None).AsTask().GetAwaiter().GetResult();
