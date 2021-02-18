@@ -3,7 +3,6 @@
 
 using System.Buffers;
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
@@ -17,24 +16,6 @@ using System.Runtime.CompilerServices;
  * and we have to deal with this pain.  Stream has implementations of
  * the sync methods in terms of the async ones, so we'll
  * call through to our base class to get those methods when necessary.
- *
- * Also buffering is added into Win32FileStream as well. Folded in the
- * code from BufferedStream, so all the comments about it being mostly
- * aggressive (and the possible perf improvement) apply to Win32FileStream as
- * well.  Also added some buffering to the async code paths.
- *
- * Class Invariants:
- * The class has one buffer, shared for reading & writing.  It can only be
- * used for one or the other at any point in time - not both.  The following
- * should be true:
- *   0 <= _readPos <= _readLen < _bufferSize
- *   0 <= _writePos < _bufferSize
- *   _readPos == _readLen && _readPos > 0 implies the read buffer is valid,
- *     but we're at the end of the buffer.
- *   _readPos == _readLen == 0 means the read buffer contains garbage.
- *   Either _writePos can be greater than 0, or _readLen & _readPos can be
- *     greater than zero, but neither can be greater than zero at the same time.
- *
  */
 
 namespace System.IO
