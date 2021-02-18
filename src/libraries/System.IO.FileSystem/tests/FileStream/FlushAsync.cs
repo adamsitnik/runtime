@@ -37,10 +37,14 @@ namespace System.IO.Tests
             using (FileStream fsr = new FileStream(fileName, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
                 fs.Write(TestBuffer, 0, TestBuffer.Length);
-                Assert.Equal(TestBuffer.Length, fs.Length);
 
                 // Make sure that we've actually buffered it, read handle won't see any changes
                 Assert.Equal(0, fsr.Length);
+
+                // previously accessing Length was not causing a Flush of the internal buffer
+                // after using BufferedStream by FileStream iternally, now it does
+                // TODO: verify with the reviewers if such change is OK
+                Assert.Equal(TestBuffer.Length, fs.Length);
 
                 // This should cause a write, after it completes the two handles should be in sync
                 await fs.FlushAsync();
