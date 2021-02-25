@@ -27,9 +27,9 @@
     + [SetCreationTime, SetLastAccessTime, SetLastWriteTime Should not open a new stream to obtain a SafeFileHandle](#20234)
     + [Support SeBackupPrivilege in System.IO.Filestream API](#27086)
 - [Priorities](#priorities)
-  * [Must have](#must-have)
-  * [Great to have](#great-to-have)
-  * [Nice to have](#nice-to-have)
+  * [P0](#p0)
+  * [P1](#p1)
+  * [P2](#p2)
   * [Future](#future)
 - [Planning](#planning)
 
@@ -410,7 +410,9 @@ TODO: It needs further triage, but from a quick look it seems that the request i
 
 Suggested work items (grouped and ordered by context, should be independent from each other):
 
-### Must have
+### P0
+
+> Anything that includes a new API is not must have
 
 * Gather API usage statistics and get a good understanding of how `FileStream` is used by our customers
 * Introduce new abstraction layer and choose file strategy at runtime
@@ -420,13 +422,10 @@ Suggested work items (grouped and ordered by context, should be independent from
   * [#27047](#27047) ReadAsync is slow: [#16354](#16354) and [#16341](#16341) and some additional profiling
   * [#25905](#25905) FileStream.Windows useAsync WriteAsync calls blocking apis
   * [#27643](#27643) FileStream.FlushAsync ends up doing synchronous writes
-* File size preallocation:  
-  * [#29666](#29666) File allocation inconsistency between Windows and Linux and sparse allocations (**possible breaking changes**)
-  * [#45946](#45946) FileStream file preallocation performance (**new API**)
-  * [#23196](#23196) File.WriteAllTextAsync performance issues (using the API from above and possibly tuning asyn Unix implementation)
+* Linux:
+  * [#23196](#23196) File.WriteAllTextAsync performance issues
     * add more `File` microbenchmarks (`File.ReadAll*`, `File.WriteAll*`, `File.CopyTo*`, `File.Open`)
 * Memory allocations
-  * [#15088](#15088) Avoid unnecessary allocations when using FileStream (**new API**)
   * Memory Profiling
   * Stephen `IValueTaskSource` suggestion
 * **Validation of new implementation with Windows Performance Team**
@@ -434,8 +433,13 @@ Suggested work items (grouped and ordered by context, should be independent from
 * **Best practices doc**
   * check all existing code examples, make sure we recommend the best solutions
 
-### Great to have
+### P1
 
+* Memory allocations
+  * [#15088](#15088) Avoid unnecessary allocations when using FileStream (**new API**)
+* File size preallocation:  
+  * [#29666](#29666) File allocation inconsistency between Windows and Linux and sparse allocations (**possible breaking changes**)
+  * [#45946](#45946) FileStream file preallocation performance (**new API**)
 * Opening FileStream in async way (user experience improvement):
    * [#25314](#25314) Do we need `File.OpenAsync`? Do we have a bug or the current behaviour is expected?
    * [#24698](#24698) Add new APIs that allow for opening file for async IO (**new API**)
@@ -443,7 +447,7 @@ Suggested work items (grouped and ordered by context, should be independent from
 * Trully asynchronous File IO on Windows:
   * [#25074](#25074) micro optimization suggestion
 
-### Nice to have
+### P2
 
 * Cancellation support
   * [#1606](#1606) "Fully support cancellation on all FileStream operations that take CancellationToken"
@@ -451,12 +455,12 @@ Suggested work items (grouped and ordered by context, should be independent from
   * [#28583](#28583) "proc.StandardOutput.ReadAsync doesn't cancel properly if no output is sent from the process"
 * Trully asynchronous File IO on Windows:
   * [#24847](#24847) feature request (Async File IO APIs mimicking Win32 OVERLAPPED)
-* #27408 NoBuffering:
-  * very likely to get rejected, but we need to understand customer needs first
-  * dependent on #33244 and #27146 which might add APIs for aligned memory allocation
 
 ### Future
 
+* #27408 NoBuffering:
+  * very likely to get rejected, but we need to understand customer needs first
+  * dependent on #33244 and #27146 which might add APIs for aligned memory allocation
 * #20234 New APIs for SetCreationTime, SetLastAccessTime, SetLastWriteTime etc
 * #27086 Support SeBackupPrivilege in System.IO.Filestream API
 * Locking:
