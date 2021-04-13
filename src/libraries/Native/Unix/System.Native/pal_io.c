@@ -998,6 +998,26 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     while ((result = posix_fallocate64(ToFileDescriptor(fd), (off64_t)offset, (off64_t)length)) < 0 && errno == EINTR);
 #elif HAVE_POSIX_FALLOCATE
     while ((result = posix_fallocate(ToFileDescriptor(fd), (off_t)offset, (off_t)length)) < 0 && errno == EINTR);
+#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
+    struct fstore_t fstore;
+    fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
+    fstore.fst_posmode = F_VOLPOSMODE; // allocate from the offset
+    fstore.fst_offset = (off_t)offset;
+    fstore.fst_length = (off_t)length;
+
+    while ((result = fcntl(ToFileDescriptor(fd), F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
+
+    if (result == -1 && errno != ENOSPC)
+    {
+        // we have failed to allocate contiguous space, let's try non-contiguous
+        fstore.fst_flags = F_ALLOCATEALL; // all or nothing
+        while ((result = fcntl(ToFileDescriptor(fd), F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
+
+        if (result == -1)
+        {
+            result = errno;
+        }
+    }
 #else
     // Not supported on this platform. Caller can ignore this failure since it's just a hint.
     (void)fd, (void)offset, (void)length;
