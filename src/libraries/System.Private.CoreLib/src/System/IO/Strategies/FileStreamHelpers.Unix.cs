@@ -39,7 +39,7 @@ namespace System.IO.Strategies
             SafeFileHandle handle = SafeFileHandle.Open(path!, openFlags, (int)OpenPermissions);
             if (allocationSize > 0 && (mode == FileMode.Create || mode == FileMode.CreateNew || mode == FileMode.Truncate))
             {
-                int allocationResult = Interop.Sys.PosixFAllocate(handle, 0, allocationSize);
+                int allocationResult = Interop.Sys.FAllocate(handle, 0, allocationSize);
 
                 if (allocationResult == (int)Interop.Error.ENOSPC)
                 {

@@ -609,7 +609,7 @@ PALEXPORT int32_t SystemNative_PosixFAdvise(intptr_t fd, int64_t offset, int64_t
  *
  * Returns 0 on success; otherwise, the error code is returned and errno is NOT set.
  */
-PALEXPORT int32_t SystemNative_PosixFAllocate(intptr_t fd, int64_t offset, int64_t length);
+PALEXPORT int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length);
 
 /**
  * Reads the number of bytes specified into the provided buffer from the specified, opened file descriptor.

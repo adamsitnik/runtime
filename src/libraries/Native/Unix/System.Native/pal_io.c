@@ -991,7 +991,7 @@ int32_t SystemNative_PosixFAdvise(intptr_t fd, int64_t offset, int64_t length, i
 #endif
 }
 
-int32_t SystemNative_PosixFAllocate(intptr_t fd, int64_t offset, int64_t length)
+int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
 {
     int32_t result;
 #if HAVE_POSIX_FALLOCATE64

@@ -8,7 +8,7 @@ internal static partial class Interop
 {
     internal static partial class Sys
     {
-        [DllImport(Libraries.SystemNative, EntryPoint = "SystemNative_PosixFAllocate", SetLastError = false /* this is explicitly called out in the man page */)]
-        internal static extern int PosixFAllocate(SafeFileHandle fd, long offset, long length);
+        [DllImport(Libraries.SystemNative, EntryPoint = "SystemNative_FAllocate", SetLastError = false /* this is explicitly called out in the man page */)]
+        internal static extern int FAllocate(SafeFileHandle fd, long offset, long length);
     }
 }
