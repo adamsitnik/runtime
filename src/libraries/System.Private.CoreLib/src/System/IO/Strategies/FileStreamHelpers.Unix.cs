@@ -37,7 +37,7 @@ namespace System.IO.Strategies
 
             // Open the file and store the safe handle.
             SafeFileHandle handle = SafeFileHandle.Open(path!, openFlags, (int)OpenPermissions);
-            if (allocationSize > 0 && (mode == FileMode.Create || mode == FileMode.CreateNew || mode == FileMode.Truncate))
+            if (allocationSize > 0 && (mode == FileMode.Create || mode == FileMode.CreateNew || mode == FileMode.Truncate || mode == FileMode.OpenOrCreate))
             {
                 int allocationResult = Interop.Sys.FAllocate(handle, 0, allocationSize);
 
