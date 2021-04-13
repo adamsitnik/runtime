@@ -662,7 +662,7 @@ int32_t SystemNative_FSync(intptr_t fd)
     int fileDescriptor = ToFileDescriptor(fd);
 
     int32_t result;
-    while ((result = 
+    while ((result =
 #if defined(TARGET_OSX) && HAVE_F_FULLFSYNC
     fcntl(fileDescriptor, F_FULLFSYNC)
 #else
@@ -991,6 +991,22 @@ int32_t SystemNative_PosixFAdvise(intptr_t fd, int64_t offset, int64_t length, i
 #endif
 }
 
+int32_t SystemNative_PosixFAllocate(intptr_t fd, int64_t offset, int64_t length)
+{
+    int32_t result;
+#if HAVE_POSIX_FALLOCATE64
+    while ((result = posix_fallocate64(ToFileDescriptor(fd), (off64_t)offset, (off64_t)length)) < 0 && errno == EINTR);
+#elif HAVE_POSIX_FALLOCATE
+    while ((result = posix_fallocate(ToFileDescriptor(fd), (off_t)offset, (off_t)length)) < 0 && errno == EINTR);
+#else
+    // Not supported on this platform. Caller can ignore this failure since it's just a hint.
+    (void)fd, (void)offset, (void)length;
+    result = ENOTSUP;
+#endif
+    return result;
+}
+
+
 int32_t SystemNative_Read(intptr_t fd, void* buffer, int32_t bufferSize)
 {
     return Common_Read(fd, buffer, bufferSize);
@@ -1184,7 +1200,7 @@ int32_t SystemNative_CopyFile(intptr_t sourceFd, intptr_t destinationFd)
 #endif
     }
     // If we copied to a filesystem (eg EXFAT) that does not preserve POSIX ownership, all files appear
-    // to be owned by root. If we aren't running as root, then we won't be an owner of our new file, and 
+    // to be owned by root. If we aren't running as root, then we won't be an owner of our new file, and
     // attempting to copy metadata to it will fail with EPERM. We have copied successfully, we just can't
     // copy metadata. The best thing we can do is skip copying the metadata.
     if (ret != 0 && errno != EPERM)
