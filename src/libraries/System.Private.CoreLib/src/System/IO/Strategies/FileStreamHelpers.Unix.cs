@@ -14,6 +14,8 @@ namespace System.IO.Strategies
     // this type defines a set of stateless FileStream/FileStreamStrategy helper methods
     internal static partial class FileStreamHelpers
     {
+        private const int ENOSPC_Linux = 28;
+
         // in the future we are most probably going to introduce more strategies (io_uring etc)
         private static FileStreamStrategy ChooseStrategyCore(SafeFileHandle handle, FileAccess access, FileShare share, int bufferSize, bool isAsync)
             => new Net5CompatFileStreamStrategy(handle, access, bufferSize, isAsync);
@@ -37,12 +39,13 @@ namespace System.IO.Strategies
 
             // Open the file and store the safe handle.
             SafeFileHandle handle = SafeFileHandle.Open(path!, openFlags, (int)OpenPermissions);
-            if (allocationSize > 0 && (mode == FileMode.Create || mode == FileMode.CreateNew || mode == FileMode.Truncate || mode == FileMode.OpenOrCreate))
+            // If allocationSize has been provided for a creatable and writeable file
+            if (allocationSize > 0 && (access & FileAccess.Write) != 0 && mode != FileMode.Open && mode != FileMode.Append)
             {
                 int allocationResult = Interop.Sys.FAllocate(handle, 0, allocationSize);
-
-                if (allocationResult == (int)Interop.Error.ENOSPC)
+                if (allocationResult == (int)Interop.Error.ENOSPC || allocationResult == ENOSPC_Linux)
                 {
+                    handle.Dispose();
                     Interop.Sys.Unlink(path); // remove the file to mimic Windows behaviour (atomic operation)
 
                     throw new IOException(SR.Format(SR.IO_DiskFull_Path_AllocationSize, path, allocationSize));

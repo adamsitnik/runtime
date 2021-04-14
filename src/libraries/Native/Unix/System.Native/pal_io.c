@@ -993,11 +993,12 @@ int32_t SystemNative_PosixFAdvise(intptr_t fd, int64_t offset, int64_t length, i
 
 int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
 {
+    int fileDescriptor = ToFileDescriptor(fd);
     int32_t result;
 #if HAVE_POSIX_FALLOCATE64
-    while ((result = posix_fallocate64(ToFileDescriptor(fd), (off64_t)offset, (off64_t)length)) == EINTR);
+    while ((result = posix_fallocate64(fileDescriptor, (off64_t)offset, (off64_t)length)) == EINTR);
 #elif HAVE_POSIX_FALLOCATE
-    while ((result = posix_fallocate(ToFileDescriptor(fd), (off_t)offset, (off_t)length)) == EINTR);
+    while ((result = posix_fallocate(fileDescriptor, (off_t)offset, (off_t)length)) == EINTR);
 #elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
     struct fstore_t fstore;
     fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
@@ -1005,13 +1006,13 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     fstore.fst_offset = (off_t)offset;
     fstore.fst_length = (off_t)length;
 
-    while ((result = fcntl(ToFileDescriptor(fd), F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
+    while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
 
     if (result == -1 && errno != ENOSPC)
     {
         // we have failed to allocate contiguous space, let's try non-contiguous
         fstore.fst_flags = F_ALLOCATEALL; // all or nothing
-        while ((result = fcntl(ToFileDescriptor(fd), F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
+        while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
 
         if (result == -1)
         {
@@ -1020,12 +1021,29 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     }
 #else
     // Not supported on this platform. Caller can ignore this failure since it's just a hint.
-    (void)fd, (void)offset, (void)length;
+    (void)offset, (void)length;
     result = ENOTSUP;
 #endif
+
+#if HAVE_POSIX_FALLOCATE64 || HAVE_POSIX_FALLOCATE
+    if (result == ENOSPC)
+    {
+        // POSIX specification does not mention what should happen when the allocation fails due to lack of free space.
+        // Most of the Linux distros don't truncate the file and it has non-zero size (but less than what was requested.
+        // To mimic the Windows behaviour of the atomic NtCreateFile syscall we just remove the file.
+
+        ftruncate(fileDescriptor, 0);
+        // the managed code has a reference to handle and it's responsible for Disposing it and Deleting the file
+    }
+#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
+    if (result == 0)
+    {
+        ftruncate(fileDescriptor, length);
+    }
+#endif
+
     return result;
 }
-
 
 int32_t SystemNative_Read(intptr_t fd, void* buffer, int32_t bufferSize)
 {
