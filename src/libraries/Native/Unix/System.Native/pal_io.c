@@ -995,9 +995,9 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
 {
     int32_t result;
 #if HAVE_POSIX_FALLOCATE64
-    while ((result = posix_fallocate64(ToFileDescriptor(fd), (off64_t)offset, (off64_t)length)) < 0 && errno == EINTR);
+    while ((result = posix_fallocate64(ToFileDescriptor(fd), (off64_t)offset, (off64_t)length)) == EINTR);
 #elif HAVE_POSIX_FALLOCATE
-    while ((result = posix_fallocate(ToFileDescriptor(fd), (off_t)offset, (off_t)length)) < 0 && errno == EINTR);
+    while ((result = posix_fallocate(ToFileDescriptor(fd), (off_t)offset, (off_t)length)) == EINTR);
 #elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
     struct fstore_t fstore;
     fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
