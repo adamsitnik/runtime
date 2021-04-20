@@ -1029,10 +1029,6 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     lockArgs.l_len = (off_t)length;
 
     while ((result = fcntl(fileDescriptor, command, &lockArgs)) == -1 && errno == EINTR) ;
-#else
-    // Not supported on this platform. Caller can ignore this failure since it's just a hint.
-    (void)offset, (void)length;
-    result = ENOTSUP;
 #endif
 
 #if HAVE_POSIX_FALLOCATE64 || HAVE_POSIX_FALLOCATE
