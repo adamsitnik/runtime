@@ -995,11 +995,25 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
 {
     int fileDescriptor = ToFileDescriptor(fd);
     int32_t result;
-#if HAVE_POSIX_FALLOCATE64
+#if HAVE_POSIX_FALLOCATE64 // 64-bit Linux
     while ((result = posix_fallocate64(fileDescriptor, (off64_t)offset, (off64_t)length)) == EINTR);
-#elif HAVE_POSIX_FALLOCATE
+#elif HAVE_POSIX_FALLOCATE // 32-bit Linux
     while ((result = posix_fallocate(fileDescriptor, (off_t)offset, (off_t)length)) == EINTR);
-#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
+#elif defined(F_ALLOCSP) || defined(F_ALLOCSP64) // FreeBSD
+    #if HAVE_FLOCK64
+    struct flock64 lockArgs;
+    int command = F_ALLOCSP64;
+    #else
+    struct flock lockArgs;
+    int command = F_ALLOCSP;
+    #endif
+
+    lockArgs.l_whence = SEEK_SET;
+    lockArgs.l_start = (off_t)offset;
+    lockArgs.l_len = (off_t)length;
+
+    while ((result = fcntl(fileDescriptor, command, &lockArgs)) < 0 && errno == EINTR) ;
+#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE // macOS
     struct fstore_t fstore;
     fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
     fstore.fst_posmode = F_VOLPOSMODE; // allocate from the offset
