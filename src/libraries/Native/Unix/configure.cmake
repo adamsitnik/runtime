@@ -220,11 +220,6 @@ check_symbol_exists(
     HAVE_POSIX_FALLOCATE64)
 
 check_symbol_exists(
-    F_PREALLOCATE
-    fcntl.h
-    HAVE_F_PREALLOCATE)
-
-check_symbol_exists(
     ioctl
     sys/ioctl.h
     HAVE_IOCTL)

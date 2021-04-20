@@ -999,6 +999,22 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     while ((result = posix_fallocate64(fileDescriptor, (off64_t)offset, (off64_t)length)) == EINTR);
 #elif HAVE_POSIX_FALLOCATE // 32-bit Linux
     while ((result = posix_fallocate(fileDescriptor, (off_t)offset, (off_t)length)) == EINTR);
+#elif defined(TARGET_OSX) && defined(F_PREALLOCATE) // macOS
+    fstore_t fstore;
+    fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
+    fstore.fst_posmode = F_PEOFPOSMODE;  // allocate from the physical end of file, as offset MUST NOT be 0 for F_VOLPOSMODE
+    fstore.fst_offset = (off_t)offset;
+    fstore.fst_length = (off_t)length;
+    fstore.fst_bytesalloc = 0; // output size, can be > length
+
+    while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) == -1 && errno == EINTR) ;
+
+    if (result == -1)
+    {
+        // we have failed to allocate contiguous space, let's try non-contiguous
+        fstore.fst_flags = F_ALLOCATEALL; // all or nothing
+        while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) == -1 && errno == EINTR) ;
+    }
 #elif defined(F_ALLOCSP) || defined(F_ALLOCSP64) // FreeBSD
     #if HAVE_FLOCK64
     struct flock64 lockArgs;
@@ -1012,27 +1028,7 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     lockArgs.l_start = (off_t)offset;
     lockArgs.l_len = (off_t)length;
 
-    while ((result = fcntl(fileDescriptor, command, &lockArgs)) < 0 && errno == EINTR) ;
-#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE // macOS
-    struct fstore_t fstore;
-    fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
-    fstore.fst_posmode = F_VOLPOSMODE; // allocate from the offset
-    fstore.fst_offset = (off_t)offset;
-    fstore.fst_length = (off_t)length;
-
-    while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
-
-    if (result == -1 && errno != ENOSPC)
-    {
-        // we have failed to allocate contiguous space, let's try non-contiguous
-        fstore.fst_flags = F_ALLOCATEALL; // all or nothing
-        while ((result = fcntl(fileDescriptor, F_PREALLOCATE, &fstore)) < 0 && errno == EINTR);
-
-        if (result == -1)
-        {
-            result = errno;
-        }
-    }
+    while ((result = fcntl(fileDescriptor, command, &lockArgs)) == -1 && errno == EINTR) ;
 #else
     // Not supported on this platform. Caller can ignore this failure since it's just a hint.
     (void)offset, (void)length;
@@ -1048,11 +1044,6 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
 
         ftruncate(fileDescriptor, 0);
         // the managed code has a reference to handle and it's responsible for Disposing it and Deleting the file
-    }
-#elif defined(TARGET_OSX) && HAVE_F_PREALLOCATE
-    if (result == 0)
-    {
-        ftruncate(fileDescriptor, length);
     }
 #endif
 
