@@ -999,7 +999,7 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     while ((result = posix_fallocate64(fileDescriptor, (off64_t)offset, (off64_t)length)) == EINTR);
 #elif HAVE_POSIX_FALLOCATE // 32-bit Linux
     while ((result = posix_fallocate(fileDescriptor, (off_t)offset, (off_t)length)) == EINTR);
-#elif defined(TARGET_OSX) && defined(F_PREALLOCATE) // macOS
+#elif defined(F_PREALLOCATE) // macOS
     fstore_t fstore;
     fstore.fst_flags = F_ALLOCATECONTIG; // ensure contiguous space
     fstore.fst_posmode = F_PEOFPOSMODE;  // allocate from the physical end of file, as offset MUST NOT be 0 for F_VOLPOSMODE
@@ -1031,15 +1031,12 @@ int32_t SystemNative_FAllocate(intptr_t fd, int64_t offset, int64_t length)
     while ((result = fcntl(fileDescriptor, command, &lockArgs)) == -1 && errno == EINTR) ;
 #endif
 
-#if HAVE_POSIX_FALLOCATE64 || HAVE_POSIX_FALLOCATE
-    if (result == ENOSPC)
+#if defined(F_PREALLOCATE) || defined(F_ALLOCSP) || defined(F_ALLOCSP64)
+    // most of the Unixes implement posix_fallocate which does NOT set the last error
+    // fctnl does, but to mimic the posix_fallocate behaviour we just return error
+    if (result == -1)
     {
-        // POSIX specification does not mention what should happen when the allocation fails due to lack of free space.
-        // Most of the Linux distros don't truncate the file and it has non-zero size (but less than what was requested.
-        // To mimic the Windows behaviour of the atomic NtCreateFile syscall we just remove the file.
-
-        ftruncate(fileDescriptor, 0);
-        // the managed code has a reference to handle and it's responsible for Disposing it and Deleting the file
+        result = errno;
     }
 #endif
 
