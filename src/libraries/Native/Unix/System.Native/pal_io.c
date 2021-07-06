@@ -1114,7 +1114,28 @@ void SystemNative_Sync(void)
 
 int32_t SystemNative_Write(intptr_t fd, const void* buffer, int32_t bufferSize)
 {
-    return Common_Write(fd, buffer, bufferSize);
+    int writeResult = Common_Write(fd, buffer, bufferSize);
+
+    if (writeResult == -1 && errno == EACCES)
+    {
+        // By default, we lock all files on Unix using flock, which in theory applies only an advisory lock.
+        // However, some file systems like CIFS map LOCK_SH (shared or so called reader lock)
+        // to a mandatory lock that prevents ourselves from writing to the file that we have just locked..
+        // See #42790, #53182 and #54966 for more details.
+        //
+        // Since it's impossible to ask the OS to not send the lock requests to the server from a syscall level
+        // like it's with "nobrl" mount.cifs option, we just unlock the file and try to perform the write again.
+        if (SystemNative_FLock(fd, LOCK_UN) != -1)
+        {
+            writeResult = Common_Write(fd, buffer, bufferSize);
+        }
+        else
+        {
+            errno = EACCES; // restore the write error
+        }
+    }
+
+    return writeResult;
 }
 
 #if !HAVE_FCOPYFILE
@@ -1476,6 +1497,18 @@ int32_t SystemNative_PWrite(intptr_t fd, void* buffer, int32_t bufferSize, int64
     ssize_t count;
     while ((count = pwrite(ToFileDescriptor(fd), buffer, (uint32_t)bufferSize, (off_t)fileOffset)) < 0 && errno == EINTR);
 
+    if (count == -1 && errno == EACCES) // see comments in SystemNative_Write
+    {
+        if (SystemNative_FLock(fd, LOCK_UN) != -1)
+        {
+            while ((count = pwrite(ToFileDescriptor(fd), buffer, (uint32_t)bufferSize, (off_t)fileOffset)) < 0 && errno == EINTR);
+        }
+        else
+        {
+            errno = EACCES;
+        }
+    }
+
     assert(count >= -1 && count <= bufferSize);
     return (int32_t)count;
 }
@@ -1527,6 +1560,10 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 
     int64_t count = 0;
     int fileDescriptor = ToFileDescriptor(fd);
+    bool canRetry = true;
+
+    start:
+
 #if HAVE_PWRITEV && !defined(TARGET_WASM) // pwritev is buggy on WASM
     while ((count = pwritev(fileDescriptor, (struct iovec*)vectors, (int)vectorCount, (off_t)fileOffset)) < 0 && errno == EINTR);
 #else
@@ -1538,7 +1575,7 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 
         if (current < 0)
         {
-            // if previous calls were succesfull, we return what we got so far
+            // if previous calls were successful, we return what we got so far
             // otherwise, we return the error code
             return count > 0 ? count : current;
         }
@@ -1555,6 +1592,19 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
         }
     }
 #endif
+
+    if (canRetry && count == -1 && errno == EACCES) // see comments in SystemNative_Write
+    {
+        if (SystemNative_FLock(fd, LOCK_UN) != -1)
+        {
+            canRetry = false;
+            goto start;
+        }
+        else
+        {
+            errno = EACCES;
+        }
+    }
 
     assert(count >= -1);
     return count;
