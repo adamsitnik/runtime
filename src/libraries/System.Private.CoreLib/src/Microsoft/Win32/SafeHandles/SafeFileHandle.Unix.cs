@@ -236,7 +236,7 @@ namespace Microsoft.Win32.SafeHandles
             // - RandomAccess: Implemented after open if posix_fadvise is available
             // - SequentialScan: Implemented after open if posix_fadvise is available
             // - WriteThrough: Handled here
-            if ((options & FileOptions.WriteThrough) != 0)
+            if ((options & FileOptions.WriteThrough) != 0 || (share != FileShare.None && (access & FileAccess.Write) != 0))
             {
                 flags |= Interop.Sys.OpenFlags.O_SYNC;
             }
