@@ -11,6 +11,7 @@ using System.ServiceProcess;
 using System.Threading.Tasks;
 using Xunit;
 using System.Threading;
+using System.Security.Cryptography;
 
 namespace System.IO.Tests
 {
@@ -320,5 +321,41 @@ namespace System.IO.Tests
 
         [DllImport("setupapi.dll", SetLastError = true)]
         static extern bool SetupDiDestroyDeviceInfoList(IntPtr DeviceInfoSet);
+    }
+
+    public class NonSeekableAsyncFileHandles
+    {
+        [PlatformSpecific(TestPlatforms.Windows)] // the test setup is Windows-specifc
+        [Fact]
+        public async Task ReadAndWriteInBothDirectionsAsync()
+        {
+            string pipeName = FileSystemTest.GetNamedPipeServerStreamName();
+            string pipePath = Path.GetFullPath($@"\\.\pipe\{pipeName}");
+
+            NamedPipeServerStream server = new (pipeName, PipeDirection.InOut);
+            using FileStream clienStream = new (pipePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 4096, useAsync: true);
+
+            await server.WaitForConnectionAsync();
+
+            using FileStream serverStrean = new (new SafeFileHandle(server.SafePipeHandle.DangerousGetHandle(), true), FileAccess.ReadWrite);
+
+            byte[] content = RandomNumberGenerator.GetBytes(100);
+            byte[] actual = new byte[content.Length];
+
+            Task<int> readTask = serverStrean.ReadAsync(actual, 0, actual.Length);
+            await clienStream.WriteAsync(content);
+            await readTask;
+
+            Assert.Equal(actual.Length, readTask.Result);
+            Assert.Equal(content, actual);
+
+            RandomNumberGenerator.Fill(content);
+            Array.Clear(actual);
+
+            Task writeTask = serverStrean.WriteAsync(content, 0, content.Length);
+            Assert.Equal(actual.Length, await clienStream.ReadAsync(actual));
+            await writeTask;
+            Assert.Equal(content, actual);
+        }
     }
 }
