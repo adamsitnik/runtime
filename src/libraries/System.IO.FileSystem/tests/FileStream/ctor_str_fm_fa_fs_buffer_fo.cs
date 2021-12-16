@@ -43,7 +43,7 @@ namespace System.IO.Tests
         [InlineData(FileOptions.Asynchronous | FileOptions.DeleteOnClose | FileOptions.RandomAccess | FileOptions.SequentialScan | FileOptions.WriteThrough)]
         public void ValidFileOptions(FileOptions option)
         {
-            byte[] data = new byte[c_DefaultBufferSize];
+            byte[] data = new byte[c_DefaultBufferSize + 1];
             new Random(1).NextBytes(data);
 
             using (FileStream fs = CreateFileStream(GetTestFilePath(), FileMode.Create, FileAccess.ReadWrite, FileShare.Read, c_DefaultBufferSize, option))
