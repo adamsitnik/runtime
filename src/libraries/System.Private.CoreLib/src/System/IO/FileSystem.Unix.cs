@@ -397,6 +397,7 @@ namespace System.IO
                 if (Interop.Sys.Stat(destNoDirectorySeparator, out _) >= 0)
                 {
                     // destination exists, but before we throw we need to check whether source exists or not
+
                     // Windows will throw if the source file/directory doesn't exist, we preemptively check
                     // to make sure our cross platform behavior matches .NET Framework behavior.
                     if (Interop.Sys.Stat(srcNoDirectorySeparator, out Interop.Sys.FileStatus sourceFileStatus) < 0)
@@ -415,7 +416,7 @@ namespace System.IO
                 }
             }
 
-            if (Interop.Sys.Rename(sourceFullPath, destNoDirectorySeparator.ToString()) < 0)
+            if (Interop.Sys.Rename(sourceFullPath, destNoDirectorySeparator) < 0)
             {
                 Interop.ErrorInfo errorInfo = Interop.Sys.GetLastErrorInfo();
                 switch (errorInfo.Error)
@@ -423,20 +424,10 @@ namespace System.IO
                     case Interop.Error.EACCES: // match Win32 exception
                         throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, sourceFullPath), errorInfo.RawErrno);
                     case Interop.Error.ENOENT:
-                        if (Interop.Sys.Stat(srcNoDirectorySeparator, out Interop.Sys.FileStatus sourceFileStatus) >= 0)
-                        {
-                            // the source directory exists, so destination does not
-                            // example: Move("/tmp/existing/", "/tmp/nonExisting1/nonExisting2/")
-                            throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, destFullPath));
-                        }
-                        // if (Path.EndsInDirectorySeparator(sourceFullPath))
-                        // {
-                            throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        // }
-                        // else
-                        // {
-                        //     throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        // }
+                        throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path,
+                            Interop.Sys.Stat(srcNoDirectorySeparator, out _) >= 0
+                                ? destFullPath // the source directory exists, so destination does not. Example: Move("/tmp/existing/", "/tmp/nonExisting1/nonExisting2/")
+                                : sourceFullPath));
                     case Interop.Error.ENOTDIR: // sourceFullPath exists and it's not a directory
                         throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
                     default:
