@@ -389,6 +389,8 @@ namespace System.IO
 
         private static void MoveDirectory(string sourceFullPath, string destFullPath, bool sameDirectoryDifferentCase, bool? sourceDirectoryExists)
         {
+            ReadOnlySpan<char> destNoDirectorySeparator = Path.TrimEndingDirectorySeparator(destFullPath.AsSpan());
+
             if (!Path.EndsInDirectorySeparator(sourceFullPath))
             {
                 destFullPath = Path.TrimEndingDirectorySeparator(destFullPath);
@@ -396,7 +398,7 @@ namespace System.IO
 
             if (!sameDirectoryDifferentCase) // This check is to allow renaming of directories
             {
-                if (DirectoryExists(destFullPath))
+                if (Interop.Sys.Stat(destNoDirectorySeparator, out _) >= 0)
                 {
                     sourceDirectoryExists ??= DirectoryExists(sourceFullPath);
 
@@ -424,10 +426,6 @@ namespace System.IO
                         }
                     }
 
-                    throw new IOException(SR.Format(SR.IO_AlreadyExists_Name, destFullPath));
-                }
-                else if (FileExists(destFullPath))
-                {
                     // Some Unix distros will overwrite the destination file if it already exists.
                     // Throwing IOException to match Windows behavior.
                     throw new IOException(SR.Format(SR.IO_AlreadyExists_Name, destFullPath));
