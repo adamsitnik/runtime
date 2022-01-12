@@ -21,7 +21,7 @@ namespace System.IO
             }
         }
 
-        internal static void MoveDirectory(string sourceFullPath, string destFullPath, string destinationWithSeparator, bool? sourceDirectoryExists = default)
+        internal static void MoveDirectory(string sourceFullPath, string destFullPath, string destinationWithSeparator)
         {
             string sourcePath = PathInternal.EnsureTrailingSeparator(sourceFullPath);
 
@@ -47,7 +47,7 @@ namespace System.IO
             if (!sourceRoot.Equals(destinationRoot, StringComparison.OrdinalIgnoreCase))
                 throw new IOException(SR.IO_SourceDestMustHaveSameRoot);
 
-            MoveDirectory(sourceFullPath, destFullPath, sameDirectoryDifferentCase, sourceDirectoryExists);
+            MoveDirectory(sourceFullPath, destFullPath, sameDirectoryDifferentCase);
         }
     }
 }

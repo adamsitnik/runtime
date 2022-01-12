@@ -196,8 +196,7 @@ namespace System.IO
             string destination = Path.GetFullPath(destDirName);
             string destinationWithSeparator = PathInternal.EnsureTrailingSeparator(destination);
 
-            FileSystem.MoveDirectory(FullPath, destination, destinationWithSeparator,
-                OperatingSystem.IsWindows() ? null : Exists); // on Windows we don't need to perform the extra check
+            FileSystem.MoveDirectory(FullPath, destination, destinationWithSeparator); // on Windows we don't need to perform the extra check
 
             Init(originalPath: destDirName,
                  fullPath: destinationWithSeparator,

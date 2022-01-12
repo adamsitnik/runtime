@@ -387,43 +387,26 @@ namespace System.IO
             }
         }
 
-        private static void MoveDirectory(string sourceFullPath, string destFullPath, bool sameDirectoryDifferentCase, bool? sourceDirectoryExists)
+        private static void MoveDirectory(string sourceFullPath, string destFullPath, bool sameDirectoryDifferentCase)
         {
+            ReadOnlySpan<char> srcNoDirectorySeparator = Path.TrimEndingDirectorySeparator(sourceFullPath.AsSpan());
             ReadOnlySpan<char> destNoDirectorySeparator = Path.TrimEndingDirectorySeparator(destFullPath.AsSpan());
-
-            if (!Path.EndsInDirectorySeparator(sourceFullPath))
-            {
-                destFullPath = Path.TrimEndingDirectorySeparator(destFullPath);
-            }
 
             if (!sameDirectoryDifferentCase) // This check is to allow renaming of directories
             {
                 if (Interop.Sys.Stat(destNoDirectorySeparator, out _) >= 0)
                 {
-                    sourceDirectoryExists ??= DirectoryExists(sourceFullPath);
-
+                    // destination exists, but before we throw we need to check whether source exists or not
                     // Windows will throw if the source file/directory doesn't exist, we preemptively check
                     // to make sure our cross platform behavior matches .NET Framework behavior.
-                    if (!sourceDirectoryExists.Value)
+                    if (Interop.Sys.Stat(srcNoDirectorySeparator, out Interop.Sys.FileStatus sourceFileStatus) < 0)
                     {
-                        if (!FileExists(sourceFullPath))
-                        {
-                            throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        }
-
-                        // Windows doesn't care if you try and copy a file via "MoveDirectory"...
-                        // ... but it doesn't like the source to have a trailing slash ...
-
-                        // On Windows we end up with ERROR_INVALID_NAME, which is
-                        // "The filename, directory name, or volume label syntax is incorrect."
-                        //
-                        // This surfaces as an IOException, if we let it go beyond here it would
-                        // give DirectoryNotFound.
-
-                        if (Path.EndsInDirectorySeparator(sourceFullPath))
-                        {
-                            throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        }
+                        throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
+                    }
+                    else if ((sourceFileStatus.Mode & Interop.Sys.FileTypes.S_IFMT) != Interop.Sys.FileTypes.S_IFDIR
+                        && Path.EndsInDirectorySeparator(sourceFullPath))
+                    {
+                        throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
                     }
 
                     // Some Unix distros will overwrite the destination file if it already exists.
@@ -432,7 +415,7 @@ namespace System.IO
                 }
             }
 
-            if (Interop.Sys.Rename(sourceFullPath, destFullPath) < 0)
+            if (Interop.Sys.Rename(sourceFullPath, destNoDirectorySeparator.ToString()) < 0)
             {
                 Interop.ErrorInfo errorInfo = Interop.Sys.GetLastErrorInfo();
                 switch (errorInfo.Error)
@@ -440,19 +423,20 @@ namespace System.IO
                     case Interop.Error.EACCES: // match Win32 exception
                         throw new IOException(SR.Format(SR.UnauthorizedAccess_IODenied_Path, sourceFullPath), errorInfo.RawErrno);
                     case Interop.Error.ENOENT:
-                        sourceDirectoryExists ??= DirectoryExists(sourceFullPath);
-                        if (sourceDirectoryExists.Value) // the source directory exists, so destination does not
+                        if (Interop.Sys.Stat(srcNoDirectorySeparator, out Interop.Sys.FileStatus sourceFileStatus) >= 0)
                         {
+                            // the source directory exists, so destination does not
+                            // example: Move("/tmp/existing/", "/tmp/nonExisting1/nonExisting2/")
                             throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, destFullPath));
                         }
-                        else if (Path.EndsInDirectorySeparator(sourceFullPath) || !FileExists(sourceFullPath))
-                        {
+                        // if (Path.EndsInDirectorySeparator(sourceFullPath))
+                        // {
                             throw new DirectoryNotFoundException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        }
-                        else
-                        {
-                            throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
-                        }
+                        // }
+                        // else
+                        // {
+                        //     throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
+                        // }
                     case Interop.Error.ENOTDIR: // sourceFullPath exists and it's not a directory
                         throw new IOException(SR.Format(SR.IO_PathNotFound_Path, sourceFullPath));
                     default:
