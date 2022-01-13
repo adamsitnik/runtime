@@ -5,18 +5,11 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.MemoryMappedFiles;
-using System.Threading;
 
 namespace Microsoft.Win32.SafeHandles
 {
     public sealed partial class SafeMemoryMappedFileHandle : SafeHandleZeroOrMinusOneIsInvalid
     {
-        /// <summary>
-        /// The underlying FileStream.  May be null.  We hold onto the stream rather than just
-        /// onto the underlying handle to ensure that logic associated with disposing the stream
-        /// (e.g. deleting the file for DeleteOnClose) happens at the appropriate time.
-        /// </summary>
-        private readonly FileStream? _fileStream;
         /// <summary>The FileStream's handle, cached to avoid repeated accesses to FileStream.SafeFileHandle that could, in theory, change.</summary>
         internal SafeFileHandle? _fileStreamHandle;
 
@@ -36,22 +29,21 @@ namespace Microsoft.Win32.SafeHandles
         internal readonly long _capacity;
 
         /// <summary>Initializes the memory-mapped file handle.</summary>
-        /// <param name="fileStream">The underlying file stream; may be null.</param>
+        /// <param name="safeFileHandle">The underlying file handle; may be null.</param>
         /// <param name="ownsFileStream">Whether this SafeHandle is responsible for Disposing the fileStream.</param>
         /// <param name="inheritability">The inheritability of the memory-mapped file.</param>
         /// <param name="access">The access for the memory-mapped file.</param>
         /// <param name="options">The options for the memory-mapped file.</param>
         /// <param name="capacity">The capacity of the memory-mapped file.</param>
         internal SafeMemoryMappedFileHandle(
-            FileStream? fileStream, bool ownsFileStream, HandleInheritability inheritability,
+            SafeFileHandle? safeFileHandle, bool ownsFileStream, HandleInheritability inheritability,
             MemoryMappedFileAccess access, MemoryMappedFileOptions options,
             long capacity)
             : base(ownsHandle: true)
         {
-            Debug.Assert(!ownsFileStream || fileStream != null, "We can only own a FileStream we're actually given.");
+            Debug.Assert(!ownsFileStream || safeFileHandle != null, "We can only own a FileStream we're actually given.");
 
             // Store the arguments.  We'll actually open the map when the view is created.
-            _fileStream = fileStream;
             _ownsFileStream = ownsFileStream;
             _inheritability = inheritability;
             _access = access;
@@ -60,13 +52,12 @@ namespace Microsoft.Win32.SafeHandles
 
             IntPtr handlePtr;
 
-            if (fileStream != null)
+            if (safeFileHandle != null)
             {
                 bool ignored = false;
-                SafeFileHandle handle = fileStream.SafeFileHandle;
-                handle.DangerousAddRef(ref ignored);
-                _fileStreamHandle = handle;
-                handlePtr = handle.DangerousGetHandle();
+                safeFileHandle.DangerousAddRef(ref ignored);
+                _fileStreamHandle = safeFileHandle;
+                handlePtr = safeFileHandle.DangerousGetHandle();
             }
             else
             {
@@ -81,7 +72,7 @@ namespace Microsoft.Win32.SafeHandles
             if (disposing && _ownsFileStream)
             {
                 // Clean up the file descriptor (either for a file on disk or a shared memory object) if we created it
-                _fileStream!.Dispose();
+                _fileStreamHandle!.Dispose();
             }
             base.Dispose(disposing);
         }
