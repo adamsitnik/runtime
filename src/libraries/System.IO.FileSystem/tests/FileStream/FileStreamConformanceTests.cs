@@ -3,8 +3,11 @@
 
 using Microsoft.Win32.SafeHandles;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using Xunit;
 
@@ -273,5 +276,42 @@ namespace System.IO.Tests
         protected override bool FullyCancelableOperations => false;
         protected override bool BlocksOnZeroByteReads => OperatingSystem.IsWindows();
         protected override bool SupportsConcurrentBidirectionalUse => false;
+    }
+
+    public class Repro
+    {
+        [Fact]
+        public unsafe void TryToMimic()
+        {
+            const int size = 10 * 1024 * 1024;
+            int pid = Process.GetCurrentProcess().Id;
+
+            while (true)
+            {
+                void* writerBytesPointer = NativeMemory.Alloc(size);
+                void* readerBytesPointer = NativeMemory.Alloc(size);
+
+                try
+                {
+                    Span<byte> writerBytes = new Span<byte>(writerBytesPointer, size);
+                    Span<byte> readerBytes = new Span<byte>(readerBytesPointer, size);
+
+                    RandomNumberGenerator.Fill(writerBytes);
+                    writerBytes.CopyTo(readerBytes);
+
+                    if (!writerBytes.SequenceEqual(readerBytes))
+                    {
+                        using Process procDump = Process.Start(@"C:\Users\adsitnik\Downloads\Procdump\procdump.exe", $"-ma {pid}");
+                        procDump.WaitForExit();
+                        return;
+                    }
+                }
+                finally
+                {
+                    NativeMemory.Free(readerBytesPointer);
+                    NativeMemory.Free(writerBytesPointer);
+                }
+            }
+        }
     }
 }
