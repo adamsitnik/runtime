@@ -1156,16 +1156,9 @@ namespace System.Text
             uint utf16Data32BitsHigh = 0, utf16Data32BitsLow = 0;
             ulong utf16Data64Bits = 0;
 
-            // If SSE2 is supported, use those specific intrinsics instead of the generic vectorized
-            // code below. This has two benefits: (a) we can take advantage of specific instructions like
-            // pmovmskb, ptest, vpminuw which we know are optimized, and (b) we can avoid downclocking the
-            // processor while this method is running.
-
-            if ((Sse2.IsSupported || AdvSimd.Arm64.IsSupported) && BitConverter.IsLittleEndian)
+            if (Vector128.IsHardwareAccelerated && BitConverter.IsLittleEndian)
             {
-                Debug.Assert(BitConverter.IsLittleEndian, "Assume little endian if SSE2/Arm64 is supported.");
-
-                if (elementCount >= 2 * (uint)Unsafe.SizeOf<Vector128<byte>>())
+                if (elementCount >= 2 * (uint)Vector128<byte>.Count)
                 {
                     // Since there's overhead to setting up the vectorized code path, we only want to
                     // call into it after a quick probe to ensure the next immediate characters really are ASCII.
@@ -1386,25 +1379,18 @@ namespace System.Text
             return !Vector128.EqualsAll(zeroIsAscii, Vector128<ushort>.Zero);
         }
 
+        // LittleEndian:
+        // +---------------------------------------------------------------+
+        // | A | 0 | B | 0 | C | 0 | D | 0 | E | 0 | F | 0 | G | 0 | H | 0 |
+        // +---------------------------------------------------------------+
+        // Shuffle to "eat" the zeros
+        // +---------------------------------------------------------------+
+        // | A | B | C | D | E | F | G | H | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+        // +---------------------------------------------------------------+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> ExtractAsciiVector(Vector128<ushort> vectorFirst, Vector128<ushort> vectorSecond)
-        {
-            // Narrows two vectors of words [ w7 w6 w5 w4 w3 w2 w1 w0 ] and [ w7' w6' w5' w4' w3' w2' w1' w0' ]
-            // to a vector of bytes [ b7 ... b0 b7' ... b0'].
-
-            if (Sse2.IsSupported)
-            {
-                return Sse2.PackUnsignedSaturate(vectorFirst.AsInt16(), vectorSecond.AsInt16());
-            }
-            else if (AdvSimd.Arm64.IsSupported)
-            {
-                return AdvSimd.Arm64.UnzipEven(vectorFirst.AsByte(), vectorSecond.AsByte());
-            }
-            else
-            {
-                throw new PlatformNotSupportedException();
-            }
-        }
+        private static Vector64<byte> ExtractAsciiVector(Vector128<ushort> asciiVector)
+            => Vector128.Shuffle(asciiVector.AsByte(), Vector128.Create(0, 2, 4, 6, 8, 10, 12, 14, 255, 255, 255, 255, 255, 255, 255, 255))
+                        .GetLower();
 
         private static unsafe nuint NarrowUtf16ToAscii_Intrinsified(char* pUtf16Buffer, byte* pAsciiBuffer, nuint elementCount)
         {
@@ -1420,7 +1406,7 @@ namespace System.Text
             // jumps as much as possible in the optimistic case of "all ASCII". If we see non-ASCII
             // data, we jump out of the hot paths to targets at the end of the method.
 
-            Debug.Assert(Vector128.IsHardwareAccelerated, "Sse2 or AdvSimd64 required.");
+            Debug.Assert(Vector128.IsHardwareAccelerated, "Vector128 is required.");
             Debug.Assert(BitConverter.IsLittleEndian, "This implementation assumes little-endian.");
             Debug.Assert(elementCount >= 2 * SizeOfVector128);
 
@@ -1437,8 +1423,8 @@ namespace System.Text
             // Turn the 8 ASCII chars we just read into 8 ASCII bytes, then copy it to the destination.
 
             ref byte asciiBuffer = ref *pAsciiBuffer;
-            Vector128<byte> asciiVector = ExtractAsciiVector(utf16VectorFirst, utf16VectorFirst);
-            asciiVector.GetLower().StoreUnsafe(ref asciiBuffer);
+            Vector64<byte> asciiVector = ExtractAsciiVector(utf16VectorFirst);
+            asciiVector.StoreUnsafe(ref asciiBuffer);
             nuint currentOffsetInElements = SizeOfVector128 / 2; // we processed 8 elements so far
 
             // We're going to get the best performance when we have aligned writes, so we'll take the
@@ -1464,8 +1450,8 @@ namespace System.Text
                 }
 
                 // Turn the 8 ASCII chars we just read into 8 ASCII bytes, then copy it to the destination.
-                asciiVector = ExtractAsciiVector(utf16VectorFirst, utf16VectorFirst);
-                asciiVector.GetLower().StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
+                asciiVector = ExtractAsciiVector(utf16VectorFirst);
+                asciiVector.StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
             }
 
             // Calculate how many elements we wrote in order to get pAsciiBuffer to its next alignment
@@ -1494,8 +1480,7 @@ namespace System.Text
                 // Build up the ASCII vector and perform the store.
 
                 Debug.Assert(((nuint)pAsciiBuffer + currentOffsetInElements) % SizeOfVector128 == 0, "Write should be aligned.");
-                asciiVector = ExtractAsciiVector(utf16VectorFirst, utf16VectorSecond);
-                asciiVector.StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
+                Vector128.Narrow(utf16VectorFirst, utf16VectorSecond).StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
 
                 currentOffsetInElements += SizeOfVector128;
             } while (currentOffsetInElements <= finalOffsetWhereCanRunLoop);
@@ -1517,8 +1502,8 @@ namespace System.Text
             // First part was all ASCII, narrow and aligned write. Note we're only filling in the low half of the vector.
 
             Debug.Assert(((nuint)pAsciiBuffer + currentOffsetInElements) % sizeof(ulong) == 0, "Destination should be ulong-aligned.");
-            asciiVector = ExtractAsciiVector(utf16VectorFirst, utf16VectorFirst);
-            asciiVector.GetLower().StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
+            asciiVector = ExtractAsciiVector(utf16VectorFirst);
+            asciiVector.StoreUnsafe(ref asciiBuffer, currentOffsetInElements);
             currentOffsetInElements += SizeOfVector128 / 2;
 
             goto Finish;
