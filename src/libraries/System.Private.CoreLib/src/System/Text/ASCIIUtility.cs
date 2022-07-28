@@ -1379,18 +1379,9 @@ namespace System.Text
             return !Vector128.EqualsAll(zeroIsAscii, Vector128<ushort>.Zero);
         }
 
-        // LittleEndian:
-        // +---------------------------------------------------------------+
-        // | A | 0 | B | 0 | C | 0 | D | 0 | E | 0 | F | 0 | G | 0 | H | 0 |
-        // +---------------------------------------------------------------+
-        // Shuffle to "eat" the zeros
-        // +---------------------------------------------------------------+
-        // | A | B | C | D | E | F | G | H | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
-        // +---------------------------------------------------------------+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector64<byte> ExtractAsciiVector(Vector128<ushort> asciiVector)
-            => Vector128.Shuffle(asciiVector.AsByte(), Vector128.Create(0, 2, 4, 6, 8, 10, 12, 14, 255, 255, 255, 255, 255, 255, 255, 255))
-                        .GetLower();
+            => Vector128.Narrow(asciiVector, asciiVector).GetLower();
 
         private static unsafe nuint NarrowUtf16ToAscii_Intrinsified(char* pUtf16Buffer, byte* pAsciiBuffer, nuint elementCount)
         {
@@ -1688,8 +1679,8 @@ namespace System.Text
                 return 0;
             }
 
-            Vector128<byte> utf16FirstHalfVector = WidenAsciiBytes(asciiVector);
-            utf16FirstHalfVector.Store((byte*)pUtf16Buffer);
+            Vector128<ushort> utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
+            utf16FirstHalfVector.Store((ushort*)pUtf16Buffer);
 
             // Calculate how many elements we wrote in order to get pOutputBuffer to its next alignment
             // point, then use that as the base offset going forward. Remember the >> 1 to account for
@@ -1719,11 +1710,9 @@ namespace System.Text
                     goto NonAsciiDataSeenInInnerLoop;
                 }
 
-                Vector128<byte> low = WidenAsciiBytes(asciiVector);
-                low.StoreAligned((byte*)pCurrentWriteAddress);
-
-                Vector128<byte> high = Vector128.Shuffle(asciiVector, Vector128.Create((byte)8, 255, 9, 255, 10, 255, 11, 255, 12, 255, 13, 255, 14, 255, 15, 255));
-                high.StoreAligned((byte*)pCurrentWriteAddress + SizeOfVector128);
+                (Vector128<ushort> low, Vector128<ushort> high) = Vector128.Widen(asciiVector);
+                low.StoreAligned((ushort*)pCurrentWriteAddress);
+                high.StoreAligned((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
 
                 currentOffset += SizeOfVector128;
                 pCurrentWriteAddress += SizeOfVector128;
@@ -1740,8 +1729,8 @@ namespace System.Text
             if (!containsNonAsciiBytes)
             {
                 // First part was all ASCII, widen
-                utf16FirstHalfVector = WidenAsciiBytes(asciiVector);
-                utf16FirstHalfVector.StoreAligned((byte*)(pUtf16Buffer + currentOffset));
+                utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
+                utf16FirstHalfVector.StoreAligned((ushort*)(pUtf16Buffer + currentOffset));
                 currentOffset += SizeOfVector128 / 2;
             }
 
@@ -1760,7 +1749,7 @@ namespace System.Text
             if (Vector128.IsHardwareAccelerated)
             {
                 Vector128<byte> vecNarrow = Vector128.CreateScalar(value).AsByte();
-                Vector128<ulong> vecWide = WidenAsciiBytes(vecNarrow).AsUInt64();
+                Vector128<ulong> vecWide = Vector128.WidenLower(vecNarrow).AsUInt64();
                 Unsafe.WriteUnaligned<ulong>(ref Unsafe.As<char, byte>(ref outputBuffer), vecWide.ToScalar());
             }
             else
@@ -1787,23 +1776,5 @@ namespace System.Text
                 }
             }
         }
-
-        // Shuffle to put a zero after each element from the lower part of the vector:
-        // +---------------------------------------------------------------+
-        // | A | B | C | D | E | F | G | H | I | J | K | L | M | N | O | P |
-        // +---------------------------------------------------------------+
-        // LittleEndian: (Previously it was achieved with Sse2.UnpackLow(asciiVector, Vector128<byte>.Zero))
-        // +---------------------------------------------------------------+
-        // | A | 0 | B | 0 | C | 0 | D | 0 | E | 0 | F | 0 | G | 0 | H | 0 |
-        // +---------------------------------------------------------------+
-        // BigEndian:
-        // +---------------------------------------------------------------+
-        // | 0 | A | 0 | B | 0 | C | 0 | D | 0 | E | 0 | F | 0 | G | 0 | H |
-        // +---------------------------------------------------------------+
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> WidenAsciiBytes(Vector128<byte> asciiVector)
-             => BitConverter.IsLittleEndian
-                ? Vector128.Shuffle(asciiVector, Vector128.Create(0, 255, 1, 255, 2, 255, 3, 255, 4, 255, 5, 255, 6, 255, 7, 255))
-                : Vector128.Shuffle(asciiVector, Vector128.Create(255, 0, 255, 1, 255, 2, 255, 3, 255, 4, 255, 5, 255, 6, 255, 7));
     }
 }
