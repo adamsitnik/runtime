@@ -1767,9 +1767,9 @@ namespace System.Text
                 }
 
                 utf16HalfVector = Vector128.WidenLower(asciiVector);
-                utf16HalfVector.Store((ushort*)pCurrentWriteAddress);
+                utf16HalfVector.StoreAligned((ushort*)pCurrentWriteAddress);
                 utf16HalfVector = Vector128.WidenUpper(asciiVector);
-                utf16HalfVector.Store((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
+                utf16HalfVector.StoreAligned((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
 
                 currentOffset += SizeOfVector128;
                 pCurrentWriteAddress += SizeOfVector128;
