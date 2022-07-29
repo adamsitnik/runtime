@@ -1766,7 +1766,8 @@ namespace System.Text
                     goto NonAsciiDataSeenInInnerLoop;
                 }
 
-                (Vector128<ushort> low, Vector128<ushort> high) = Vector128.Widen(asciiVector);
+                Vector128<ushort> low = Vector128.WidenLower(asciiVector);
+                Vector128<ushort> high = Vector128.WidenUpper(asciiVector);
                 low.StoreAligned((ushort*)pCurrentWriteAddress);
                 high.StoreAligned((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
 
