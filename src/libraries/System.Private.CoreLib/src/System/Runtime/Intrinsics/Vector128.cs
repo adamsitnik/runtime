@@ -3767,6 +3767,7 @@ namespace System.Runtime.Intrinsics
         }
 
         [Intrinsic]
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static Vector128<ushort> WidenLower(Vector128<byte> source)
         {
             Unsafe.SkipInit(out Vector128<ushort> lower);
