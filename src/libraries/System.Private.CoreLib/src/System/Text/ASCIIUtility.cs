@@ -1735,8 +1735,8 @@ namespace System.Text
                 return 0;
             }
 
-            Vector128<ushort> utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
-            utf16FirstHalfVector.Store((ushort*)pUtf16Buffer);
+            Vector128<byte> utf16FirstHalfVector = UnpackLowZeros(asciiVector);
+            utf16FirstHalfVector.Store((byte*)pUtf16Buffer);
 
             // Calculate how many elements we wrote in order to get pOutputBuffer to its next alignment
             // point, then use that as the base offset going forward. Remember the >> 1 to account for
@@ -1766,9 +1766,10 @@ namespace System.Text
                     goto NonAsciiDataSeenInInnerLoop;
                 }
 
-                (Vector128<ushort> low, Vector128<ushort> high) = Vector128.Widen(asciiVector);
-                low.StoreAligned((ushort*)pCurrentWriteAddress);
-                high.StoreAligned((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
+                Vector128<byte> low = UnpackLowZeros(asciiVector);
+                Vector128<byte> high = Vector128.Shuffle(asciiVector, Vector128.Create((byte)8, 255, 9, 255, 10, 255, 11, 255, 12, 255, 13, 255, 14, 255, 15, 255));
+                low.StoreAligned((byte*)pCurrentWriteAddress);
+                high.StoreAligned((byte*)pCurrentWriteAddress + Vector128<byte>.Count);
 
                 currentOffset += SizeOfVector128;
                 pCurrentWriteAddress += SizeOfVector128;
@@ -1785,8 +1786,8 @@ namespace System.Text
             if (!containsNonAsciiBytes)
             {
                 // First part was all ASCII, widen
-                utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
-                utf16FirstHalfVector.StoreAligned((ushort*)(pUtf16Buffer + currentOffset));
+                utf16FirstHalfVector = UnpackLowZeros(asciiVector);
+                utf16FirstHalfVector.StoreAligned((byte*)(pUtf16Buffer + currentOffset));
                 currentOffset += SizeOfVector128 / 2;
             }
 
@@ -1805,7 +1806,7 @@ namespace System.Text
             if (Vector128.IsHardwareAccelerated)
             {
                 Vector128<byte> vecNarrow = Vector128.CreateScalar(value).AsByte();
-                Vector128<ulong> vecWide = Vector128.WidenLower(vecNarrow).AsUInt64();
+                Vector128<ulong> vecWide = UnpackLowZeros(vecNarrow).AsUInt64();
                 Unsafe.WriteUnaligned<ulong>(ref Unsafe.As<char, byte>(ref outputBuffer), vecWide.ToScalar());
             }
             else
@@ -1831,6 +1832,20 @@ namespace System.Text
                     outputBuffer = (char)value;
                 }
             }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<byte> UnpackLowZeros(Vector128<byte> asciiVector)
+        {
+            // Shuffle to put a zero after each element from the lower part of the vector:
+            // Previously it was achieved with Sse2.UnpackLow(asciiVector, Vector128<byte>.Zero);
+            // +---------------------------------------------------------------+
+            // | A | B | C | D | E | F | G | H | I | J | K | L | M | N | O | P |
+            // +---------------------------------------------------------------+
+            // +---------------------------------------------------------------+
+            // | A | 0 | B | 0 | C | 0 | D | 0 | E | 0 | F | 0 | G | 0 | H | 0 |
+            // +---------------------------------------------------------------+
+            return Vector128.Shuffle(asciiVector, Vector128.Create((byte)0, 255, 1, 255, 2, 255, 3, 255, 4, 255, 5, 255, 6, 255, 7, 255));
         }
     }
 }
