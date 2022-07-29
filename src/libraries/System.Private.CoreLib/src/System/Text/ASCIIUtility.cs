@@ -1705,7 +1705,18 @@ namespace System.Text
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static bool ContainsNonAsciiByte(Vector128<byte> asciiVector) => asciiVector.ExtractMostSignificantBits() != 0;
+        private static bool ContainsNonAsciiByte(Vector128<byte> value)
+        {
+            if (AdvSimd.Arm64.IsSupported)
+            {
+                value = AdvSimd.Arm64.MaxPairwise(value, value);
+                return (value.AsUInt64().ToScalar() & 0x8080808080808080) != 0;
+            }
+            else
+            {
+                return value.ExtractMostSignificantBits() != 0;
+            }
+        }
 
         private static unsafe nuint WidenAsciiToUtf16_Intrinsified(byte* pAsciiBuffer, char* pUtf16Buffer, nuint elementCount)
         {
