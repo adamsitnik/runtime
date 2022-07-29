@@ -1735,8 +1735,8 @@ namespace System.Text
                 return 0;
             }
 
-            Vector128<ushort> utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
-            utf16FirstHalfVector.Store((ushort*)pUtf16Buffer);
+            Vector128<ushort> utf16HalfVector = Vector128.WidenLower(asciiVector);
+            utf16HalfVector.Store((ushort*)pUtf16Buffer);
 
             // Calculate how many elements we wrote in order to get pOutputBuffer to its next alignment
             // point, then use that as the base offset going forward. Remember the >> 1 to account for
@@ -1766,10 +1766,10 @@ namespace System.Text
                     goto NonAsciiDataSeenInInnerLoop;
                 }
 
-                Vector128<ushort> low = Vector128.WidenLower(asciiVector);
-                Vector128<ushort> high = Vector128.WidenUpper(asciiVector);
-                low.StoreAligned((ushort*)pCurrentWriteAddress);
-                high.StoreAligned((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
+                utf16HalfVector = Vector128.WidenLower(asciiVector);
+                utf16HalfVector.Store((ushort*)pCurrentWriteAddress);
+                utf16HalfVector = Vector128.WidenUpper(asciiVector);
+                utf16HalfVector.Store((ushort*)pCurrentWriteAddress + Vector128<ushort>.Count);
 
                 currentOffset += SizeOfVector128;
                 pCurrentWriteAddress += SizeOfVector128;
@@ -1786,8 +1786,8 @@ namespace System.Text
             if (!containsNonAsciiBytes)
             {
                 // First part was all ASCII, widen
-                utf16FirstHalfVector = Vector128.WidenLower(asciiVector);
-                utf16FirstHalfVector.StoreAligned((ushort*)(pUtf16Buffer + currentOffset));
+                utf16HalfVector = Vector128.WidenLower(asciiVector);
+                utf16HalfVector.StoreAligned((ushort*)(pUtf16Buffer + currentOffset));
                 currentOffset += SizeOfVector128 / 2;
             }
 
