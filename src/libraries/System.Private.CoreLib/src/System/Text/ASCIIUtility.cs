@@ -1582,10 +1582,10 @@ namespace System.Text
             {
                 currentOffset = WidenAsciiToUtf16_Vector256(pAsciiBuffer, pUtf16Buffer, elementCount);
             }
-            else if (BitConverter.IsLittleEndian && Vector128.IsHardwareAccelerated && elementCount >= 2 * (uint)Vector128<byte>.Count)
-            {
-                currentOffset = WidenAsciiToUtf16_Vector128(pAsciiBuffer, pUtf16Buffer, elementCount);
-            }
+            //else if (BitConverter.IsLittleEndian && Vector128.IsHardwareAccelerated && elementCount >= 2 * (uint)Vector128<byte>.Count)
+            //{
+            //    currentOffset = WidenAsciiToUtf16_Vector128(pAsciiBuffer, pUtf16Buffer, elementCount);
+            //}
             else if (Vector.IsHardwareAccelerated)
             {
                 uint SizeOfVector = (uint)Unsafe.SizeOf<Vector<byte>>(); // JIT will make this a const
