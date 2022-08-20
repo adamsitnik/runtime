@@ -1582,10 +1582,10 @@ namespace System.Text
             {
                 currentOffset = WidenAsciiToUtf16_Vector256(pAsciiBuffer, pUtf16Buffer, elementCount);
             }
-            //else if (BitConverter.IsLittleEndian && Vector128.IsHardwareAccelerated && elementCount >= 2 * (uint)Vector128<byte>.Count)
-            //{
-            //    currentOffset = WidenAsciiToUtf16_Vector128(pAsciiBuffer, pUtf16Buffer, elementCount);
-            //}
+            else if (BitConverter.IsLittleEndian && Vector128.IsHardwareAccelerated && elementCount >= 2 * (uint)Vector128<byte>.Count)
+            {
+                currentOffset = WidenAsciiToUtf16_Vector128(pAsciiBuffer, pUtf16Buffer, elementCount);
+            }
             else if (Vector.IsHardwareAccelerated)
             {
                 uint SizeOfVector = (uint)Unsafe.SizeOf<Vector<byte>>(); // JIT will make this a const
@@ -1793,13 +1793,14 @@ namespace System.Text
         {
             Debug.Assert(AllBytesInUInt32AreAscii(value));
 
-            if (AdvSimd.Arm64.IsSupported)
-            {
-                Vector128<byte> vecNarrow = AdvSimd.DuplicateToVector128(value).AsByte();
-                Vector128<ulong> vecWide = AdvSimd.Arm64.ZipLow(vecNarrow, Vector128<byte>.Zero).AsUInt64();
-                Unsafe.WriteUnaligned<ulong>(ref Unsafe.As<char, byte>(ref outputBuffer), vecWide.ToScalar());
-            }
-            else if (Vector128.IsHardwareAccelerated)
+            //if (AdvSimd.Arm64.IsSupported)
+            //{
+            //    Vector128<byte> vecNarrow = AdvSimd.DuplicateToVector128(value).AsByte();
+            //    Vector128<ulong> vecWide = AdvSimd.Arm64.ZipLow(vecNarrow, Vector128<byte>.Zero).AsUInt64();
+            //    Unsafe.WriteUnaligned<ulong>(ref Unsafe.As<char, byte>(ref outputBuffer), vecWide.ToScalar());
+            //}
+            //else
+            if (Vector128.IsHardwareAccelerated)
             {
                 Vector128<byte> vecNarrow = Vector128.CreateScalar(value).AsByte();
                 Vector128<ulong> vecWide = Vector128.WidenLower(vecNarrow).AsUInt64();
