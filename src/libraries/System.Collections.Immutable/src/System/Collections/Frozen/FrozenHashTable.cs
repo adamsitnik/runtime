@@ -159,21 +159,35 @@ namespace System.Collections.Frozen
                 return HashHelpers.GetPrime(hashCodes.Length);
             }
 
-            // Filter out duplicate codes, since no increase in buckets will avoid collisions from duplicate input hash codes.
-            HashSet<int>? codes = hashCodesAreUnique ? null :
-#if NETCOREAPP2_0_OR_GREATER
-                new HashSet<int>(hashCodes.Length);
-#else
-                new HashSet<int>();
-#endif
+            // To filter out duplicate codes, we sort the hash codes and just skip the duplicates.
+            // The alternative is to allocate a hash set.
+            // This is required because no increase in buckets will avoid collisions from duplicate input hash codes.
+            int[]? codes = hashCodesAreUnique ? null : ArrayPool<int>.Shared.Rent(hashCodes.Length);
+            Span<int> sortedHashCodes;
+            int uniqueCodesCount;
             if (codes is not null)
             {
-                foreach (int hashCode in hashCodes)
+                hashCodes.CopyTo(codes);
+                Array.Sort(codes, 0, hashCodes.Length);
+                sortedHashCodes = new Span<int>(codes, 0, hashCodes.Length);
+
+                uniqueCodesCount = 1;
+                int previousValue = sortedHashCodes[0];
+                for (int i = 1; i < sortedHashCodes.Length; i++)
                 {
-                    codes.Add(hashCode);
+                    int currentValue = sortedHashCodes[i];
+                    if (currentValue != previousValue)
+                    {
+                        uniqueCodesCount++;
+                        previousValue = currentValue;
+                    }
                 }
             }
-            int uniqueCodesCount = hashCodesAreUnique ? hashCodes.Length : codes!.Count;
+            else
+            {
+                uniqueCodesCount = hashCodes.Length;
+                sortedHashCodes = default;
+            }
             Debug.Assert(uniqueCodesCount != 0);
 
             // In our precomputed primes table, find the index of the smallest prime that's at least as large as our number of
@@ -228,24 +242,31 @@ namespace System.Collections.Frozen
                 // track it as a collision.
                 int numCollisions = 0;
 
-                if (codes is not null && uniqueCodesCount != hashCodes.Length)
+                if (uniqueCodesCount != hashCodes.Length)
                 {
-                    foreach (int code in codes)
+                    int previousValue = sortedHashCodes[0] == 0 ? -1 : sortedHashCodes[0] * -1;
+                    for (int i = 0; i < sortedHashCodes.Length; i++)
                     {
-                        uint bucketNum = (uint)code % (uint)numBuckets;
-                        if ((seenBuckets[bucketNum / BitsPerInt32] & (1 << (int)bucketNum)) != 0)
+                        int currentValue = sortedHashCodes[i];
+                        if (currentValue != previousValue)
                         {
-                            numCollisions++;
-                            if (numCollisions >= bestNumCollisions)
+                            uint bucketNum = (uint)currentValue % (uint)numBuckets;
+                            if ((seenBuckets[bucketNum / BitsPerInt32] & (1 << (int)bucketNum)) != 0)
                             {
-                                // If we've already hit the previously known best number of collisions,
-                                // there's no point in continuing as worst case we'd just use that.
-                                break;
+                                numCollisions++;
+                                if (numCollisions >= bestNumCollisions)
+                                {
+                                    // If we've already hit the previously known best number of collisions,
+                                    // there's no point in continuing as worst case we'd just use that.
+                                    break;
+                                }
                             }
-                        }
-                        else
-                        {
-                            seenBuckets[bucketNum / BitsPerInt32] |= 1 << (int)bucketNum;
+                            else
+                            {
+                                seenBuckets[bucketNum / BitsPerInt32] |= 1 << (int)bucketNum;
+                            }
+
+                            previousValue = currentValue;
                         }
                     }
                 }
@@ -289,6 +310,10 @@ namespace System.Collections.Frozen
                 }
             }
 
+            if (codes is not null)
+            {
+                ArrayPool<int>.Shared.Return(codes);
+            }
             ArrayPool<int>.Shared.Return(seenBuckets);
 
             return bestNumBuckets;
