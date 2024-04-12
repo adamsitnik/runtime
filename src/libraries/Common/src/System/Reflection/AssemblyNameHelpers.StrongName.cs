@@ -2,7 +2,10 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Security;
+
+#nullable enable
 
 namespace System.Reflection
 {
@@ -16,8 +19,12 @@ namespace System.Reflection
             if (publicKey.Length == 0)
                 return Array.Empty<byte>();
 
+#if SYSTEM_PRIVATE_CORELIB
             if (!IsValidPublicKey(publicKey))
                 throw new SecurityException(SR.Security_InvalidAssemblyPublicKey);
+#else
+            Debug.Assert(IsValidPublicKey(publicKey));
+#endif
 
             Span<byte> hash = stackalloc byte[20];
 
@@ -35,7 +42,7 @@ namespace System.Reflection
         //
         // This validation logic is a port of StrongNameIsValidPublicKey() from src\coreclr\md\runtime\strongnameinternal.cpp
         //
-        private static bool IsValidPublicKey(byte[] publicKey)
+        internal static bool IsValidPublicKey(byte[] publicKey)
         {
             uint publicKeyLength = (uint)(publicKey.Length);
 
