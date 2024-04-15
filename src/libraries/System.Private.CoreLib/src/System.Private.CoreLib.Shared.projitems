@@ -647,6 +647,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyKeyNameAttribute.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyMetadataAttribute.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyName.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyNameHelpers.StrongName.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyNameFlags.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyNameProxy.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Reflection\AssemblyProductAttribute.cs" />
@@ -1477,9 +1478,6 @@
     </Compile>
     <Compile Include="$(CommonPath)System\Reflection\AssemblyNameFormatter.cs">
       <Link>Common\System\Reflection\AssemblyNameFormatter.cs</Link>
-    </Compile>
-    <Compile Include="$(CommonPath)System\Reflection\AssemblyNameHelpers.StrongName.cs">
-      <Link>Common\System\Reflection\AssemblyNameHelpers.StrongName.cs</Link>
     </Compile>
     <Compile Include="$(CommonPath)System\Reflection\Metadata\AssemblyNameInfo.cs">
       <Link>Common\System\Reflection\Metadata\AssemblyNameInfo.cs</Link>

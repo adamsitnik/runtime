@@ -2411,14 +2411,13 @@ namespace System.Reflection.Metadata
     public sealed partial class AssemblyNameInfo : System.IEquatable<System.Reflection.Metadata.AssemblyNameInfo>
     {
         public AssemblyNameInfo(string name, System.Version? version = null, string? cultureName = null, System.Reflection.AssemblyNameFlags flags = AssemblyNameFlags.None,
-           Collections.Immutable.ImmutableArray<byte> publicKey = default, Collections.Immutable.ImmutableArray<byte> publicKeyToken = default) { }
+           Collections.Immutable.ImmutableArray<byte> publicKeyOrToken = default) { }
         public string Name { get { throw null; } }
         public string? CultureName { get { throw null; } }
         public string FullName { get { throw null; } }
         public System.Version? Version { get { throw null; } }
         public System.Reflection.AssemblyNameFlags Flags { get { throw null; } }
-        public System.Collections.Immutable.ImmutableArray<byte> PublicKey { get { throw null; } }
-        public System.Collections.Immutable.ImmutableArray<byte> PublicKeyToken { get { throw null; } }
+        public System.Collections.Immutable.ImmutableArray<byte> PublicKeyOrToken { get { throw null; } }
         public static System.Reflection.Metadata.AssemblyNameInfo Parse(System.ReadOnlySpan<char> assemblyName) { throw null; }
         public static bool TryParse(System.ReadOnlySpan<char> assemblyName, [System.Diagnostics.CodeAnalysis.NotNullWhenAttribute(true)] out System.Reflection.Metadata.AssemblyNameInfo? result) { throw null; }
         public override bool Equals(object? obj) { throw null; }

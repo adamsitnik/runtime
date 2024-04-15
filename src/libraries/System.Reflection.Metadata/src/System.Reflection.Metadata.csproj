@@ -253,8 +253,6 @@ The System.Reflection.Metadata library is built-in as part of the shared framewo
     <Compile Include="System\Reflection\System.Reflection.cs" />
     <Compile Include="$(CommonPath)System\HexConverter.cs" Link="Common\System\HexConverter.cs" />
     <Compile Include="$(CommonPath)System\Obsoletions.cs" Link="Common\System\Obsoletions.cs" />
-    <Compile Include="$(CommonPath)System\Sha1ForNonSecretPurposes.cs" Link="Common\System\Sha1ForNonSecretPurposes.cs" />
-    <Compile Include="$(CommonPath)System\Reflection\AssemblyNameHelpers.StrongName.cs" Link="System\Reflection\AssemblyNameHelpers.StrongName.cs" />
     <Compile Include="$(CommonPath)System\Reflection\AssemblyNameFormatter.cs" Link="System\Reflection\AssemblyNameFormatter.cs" />
     <Compile Include="$(CommonPath)System\Reflection\AssemblyNameParser.cs" Link="System\Reflection\AssemblyNameParser.cs" />
     <Compile Include="$(CommonPath)System\Reflection\Metadata\AssemblyNameInfo.cs" Link="System\Reflection\Metadata\AssemblyNameInfo.cs" />

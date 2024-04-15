@@ -119,7 +119,6 @@ namespace System.Reflection.Metadata.Tests
                 Assert.Equal(expectedAssemblyName.Name, parsedAssemblyName.Name);
                 Assert.Equal(expectedAssemblyName.Version, parsedAssemblyName.Version);
                 Assert.Equal(expectedAssemblyName.CultureName, parsedAssemblyName.CultureName);
-                Assert.Equal(expectedAssemblyName.GetPublicKeyToken(), parsedAssemblyName.PublicKeyToken.ToArray());
                 Assert.Equal(expectedAssemblyName.FullName, parsedAssemblyName.FullName);
 
                 Assert.Equal(default, parsedAssemblyName.Flags);

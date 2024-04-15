@@ -20,32 +20,13 @@ namespace System.Reflection.Metadata
         private string? _fullName;
 
 #if !SYSTEM_PRIVATE_CORELIB
-        public AssemblyNameInfo(string name, Version? version = null, string? cultureName = null, AssemblyNameFlags flags = AssemblyNameFlags.None,
-           Collections.Immutable.ImmutableArray<byte> publicKey = default, Collections.Immutable.ImmutableArray<byte> publicKeyToken = default)
+        public AssemblyNameInfo(string name, Version? version = null, string? cultureName = null, AssemblyNameFlags flags = AssemblyNameFlags.None, Collections.Immutable.ImmutableArray<byte> publicKeyOrToken = default)
         {
             Name = name ?? throw new ArgumentNullException(nameof(name));
             Version = version;
             CultureName = cultureName;
-
-            if (!publicKey.IsDefaultOrEmpty
-#if NET8_0_OR_GREATER
-                && ValidatePublicKey(Runtime.InteropServices.ImmutableCollectionsMarshal.AsArray(publicKey)))
-#else
-                && ValidatePublicKey(System.Linq.ImmutableArrayExtensions.ToArray(publicKey)))
-#endif
-            {
-                throw new ArgumentException("SR.Security_InvalidAssemblyPublicKey", nameof(publicKey)); // TODO adsitnik: use actual resource
-            }
-
-            PublicKey = publicKey;
-            PublicKeyToken = publicKeyToken;
-
-            if (!publicKey.IsDefaultOrEmpty)
-            {
-                flags |= AssemblyNameFlags.PublicKey;
-            }
-
             Flags = flags;
+            PublicKeyOrToken = publicKeyOrToken;
         }
 #endif
 
@@ -55,22 +36,15 @@ namespace System.Reflection.Metadata
             Version = parts._version;
             CultureName = parts._cultureName;
             Flags = parts._flags;
-
-            bool publicKey = (parts._flags & AssemblyNameFlags.PublicKey) != 0;
-
 #if SYSTEM_PRIVATE_CORELIB
-            PublicKey = publicKey ? parts._publicKeyOrToken : null;
-            PublicKeyToken = publicKey ? null : parts._publicKeyOrToken;
+            PublicKeyOrToken = parts._publicKeyOrToken;
 #else
-            PublicKey = ToImmutable(publicKey ? parts._publicKeyOrToken : null);
-            PublicKeyToken = ToImmutable(publicKey ? null : parts._publicKeyOrToken);
-
-            static Collections.Immutable.ImmutableArray<byte> ToImmutable(byte[]? bytes)
-               => bytes is null ? default : bytes.Length == 0 ? Collections.Immutable.ImmutableArray<byte>.Empty :
+            PublicKeyOrToken = parts._publicKeyOrToken is null ? default : parts._publicKeyOrToken.Length == 0
+                ? Collections.Immutable.ImmutableArray<byte>.Empty
     #if NET8_0_OR_GREATER
-                    Runtime.InteropServices.ImmutableCollectionsMarshal.AsImmutableArray(bytes);
+                : Runtime.InteropServices.ImmutableCollectionsMarshal.AsImmutableArray(parts._publicKeyOrToken);
     #else
-                    Collections.Immutable.ImmutableArray.Create(bytes);
+                : Collections.Immutable.ImmutableArray.Create(parts._publicKeyOrToken);
     #endif
 #endif
         }
@@ -81,11 +55,9 @@ namespace System.Reflection.Metadata
         public AssemblyNameFlags Flags { get; }
 
 #if SYSTEM_PRIVATE_CORELIB
-        public byte[]? PublicKey { get; }
-        public byte[]? PublicKeyToken { get; }
+        public byte[]? PublicKeyOrToken { get; }
 #else
-        public Collections.Immutable.ImmutableArray<byte> PublicKey { get; }
-        public Collections.Immutable.ImmutableArray<byte> PublicKeyToken { get; }
+        public Collections.Immutable.ImmutableArray<byte> PublicKeyOrToken { get; }
 #endif
 
         public string FullName
@@ -94,22 +66,15 @@ namespace System.Reflection.Metadata
             {
                 if (_fullName is null)
                 {
+                    byte[]? publicKeyToken = ((Flags & AssemblyNameFlags.PublicKey) != 0) ? null :
 #if SYSTEM_PRIVATE_CORELIB
-                    byte[]? pkt = PublicKeyToken ?? AssemblyNameHelpers.ComputePublicKeyToken(PublicKey);
+                    PublicKeyOrToken;
 #elif NET8_0_OR_GREATER
-                    byte[]? pkt = !PublicKeyToken.IsDefault
-                        ? Runtime.InteropServices.ImmutableCollectionsMarshal.AsArray(PublicKeyToken)
-                        : !PublicKey.IsDefault
-                            ? AssemblyNameHelpers.ComputePublicKeyToken(Runtime.InteropServices.ImmutableCollectionsMarshal.AsArray(PublicKey))
-                            : null;
+                    !PublicKeyOrToken.IsDefault ? Runtime.InteropServices.ImmutableCollectionsMarshal.AsArray(PublicKeyOrToken) : null;
 #else
-                    byte[]? pkt = !PublicKeyToken.IsDefault
-                        ? System.Linq.ImmutableArrayExtensions.ToArray(PublicKeyToken)
-                        : !PublicKey.IsDefault
-                            ? AssemblyNameHelpers.ComputePublicKeyToken(System.Linq.ImmutableArrayExtensions.ToArray(PublicKey))
-                            : null;
+                    ToArray(PublicKeyOrToken);
 #endif
-                    _fullName = AssemblyNameFormatter.ComputeDisplayName(Name, Version, CultureName, pkt/*, ExtractAssemblyNameFlags(Flags), ExtractAssemblyContentType(Flags)*/); ;
+                    _fullName = AssemblyNameFormatter.ComputeDisplayName(Name, Version, CultureName, publicKeyToken/*, ExtractAssemblyNameFlags(Flags), ExtractAssemblyContentType(Flags)*/); ;
                 }
 
                 return _fullName;
@@ -138,12 +103,7 @@ namespace System.Reflection.Metadata
                 }
             }
 
-            if (!SequenceEqual(PublicKey, other.PublicKey) || !SequenceEqual(PublicKeyToken, other.PublicKeyToken))
-            {
-                return false;
-            }
-
-            return true;
+            return SequenceEqual(PublicKeyOrToken, other.PublicKeyOrToken);
 
 #if SYSTEM_PRIVATE_CORELIB
             static bool SequenceEqual(byte[]? left, byte[]? right)
@@ -215,18 +175,31 @@ namespace System.Reflection.Metadata
 
 #if SYSTEM_PRIVATE_CORELIB
             assemblyName._flags = Flags;
-            assemblyName.SetPublicKey(PublicKey);
-            assemblyName.SetPublicKeyToken(PublicKeyToken);
+
+            if (PublicKeyOrToken is not null)
+            {
+                if ((Flags & AssemblyNameFlags.PublicKey) != 0)
+                {
+                    assemblyName.SetPublicKey(PublicKeyOrToken);
+                }
+                else
+                {
+                    assemblyName.SetPublicKeyToken(PublicKeyOrToken);
+                }
+            }
 #else
             assemblyName.Flags = Flags;
 
-            if (!PublicKey.IsDefault)
+            if (!PublicKeyOrToken.IsDefault)
             {
-                assemblyName.SetPublicKey(System.Linq.ImmutableArrayExtensions.ToArray(PublicKey));
-            }
-            if (!PublicKeyToken.IsDefault)
-            {
-                assemblyName.SetPublicKeyToken(System.Linq.ImmutableArrayExtensions.ToArray(PublicKeyToken));
+                if ((Flags & AssemblyNameFlags.PublicKey) != 0)
+                {
+                    assemblyName.SetPublicKey(ToArray(PublicKeyOrToken));
+                }
+                else
+                {
+                    assemblyName.SetPublicKeyToken(ToArray(PublicKeyOrToken));
+                }
             }
 #endif
 
@@ -250,15 +223,10 @@ namespace System.Reflection.Metadata
         /// <param name="assemblyName">A span containing the characters representing the assembly name to parse.</param>
         /// <param name="result">Contains the result when parsing succeeds.</param>
         /// <returns>true if assembly name was converted successfully, otherwise, false.</returns>
-        public static bool TryParse(ReadOnlySpan<char> assemblyName,
-#if SYSTEM_REFLECTION_METADATA || SYSTEM_PRIVATE_CORELIB // required by some tools that include this file but don't include the attribute
-            [NotNullWhen(true)]
-#endif
-            out AssemblyNameInfo? result)
+        public static bool TryParse(ReadOnlySpan<char> assemblyName, [NotNullWhen(true)] out AssemblyNameInfo? result)
         {
             AssemblyNameParser.AssemblyNameParts parts = default;
-            if (AssemblyNameParser.TryParse(assemblyName, ref parts)
-                && ((parts._flags & AssemblyNameFlags.PublicKey) == 0 || ValidatePublicKey(parts._publicKeyOrToken)))
+            if (AssemblyNameParser.TryParse(assemblyName, ref parts))
             {
                 result = new(parts);
                 return true;
@@ -268,9 +236,23 @@ namespace System.Reflection.Metadata
             return false;
         }
 
-        private static bool ValidatePublicKey(byte[]? publicKey)
-            => publicKey is null
-            || publicKey.Length == 0
-            || AssemblyNameHelpers.IsValidPublicKey(publicKey);
+#if !SYSTEM_PRIVATE_CORELIB
+        private static byte[]? ToArray(Collections.Immutable.ImmutableArray<byte> input)
+        {
+            // not using System.Linq.ImmutableArrayExtensions.ToArray as TypeSystem does not allow System.Linq..
+            if (input.IsDefault)
+            {
+                return null;
+            }
+            else if (input.IsEmpty)
+            {
+                return Array.Empty<byte>();
+            }
+
+            byte[] result = new byte[input.Length];
+            input.CopyTo(result, 0);
+            return result;
+        }
+#endif
     }
 }
