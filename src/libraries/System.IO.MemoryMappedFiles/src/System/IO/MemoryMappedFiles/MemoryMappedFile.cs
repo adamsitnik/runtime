@@ -430,6 +430,11 @@ namespace System.IO.MemoryMappedFiles
 
         public MemoryMappedViewAccessor CreateViewAccessor(long offset, long size, MemoryMappedFileAccess access)
         {
+            return CreateViewAccessor(offset, size, access, true);
+        }
+
+        public MemoryMappedViewAccessor CreateViewAccessor(long offset, long size, MemoryMappedFileAccess access, bool flushOnDispose = true)
+        {
             ArgumentOutOfRangeException.ThrowIfNegative(offset);
 
             if (size < 0)
@@ -448,7 +453,7 @@ namespace System.IO.MemoryMappedFiles
             }
 
             MemoryMappedView view = MemoryMappedView.CreateView(_handle, access, offset, size);
-            return new MemoryMappedViewAccessor(view);
+            return new MemoryMappedViewAccessor(view, flushOnDispose);
         }
 
         public void Dispose()

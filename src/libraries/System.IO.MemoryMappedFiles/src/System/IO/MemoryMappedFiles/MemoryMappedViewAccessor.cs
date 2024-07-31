@@ -9,12 +9,14 @@ namespace System.IO.MemoryMappedFiles
     public sealed class MemoryMappedViewAccessor : UnmanagedMemoryAccessor
     {
         private readonly MemoryMappedView _view;
+        private readonly bool _flushOnDispose;
 
-        internal MemoryMappedViewAccessor(MemoryMappedView view)
+        internal MemoryMappedViewAccessor(MemoryMappedView view, bool flushOnDispose)
         {
             Debug.Assert(view != null, "view is null");
 
             _view = view;
+            _flushOnDispose = flushOnDispose;
             Initialize(_view.ViewHandle, _view.PointerOffset, _view.Size, MemoryMappedFile.GetFileAccess(_view.Access));
         }
 
@@ -34,7 +36,7 @@ namespace System.IO.MemoryMappedFiles
             {
                 // Explicitly flush the changes.  The OS will do this for us anyway, but not until after the
                 // MemoryMappedFile object itself is closed.
-                if (disposing && !_view.IsClosed && CanWrite)
+                if (disposing && _flushOnDispose && !_view.IsClosed && CanWrite)
                 {
                     Flush();
                 }
