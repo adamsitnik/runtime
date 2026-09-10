@@ -31,9 +31,10 @@ namespace System.Threading
             // The shared ring handle, or IntPtr.Zero if unavailable/disabled. Set at most once.
             private static readonly IntPtr s_ringHandle;
 
-            // Guards (a) pushing SQEs + the non-blocking submit-only io_uring_enter call, and
-            // (b) draining currently-available CQEs after a driver wakes up. Never held across the
-            // blocking io_uring_enter(min_complete: 1) wait itself.
+            // Guards pushing SQEs and the non-blocking submit-only io_uring_enter call in TrySubmit -
+            // i.e., only the SQ ring. The CQ ring needs no lock at all: exclusive access to it is
+            // guaranteed by the s_isDriving CAS below (only the elected driver ever reads completions),
+            // and the SQ/CQ rings are separate mmap'd memory regions, so the two don't contend.
             private static readonly Lock s_lock = new Lock();
 
             // CAS slot: 0 == no one is currently driving completions, 1 == a driver is active.
@@ -143,7 +144,13 @@ namespace System.Threading
 
                 try
                 {
-                    // Block in-kernel, outside of the lock, until at least one completion is available.
+                    // No lock is needed here, or in the drain loop below: s_lock only ever guards the SQ
+                    // ring (pushing new SQEs in TrySubmit), which is entirely separate mmap'd memory from
+                    // the CQ ring read here. Exclusive access to the CQ ring is instead guaranteed by the
+                    // s_isDriving CAS above - only the winning thread ever calls IoRingWaitForCompletions,
+                    // for the whole duration of this method. Taking s_lock around the first (blocking)
+                    // call would also risk stalling every concurrent TrySubmit caller for as long as this
+                    // thread waits in-kernel for a completion, which can be indefinite.
                     Interop.Sys.IoRingCompletion completion = default;
                     int result = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, &completion, 1, minComplete: 1, out int completedCount);
                     if (result != 0 || completedCount == 0)
@@ -157,14 +164,10 @@ namespace System.Threading
                     while (true)
                     {
                         Interop.Sys.IoRingCompletion nextCompletion = default;
-                        int nextResult;
-                        using (s_lock.EnterScope())
+                        int nextResult = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, &nextCompletion, 1, minComplete: 0, out int nextCompletedCount);
+                        if (nextResult != 0 || nextCompletedCount == 0)
                         {
-                            nextResult = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, &nextCompletion, 1, minComplete: 0, out int nextCompletedCount);
-                            if (nextResult != 0 || nextCompletedCount == 0)
-                            {
-                                break;
-                            }
+                            break;
                         }
 
                         Dispatch(nextCompletion);
