@@ -2258,12 +2258,16 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
         case IoRingOp_ReadV:
             sqe->opcode = IORING_OP_READV;
             sqe->addr = (uint64_t)(uintptr_t)request->Vectors;
-            sqe->len = (uint32_t)request->VectorCount;
+            // Just like plain readv(2)/writev(2) (see GetAllowedVectorCount above), io_uring
+            // rejects IORING_OP_READV/WRITEV with more than IOV_MAX vectors (EINVAL). The managed
+            // caller is responsible for handling a resulting short read/write by resubmitting the
+            // remainder, the same way it already does for the non-io_uring PReadV/PWriteV path.
+            sqe->len = (uint32_t)GetAllowedVectorCount(request->Vectors, request->VectorCount);
             break;
         case IoRingOp_WriteV:
             sqe->opcode = IORING_OP_WRITEV;
             sqe->addr = (uint64_t)(uintptr_t)request->Vectors;
-            sqe->len = (uint32_t)request->VectorCount;
+            sqe->len = (uint32_t)GetAllowedVectorCount(request->Vectors, request->VectorCount);
             break;
     }
 }
@@ -2323,15 +2327,14 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
         params.cq_entries = (uint32_t)completionQueueDepth;
     }
 
-    // Try the flags that give the best completion-reaping performance (kernel 6.1+); an older
-    // kernel will reject them with EINVAL, so fall back to no special flags in that case.
-    params.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    // Deliberately no IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN here: this ring is
+    // shared across (and submitted to / drained from) many different threads - any Thread Pool
+    // worker thread may call SystemNative_IoRingSubmit, and the thread that reaps completions via
+    // SystemNative_IoRingWaitForCompletions rotates over time. SINGLE_ISSUER requires all
+    // submissions to come from one fixed thread/task, and the kernel enforces this by rejecting
+    // io_uring_enter(2) from any other thread with -EEXIST once a first "issuer" is established -
+    // which is incompatible with this design (see the io_uring PAL/ThreadPool design notes).
     long fd = IoUringSetup((uint32_t)submissionQueueDepth, &params);
-    if (fd < 0 && errno == EINVAL)
-    {
-        params.flags &= ~(uint32_t)(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
-        fd = IoUringSetup((uint32_t)submissionQueueDepth, &params);
-    }
 
     if (fd < 0)
     {
@@ -2442,13 +2445,19 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
 
     __atomic_store_n(ring->SqTail, sqTail, __ATOMIC_RELEASE);
 
-    long result = IoUringEnter(ring->Fd, (uint32_t)queued, 0, 0);
-    if (result < 0)
-    {
-        return -1;
-    }
+    // The entries above are now published via the SQ tail and visible to the kernel; this
+    // cannot be undone. io_uring_enter's to_submit is merely a hint asking the kernel to
+    // consume them right now - if it fails (e.g. transient -EBUSY/-EAGAIN back-pressure) or
+    // reports fewer than `queued`, the not-yet-consumed entries simply remain published and
+    // will be picked up by a later io_uring_enter call (the next submission, or while
+    // waiting for completions), still producing a completion for each of them. So the result
+    // of this call must NOT cause us to report back fewer than `queued` as submitted - doing
+    // so would let the caller believe (and act as though, e.g. by freeing correlation state)
+    // that an entry was never queued when it actually was/may still be processed by the
+    // kernel, leading to a completion later referencing already-freed state.
+    IoUringEnter(ring->Fd, (uint32_t)queued, 0, 0);
 
-    *submittedCount = (int32_t)result;
+    *submittedCount = queued;
     return 0;
 #else
     (void)ringHandle, (void)requests, (void)requestCount;

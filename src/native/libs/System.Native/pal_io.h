@@ -967,9 +967,14 @@ PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_
 /**
  * Submits a batch of requests to the given ring in a single io_uring_enter call.
  *
- * Returns 0 on success (with *submittedCount set to the number of requests actually submitted);
- * otherwise, returns -1 and sets errno. A return of 0 with *submittedCount less than requestCount
+ * Returns 0 on success (with *submittedCount set to the number of requests actually queued
+ * into the ring's submission queue - i.e., durably published and guaranteed to eventually
+ * produce a matching completion). A return of 0 with *submittedCount less than requestCount
  * means the submission queue was full; the caller should retry the remaining requests later.
+ * Once a request is counted in *submittedCount, it must not be treated as "not submitted"
+ * even if this call otherwise reports an error queueing kernel-side processing of it - it is
+ * already visible to the kernel and will complete. Returns -1 and sets errno only when no
+ * requests at all could be queued due to a genuine failure (e.g., an invalid ring handle).
  */
 PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
 

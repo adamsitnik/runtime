@@ -106,6 +106,20 @@ namespace System.Threading
                 if (submitted)
                 {
                     Interlocked.Increment(ref s_inFlightCount);
+
+                    // A worker only re-checks TryBecomeDriverAndDrive() opportunistically, right before it
+                    // would otherwise park, and submitting via io_uring does not go through the normal
+                    // work-queue/semaphore signaling path that would normally wake such a check. Without
+                    // this, if every existing worker thread is already parked (blocked in the semaphore
+                    // wait) when this operation is submitted, no thread would ever revisit the loop to
+                    // notice the new in-flight operation, and its completion would never be reaped - a
+                    // permanent hang. Explicitly wake (or create) a worker so it loops back to the top of
+                    // its dispatch loop and gets a chance to become the driver. This mirrors exactly what
+                    // enqueuing an ordinary Thread Pool work item already does to guarantee a worker runs.
+                    if (Volatile.Read(ref s_isDriving) == 0)
+                    {
+                        WorkerThread.MaybeAddWorkingWorker(ThreadPoolInstance);
+                    }
                 }
                 else
                 {
