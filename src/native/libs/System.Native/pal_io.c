@@ -2446,21 +2446,42 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
     __atomic_store_n(ring->SqTail, sqTail, __ATOMIC_RELEASE);
 
     // The entries above are now published via the SQ tail and visible to the kernel; this
-    // cannot be undone. io_uring_enter's to_submit is merely a hint asking the kernel to
-    // consume them right now - if it fails (e.g. transient -EBUSY/-EAGAIN back-pressure) or
-    // reports fewer than `queued`, the not-yet-consumed entries simply remain published and
-    // will be picked up by a later io_uring_enter call (the next submission, or while
-    // waiting for completions), still producing a completion for each of them. So the result
-    // of this call must NOT cause us to report back fewer than `queued` as submitted - doing
-    // so would let the caller believe (and act as though, e.g. by freeing correlation state)
-    // that an entry was never queued when it actually was/may still be processed by the
-    // kernel, leading to a completion later referencing already-freed state.
-    IoUringEnter(ring->Fd, (uint32_t)queued, 0, 0);
-
+    // cannot be undone. Deliberately do NOT call io_uring_enter here - see
+    // SystemNative_IoRingKick. Doing the (relatively expensive, and otherwise-unnecessary-to-
+    // serialize) syscall outside of whatever lock protects this enqueue step lets many
+    // threads publish new entries into a shared ring quickly, without each blocking the next
+    // behind a full syscall while holding that lock.
     *submittedCount = queued;
     return 0;
 #else
     (void)ringHandle, (void)requests, (void)requestCount;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingKick(intptr_t ringHandle)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Ask the kernel to consume as many currently-enqueued-but-not-yet-submitted entries as
+    // possible. Passing the full ring depth (rather than trying to track exactly how many are
+    // new) is safe: io_uring_enter only ever consumes what is actually available between its
+    // own internal submission cursor and the current SQ tail, capped at to_submit - so this is
+    // simply "submit everything pending" and never over-consumes or double-processes entries.
+    // A negative/short result is not an error here: if another thread's concurrent kick (or
+    // the driver's own waiting enter call) already consumed everything, this call legitimately
+    // has nothing to do and that is not a failure.
+    IoUringEnter(ring->Fd, ring->SqEntries, 0, 0);
+    return 0;
+#else
+    (void)ringHandle;
     errno = ENOTSUP;
     return -1;
 #endif

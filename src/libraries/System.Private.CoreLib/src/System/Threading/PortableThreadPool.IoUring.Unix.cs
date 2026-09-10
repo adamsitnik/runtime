@@ -15,13 +15,21 @@ namespace System.Threading
         /// completions" rotates: any worker thread that is about to park first attempts a non-blocking
         /// CAS on a single "driver" slot. The thread that wins blocks in <c>io_uring_enter</c> waiting for
         /// at least one completion, then (without running any continuation inline) queues the
-        /// corresponding continuations as ordinary Thread Pool work items.
+        /// corresponding continuations as ordinary Thread Pool work items. At any given moment, at most
+        /// one thread is ever reaping completions - the CAS guarantees this remains a single-driver
+        /// design even under high submission concurrency.
         /// </summary>
         internal static class IoUringThreadPool
         {
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive (or sharded across multiple rings) in a future iteration.
             private const int QueueDepth = 1024;
+
+            // Maximum number of completions fetched per IoRingWaitForCompletions call. Batching here
+            // means a driver that wakes up to many simultaneously-ready completions (e.g. under high
+            // concurrency) drains all of them via a single syscall instead of one syscall per
+            // completion.
+            private const int MaxCompletionsPerWait = 64;
 
             // Opt-out switch: io_uring integration is used by default on Linux when the kernel supports
             // it. Set DOTNET_USE_IO_URING=0 to fall back to the pre-existing (blocking-call-on-a-
@@ -31,13 +39,18 @@ namespace System.Threading
             // The shared ring handle, or IntPtr.Zero if unavailable/disabled. Set at most once.
             private static readonly IntPtr s_ringHandle;
 
-            // Guards pushing SQEs and the non-blocking submit-only io_uring_enter call in TrySubmit -
-            // i.e., only the SQ ring. The CQ ring needs no lock at all: exclusive access to it is
-            // guaranteed by the s_isDriving CAS below (only the elected driver ever reads completions),
-            // and the SQ/CQ rings are separate mmap'd memory regions, so the two don't contend.
+            // Guards pushing SQEs (writing into the SQE array and publishing the new SQ tail) in
+            // TrySubmit - i.e., only the SQ ring's producer-side bookkeeping. It does NOT guard the
+            // io_uring_enter "kick" syscall (see IoRingKick), which is safe to call concurrently from
+            // multiple threads and is deliberately done outside this lock so that submitting threads
+            // don't serialize behind each other's syscalls - only the (much cheaper) in-memory SQE
+            // write. The CQ ring needs no lock at all: exclusive access to it is guaranteed by the
+            // s_isDriving CAS below (only the elected driver ever reads completions), and the SQ/CQ
+            // rings are separate mmap'd memory regions, so the two don't contend.
             private static readonly Lock s_lock = new Lock();
 
-            // CAS slot: 0 == no one is currently driving completions, 1 == a driver is active.
+            // CAS slot: 0 == no one is currently driving completions, 1 == a driver is active. At most
+            // one thread ever holds this at a time - completions are always reaped by a single thread.
             private static int s_isDriving;
 
             // Number of io_uring operations submitted but not yet completed. Used to avoid a thread
@@ -105,6 +118,12 @@ namespace System.Threading
 
                 if (submitted)
                 {
+                    // Ask the kernel to act on the entry just enqueued. Deliberately done outside
+                    // s_lock (see its doc comment): this is a plain io_uring_enter syscall, safe to
+                    // call concurrently with other threads' kicks/enqueues on this non-SINGLE_ISSUER
+                    // ring, so there's no need to serialize it behind the (much shorter) enqueue lock.
+                    Interop.Sys.IoRingKick(s_ringHandle);
+
                     Interlocked.Increment(ref s_inFlightCount);
 
                     // A worker only re-checks TryBecomeDriverAndDrive() opportunistically, right before it
@@ -158,33 +177,53 @@ namespace System.Threading
 
                 try
                 {
-                    // No lock is needed here, or in the drain loop below: s_lock only ever guards the SQ
-                    // ring (pushing new SQEs in TrySubmit), which is entirely separate mmap'd memory from
-                    // the CQ ring read here. Exclusive access to the CQ ring is instead guaranteed by the
-                    // s_isDriving CAS above - only the winning thread ever calls IoRingWaitForCompletions,
-                    // for the whole duration of this method. Taking s_lock around the first (blocking)
-                    // call would also risk stalling every concurrent TrySubmit caller for as long as this
-                    // thread waits in-kernel for a completion, which can be indefinite.
-                    Interop.Sys.IoRingCompletion completion = default;
-                    int result = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, &completion, 1, minComplete: 1, out int completedCount);
-                    if (result != 0 || completedCount == 0)
+                    // No lock is needed here: s_lock only ever guards the SQ ring's producer-side
+                    // bookkeeping (pushing new SQEs in TrySubmit), which is entirely separate mmap'd
+                    // memory from the CQ ring read here. Exclusive access to the CQ ring is instead
+                    // guaranteed by the s_isDriving CAS above - only the winning thread ever calls
+                    // IoRingWaitForCompletions, for the whole duration of this method. Taking s_lock
+                    // around the first (blocking) call would also risk stalling every concurrent
+                    // TrySubmit caller for as long as this thread waits in-kernel for a completion,
+                    // which can be indefinite.
+                    //
+                    // Each call below fetches up to MaxCompletionsPerWait completions in a single
+                    // syscall (the native side already drains everything currently available up to
+                    // that count), so a driver that wakes up to many simultaneously-ready completions
+                    // does not need one syscall per completion.
+                    Span<Interop.Sys.IoRingCompletion> completions = stackalloc Interop.Sys.IoRingCompletion[MaxCompletionsPerWait];
+
+                    int completedCount;
+                    fixed (Interop.Sys.IoRingCompletion* completionsPtr = completions)
                     {
-                        return true;
+                        int result = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, completionsPtr, MaxCompletionsPerWait, minComplete: 1, out completedCount);
+                        if (result != 0 || completedCount == 0)
+                        {
+                            return true;
+                        }
                     }
 
-                    Dispatch(completion);
+                    for (int i = 0; i < completedCount; i++)
+                    {
+                        Dispatch(completions[i]);
+                    }
 
                     // Drain any additional completions that are already available without waiting again.
                     while (true)
                     {
-                        Interop.Sys.IoRingCompletion nextCompletion = default;
-                        int nextResult = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, &nextCompletion, 1, minComplete: 0, out int nextCompletedCount);
-                        if (nextResult != 0 || nextCompletedCount == 0)
+                        int nextCompletedCount;
+                        fixed (Interop.Sys.IoRingCompletion* completionsPtr = completions)
                         {
-                            break;
+                            int nextResult = Interop.Sys.IoRingWaitForCompletions(s_ringHandle, completionsPtr, MaxCompletionsPerWait, minComplete: 0, out nextCompletedCount);
+                            if (nextResult != 0 || nextCompletedCount == 0)
+                            {
+                                break;
+                            }
                         }
 
-                        Dispatch(nextCompletion);
+                        for (int i = 0; i < nextCompletedCount; i++)
+                        {
+                            Dispatch(completions[i]);
+                        }
                     }
                 }
                 finally

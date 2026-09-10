@@ -965,18 +965,37 @@ PALEXPORT int32_t SystemNative_IoRingIsAvailable(void);
 PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, intptr_t* ringHandle);
 
 /**
- * Submits a batch of requests to the given ring in a single io_uring_enter call.
+ * Enqueues a batch of requests into the given ring's submission queue (writing SQEs and
+ * publishing the new SQ tail), but does NOT call io_uring_enter - the kernel will not act on
+ * these entries until a subsequent call to SystemNative_IoRingKick (or
+ * SystemNative_IoRingWaitForCompletions with minComplete > 0, which also submits). This split
+ * exists so that many threads can cheaply enqueue into a shared ring (a fast, non-blocking
+ * memory operation) without each having to serialize behind a full io_uring_enter syscall;
+ * the (relatively cheap, and safe to call concurrently from multiple threads on a non-
+ * SINGLE_ISSUER ring) kick can then happen outside of whatever lock protects enqueuing.
  *
  * Returns 0 on success (with *submittedCount set to the number of requests actually queued
  * into the ring's submission queue - i.e., durably published and guaranteed to eventually
- * produce a matching completion). A return of 0 with *submittedCount less than requestCount
- * means the submission queue was full; the caller should retry the remaining requests later.
- * Once a request is counted in *submittedCount, it must not be treated as "not submitted"
- * even if this call otherwise reports an error queueing kernel-side processing of it - it is
- * already visible to the kernel and will complete. Returns -1 and sets errno only when no
- * requests at all could be queued due to a genuine failure (e.g., an invalid ring handle).
+ * produce a matching completion once kicked). A return of 0 with *submittedCount less than
+ * requestCount means the submission queue was full; the caller should retry the remaining
+ * requests later. Once a request is counted in *submittedCount, it must not be treated as
+ * "not submitted" - it is already visible to the kernel (once kicked) and will complete.
+ * Returns -1 and sets errno only when no requests at all could be queued due to a genuine
+ * failure (e.g., an invalid ring handle).
  */
 PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
+
+/**
+ * Asks the kernel to process any entries currently enqueued (via SystemNative_IoRingSubmit)
+ * but not yet acted upon. Safe to call from multiple threads concurrently for the same ring
+ * (as long as the ring was not created with IORING_SETUP_SINGLE_ISSUER, which this PAL never
+ * requests) - a redundant or overlapping call is harmless and simply reports 0 newly
+ * consumed entries. Does not block waiting for completions; see
+ * SystemNative_IoRingWaitForCompletions for that.
+ *
+ * Returns 0 on success, or -1 and sets errno on failure.
+ */
+PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
 
 /**
  * Reaps completions from the given ring's completion queue, waiting in-kernel for at least
