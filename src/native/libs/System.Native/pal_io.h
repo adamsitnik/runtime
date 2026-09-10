@@ -908,3 +908,83 @@ PALEXPORT int64_t SystemNative_ReadV(intptr_t fd, IOVector* vectors, int32_t vec
  * Returns the number of bytes written on success; otherwise, -1 is returned and errno is set.
  */
 PALEXPORT int64_t SystemNative_WriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount);
+
+/**
+ * Operation code for an IoRingRequest. Mirrors a subset of the Linux IORING_OP_* opcodes.
+ */
+typedef enum
+{
+    IoRingOp_Read = 0,   // single buffer read; positional (pread-like) if Offset >= 0, else read-like
+    IoRingOp_Write = 1,  // single buffer write; positional (pwrite-like) if Offset >= 0, else write-like
+    IoRingOp_ReadV = 2,  // scatter read into Vectors; positional (preadv-like) if Offset >= 0, else readv-like
+    IoRingOp_WriteV = 3, // gather write from Vectors; positional (pwritev-like) if Offset >= 0, else writev-like
+} IoRingOp;
+
+/**
+ * A single io_uring request to be submitted via SystemNative_IoRingSubmit.
+ * Exactly one of (Buffer, BufferLength) or (Vectors, VectorCount) is used, depending on OpCode.
+ */
+typedef struct
+{
+    int32_t OpCode;      // IoRingOp
+    intptr_t Fd;
+    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops
+    uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write
+    int32_t BufferLength;
+    IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
+    int32_t VectorCount;
+    uint64_t UserData;   // opaque correlation token, echoed back in the matching IoRingCompletion
+} IoRingRequest;
+
+/**
+ * A single io_uring completion, as reaped via SystemNative_IoRingWaitForCompletions.
+ */
+typedef struct
+{
+    uint64_t UserData; // matches the UserData of the IoRingRequest that produced this completion
+    int32_t Result;    // number of bytes transferred on success, or -errno on failure
+    uint32_t Flags;    // raw CQE flags (e.g. IORING_CQE_F_MORE)
+} IoRingCompletion;
+
+/**
+ * Determines whether io_uring is usable on this system (kernel support, not blocked by
+ * seccomp/sysctl, etc.). This performs a real io_uring_setup/close probe and caches the result.
+ *
+ * Returns 1 if io_uring is available, 0 if not.
+ */
+PALEXPORT int32_t SystemNative_IoRingIsAvailable(void);
+
+/**
+ * Creates a new io_uring instance with the requested submission/completion queue depths.
+ * Attempts to use IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN (kernel 6.1+) and
+ * transparently falls back to no special flags if the kernel rejects them.
+ *
+ * Returns 0 on success (with *ringHandle set to an opaque, non-zero handle);
+ * otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, intptr_t* ringHandle);
+
+/**
+ * Submits a batch of requests to the given ring in a single io_uring_enter call.
+ *
+ * Returns 0 on success (with *submittedCount set to the number of requests actually submitted);
+ * otherwise, returns -1 and sets errno. A return of 0 with *submittedCount less than requestCount
+ * means the submission queue was full; the caller should retry the remaining requests later.
+ */
+PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
+
+/**
+ * Reaps completions from the given ring's completion queue, waiting in-kernel for at least
+ * minComplete of them to be available (pass 0 to only drain what is already available).
+ *
+ * Returns 0 on success (with *completedCount set to the number of completions written into
+ * the completions buffer, up to maxCompletions); otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount);
+
+/**
+ * Closes the given ring, unmapping its shared memory regions and closing its file descriptor.
+ *
+ * Returns 0 on success; otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingClose(intptr_t ringHandle);

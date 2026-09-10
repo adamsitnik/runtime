@@ -2622,6 +2622,9 @@
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.WriteV.cs">
       <Link>Common\Interop\Unix\System.Native\Interop.WriteV.cs</Link>
     </Compile>
+    <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.IoRing.cs">
+      <Link>Common\Interop\Unix\System.Native\Interop.IoRing.cs</Link>
+    </Compile>
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.ReadDir.cs">
       <Link>Common\Interop\Unix\System.Native\Interop.ReadDir.cs</Link>
     </Compile>
