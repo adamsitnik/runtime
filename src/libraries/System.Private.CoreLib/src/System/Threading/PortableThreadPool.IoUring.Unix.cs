@@ -56,6 +56,22 @@ namespace System.Threading
             // one thread ever holds this at a time - completions are always reaped by a single thread.
             private static int s_isDriving;
 
+            // Opportunistic batching for the post-lock IoRingKick call: incremented before a thread
+            // attempts to submit, decremented after it finishes (successfully or not). When multiple
+            // threads submit around the same time, only the last one to finish (the decrement that
+            // observes the counter back at 0) actually calls IoRingKick; the others skip it, since their
+            // SQEs will be picked up by that same kick. The kick is issued whenever the counter reaches 0
+            // - not only when *this* thread's own submission succeeded - because an Interlocked.Decrement
+            // only ever executes after that thread's own submit-or-fail attempt has fully completed, so
+            // observing 0 guarantees every submission in the current "wave" (successful or not) has
+            // already been durably published to the SQ ring. Gating the kick on this thread's own
+            // success instead would be unsound: a successful submitter that isn't the last one out could
+            // have its SQE left un-kicked forever if the actual last-out thread's own submission failed
+            // (e.g., the queue was momentarily full) - io_uring_wait_cqe does not submit pending SQEs on
+            // its own, so a never-kicked SQE's completion would never arrive, hanging that operation
+            // indefinitely.
+            private static int s_submittersInFlight;
+
             // Number of io_uring operations submitted but not yet completed. Used to avoid a thread
             // blocking forever in io_uring_enter when there is nothing outstanding to wait for.
             private static int s_inFlightCount;
@@ -112,6 +128,8 @@ namespace System.Threading
                 Interop.Sys.IoRingRequest localRequest = request;
                 localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
 
+                Interlocked.Increment(ref s_submittersInFlight);
+
                 bool submitted;
                 using (s_lock.EnterScope())
                 {
@@ -119,14 +137,22 @@ namespace System.Threading
                     submitted = result == 0 && submittedCount == 1;
                 }
 
+                // See s_submittersInFlight's doc comment: the kick must fire whenever this "wave" of
+                // concurrent submitters has quiesced, regardless of whether *this* thread's own
+                // submission succeeded - not just when `submitted` is true.
+                bool moreSubmittersComing = Interlocked.Decrement(ref s_submittersInFlight) != 0;
+
+                if (!moreSubmittersComing)
+                {
+                    // Ask the kernel to start processing whatever SQEs were just published by this
+                    // (possibly multi-thread) batch. This is a plain io_uring_enter(2) call (safe to call
+                    // concurrently, unlike IoRingSubmit above) and is deliberately done outside s_lock so
+                    // it never serializes concurrent submitters behind one another's syscalls.
+                    Interop.Sys.IoRingKick(s_ringHandle);
+                }
+
                 if (submitted)
                 {
-                    // Ask the kernel to start processing the just-published SQE. This is a plain
-                    // io_uring_enter(2) call (safe to call concurrently, unlike IoRingSubmit above) and
-                    // is deliberately done outside s_lock so it never serializes concurrent submitters
-                    // behind one another's syscalls.
-                    Interop.Sys.IoRingKick(s_ringHandle);
-
                     Interlocked.Increment(ref s_inFlightCount);
 
                     // A worker only re-checks TryBecomeDriverAndDrive() opportunistically, right before it
