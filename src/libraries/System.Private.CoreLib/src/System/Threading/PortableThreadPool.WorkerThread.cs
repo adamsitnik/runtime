@@ -126,14 +126,15 @@ namespace System.Threading
                     bool noSpin = false;
                     while (true)
                     {
-                        // Before parking, give this thread a chance to become the io_uring "driver"
-                        // (see IoUringThreadPool) and reap completions instead. This is a single cheap
-                        // bool check when io_uring integration is disabled/unavailable.
-                        if (IoUringThreadPool.TryBecomeDriverAndDrive())
+                        // Before parking, give this thread a chance to drain its own io_uring ring (see
+                        // IoUringThreadPool) instead. This is a single cheap bool check when io_uring
+                        // integration is disabled/unavailable or this thread has never submitted an
+                        // io_uring operation.
+                        if (IoUringThreadPool.TryDriveOwnRing())
                         {
-                            // Drove a round of completions, which were queued as ordinary work items
-                            // (never run inline here). Loop back around to pick up any of our own
-                            // outstanding work before parking again.
+                            // Drove a round of completions on our own ring, running their continuations
+                            // inline (may have queued new ordinary Thread Pool work items as a result).
+                            // Loop back around to pick up any outstanding work before parking again.
                             noSpin = false;
                             continue;
                         }
