@@ -205,34 +205,43 @@ namespace Microsoft.Win32.SafeHandles
             /// Called by <see cref="PortableThreadPool.IoUringThreadPool"/>'s driver thread when this
             /// operation's io_uring completion is available. Must only perform minimal, non-blocking
             /// bookkeeping (per the <see cref="PortableThreadPool.IIoUringOperation"/> contract) and must
-            /// not run continuations inline.
+            /// not run continuations inline or queue them itself - the driver batches the returned work
+            /// item together with others drained in the same pass.
             /// </summary>
-            void PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result)
+            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result)
             {
                 if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
-                    && TryContinuePartialWrite(result))
+                    && TryContinuePartialWrite(result, out IThreadPoolWorkItem? fallbackWorkItem))
                 {
-                    // The write completed for fewer bytes than requested; we've already resubmitted an
-                    // io_uring request for the remainder, so this instance is still in flight.
-                    return;
+                    // The write completed for fewer bytes than requested. Either we've already
+                    // resubmitted an io_uring request for the remainder (fallbackWorkItem is null, this
+                    // instance is still in flight, nothing to queue yet), or resubmission itself failed
+                    // and fallbackWorkItem is this instance, to be finalized via the ordinary blocking
+                    // path instead.
+                    return fallbackWorkItem;
                 }
 
                 _ioUringResult = result;
                 _completedViaIoUring = true;
-                ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+                return this;
             }
 
             /// <summary>
             /// If <paramref name="bytesWritten"/> represents a partial write (fewer bytes than were
             /// requested by the most recent submission), advances the write state and attempts to
             /// resubmit an io_uring request for the remainder. Returns true if a resubmission was made
-            /// (regardless of whether it itself succeeded - on failure, this falls back to completing the
-            /// remainder via the ordinary blocking-work-item path). Returns false if the write was already
-            /// complete (or this isn't a write operation), in which case the caller should finalize the
-            /// operation as usual.
+            /// (regardless of whether it itself succeeded). On success, <paramref name="fallbackWorkItem"/>
+            /// is <see langword="null"/> (this instance is still in flight). On resubmission failure,
+            /// <paramref name="fallbackWorkItem"/> is <see langword="this"/>, meaning the caller should
+            /// still queue it (falling back to completing the remainder via the ordinary blocking path).
+            /// Returns false if the write was already complete (or this isn't a write operation), in which
+            /// case <paramref name="fallbackWorkItem"/> is <see langword="null"/> and the caller should
+            /// finalize the operation as usual.
             /// </summary>
-            private bool TryContinuePartialWrite(int bytesWritten)
+            private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? fallbackWorkItem)
             {
+                fallbackWorkItem = null;
+
                 if (_operation == Operation.Write)
                 {
                     if (bytesWritten >= _singleSegment.Length)
@@ -257,7 +266,7 @@ namespace Microsoft.Win32.SafeHandles
                     {
                         // Fall back to the ordinary blocking path for just the remainder: _singleSegment
                         // and _fileOffset already reflect only the not-yet-written data.
-                        ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+                        fallbackWorkItem = this;
                     }
 
                     return true;
@@ -289,7 +298,7 @@ namespace Microsoft.Win32.SafeHandles
                         // remaining (not-yet-written) data.
                         SwapToRemainingWriteGatherBuffers();
                         ReleaseIoUringState();
-                        ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+                        fallbackWorkItem = this;
                     }
 
                     return true;

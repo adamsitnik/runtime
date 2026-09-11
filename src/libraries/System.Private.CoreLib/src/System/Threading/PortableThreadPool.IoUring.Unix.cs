@@ -31,6 +31,13 @@ namespace System.Threading
             // completion.
             private const int MaxCompletionsPerWait = 64;
 
+            // Scratch buffer used by the driver to collect the work items returned from a batch of
+            // completions before queuing them all via a single ThreadPool.UnsafeQueueUserWorkItems call.
+            // Reused across calls: only ever accessed by the single thread currently holding the
+            // s_isDriving CAS (see TryBecomeDriverAndDrive/DispatchBatch), so no synchronization is
+            // needed for this array itself.
+            private static readonly IThreadPoolWorkItem[] s_workItemBatch = new IThreadPoolWorkItem[MaxCompletionsPerWait];
+
             // Opt-out switch: io_uring integration is used by default on Linux when the kernel supports
             // it. Set DOTNET_USE_IO_URING=0 to fall back to the pre-existing (blocking-call-on-a-
             // ThreadPool-work-item) implementation unconditionally.
@@ -221,6 +228,10 @@ namespace System.Threading
                     // does not need one syscall per completion.
                     Span<Interop.Sys.IoRingCompletion> completions = stackalloc Interop.Sys.IoRingCompletion[MaxCompletionsPerWait];
 
+                    // Reused across every batch drained by this call. Only ever accessed by the single
+                    // thread currently holding the s_isDriving CAS, so no synchronization is needed here.
+                    IThreadPoolWorkItem[] workItemBatch = s_workItemBatch;
+
                     int completedCount;
                     fixed (Interop.Sys.IoRingCompletion* completionsPtr = completions)
                     {
@@ -231,10 +242,7 @@ namespace System.Threading
                         }
                     }
 
-                    for (int i = 0; i < completedCount; i++)
-                    {
-                        Dispatch(completions[i]);
-                    }
+                    DispatchBatch(completions.Slice(0, completedCount), workItemBatch);
 
                     // Drain any additional completions that are already available without waiting again.
                     while (true)
@@ -249,10 +257,7 @@ namespace System.Threading
                             }
                         }
 
-                        for (int i = 0; i < nextCompletedCount; i++)
-                        {
-                            Dispatch(completions[i]);
-                        }
+                        DispatchBatch(completions.Slice(0, nextCompletedCount), workItemBatch);
                     }
                 }
                 finally
@@ -263,18 +268,38 @@ namespace System.Threading
                 return true;
             }
 
-            private static void Dispatch(in Interop.Sys.IoRingCompletion completion)
+            /// <summary>
+            /// Completes the operation associated with each of the given completions, collecting the
+            /// (non-null) returned work items and queuing them all via a single batched
+            /// <see cref="ThreadPool.UnsafeQueueUserWorkItems"/> call instead of once per completion.
+            /// </summary>
+            private static void DispatchBatch(ReadOnlySpan<Interop.Sys.IoRingCompletion> completions, IThreadPoolWorkItem[] workItemBatch)
             {
-                Interlocked.Decrement(ref s_inFlightCount);
+                int batchCount = 0;
+                foreach (ref readonly Interop.Sys.IoRingCompletion completion in completions)
+                {
+                    Interlocked.Decrement(ref s_inFlightCount);
 
-                GCHandle handle = GCHandle.FromIntPtr((IntPtr)completion.UserData);
-                var operation = (IIoUringOperation)handle.Target!;
-                handle.Free();
+                    GCHandle handle = GCHandle.FromIntPtr((IntPtr)completion.UserData);
+                    var operation = (IIoUringOperation)handle.Target!;
+                    handle.Free();
 
-                // The driver must not run the continuation inline; CompleteFromIoUring is responsible
-                // for queuing the actual continuation as an ordinary Thread Pool work item, which also
-                // wakes the normal idle-worker primitive for any parked sibling to pick it up.
-                operation.CompleteFromIoUring(completion.Result);
+                    // The driver must not run the continuation inline; CompleteFromIoUring only does
+                    // minimal bookkeeping and returns the work item (if any) to be queued, so it can be
+                    // batched together with the other completions drained in this pass.
+                    IThreadPoolWorkItem? workItem = operation.CompleteFromIoUring(completion.Result);
+                    if (workItem is not null)
+                    {
+                        workItemBatch[batchCount++] = workItem;
+                    }
+                }
+
+                if (batchCount > 0)
+                {
+                    // Also wakes the normal idle-worker primitive for any parked sibling to pick these up.
+                    ThreadPool.UnsafeQueueUserWorkItems(workItemBatch.AsSpan(0, batchCount), preferLocal: false);
+                    Array.Clear(workItemBatch, 0, batchCount);
+                }
             }
         }
 
@@ -288,11 +313,17 @@ namespace System.Threading
             /// Called directly by the driver thread (synchronously, as part of draining the completion
             /// queue) with the raw io_uring completion result: the number of bytes transferred on
             /// success, or <c>-errno</c> on failure. Implementations must only do the minimal bookkeeping
-            /// required (e.g., unpinning buffers, storing the result) and then queue the actual
-            /// continuation via <see cref="ThreadPool.UnsafeQueueUserWorkItem(IThreadPoolWorkItem, bool)"/>
-            /// - they must NOT run the continuation body inline on the driver thread.
+            /// required (e.g., unpinning buffers, storing the result) and must NOT run the continuation
+            /// body inline on the driver thread, nor queue it to the Thread Pool themselves. Instead,
+            /// return the <see cref="IThreadPoolWorkItem"/> representing the continuation to run, so the
+            /// driver can batch it together with the other completions drained in the same pass and
+            /// queue them all via a single <see cref="ThreadPool.UnsafeQueueUserWorkItems"/> call, instead
+            /// of calling <see cref="ThreadPool.UnsafeQueueUserWorkItem(IThreadPoolWorkItem, bool)"/> once
+            /// per completion. Return <see langword="null"/> if this completion does not (yet) require a
+            /// continuation to be queued - e.g. a partial write was resubmitted via a new io_uring request
+            /// and remains in flight.
             /// </summary>
-            void CompleteFromIoUring(int result);
+            IThreadPoolWorkItem? CompleteFromIoUring(int result);
         }
     }
 }
