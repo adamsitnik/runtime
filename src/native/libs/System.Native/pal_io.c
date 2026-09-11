@@ -2196,10 +2196,12 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 //
 // Per liburing's own documented thread-safety contract, submission-side calls
 // (io_uring_get_sqe/io_uring_submit and friends) on a given struct io_uring are NOT safe to call
-// concurrently from multiple threads without external synchronization - the caller (the managed
-// IoUringThreadPool) is responsible for serializing all SystemNative_IoRingSubmit calls for a
-// given ring (e.g. via a lock), exactly as it already must for the completion side (only one
-// thread may ever call SystemNative_IoRingWaitForCompletions for a given ring at a time).
+// concurrently from multiple threads without external synchronization. The managed
+// IoUringThreadPool layer sidesteps this entirely rather than adding a lock: each ring is owned
+// by exactly one thread for its whole lifetime (only that thread ever calls
+// SystemNative_IoRingSubmit/SystemNative_IoRingKick or reaps completions via
+// SystemNative_IoRingWaitForCompletions for that ring), so no synchronization is needed at any
+// layer, native or managed.
 
 #if HAVE_LIBURING_H
 
@@ -2243,14 +2245,12 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 // Publishes SQEs already filled via io_uring_get_sqe to the kernel-visible SQ ring tail, without
 // calling io_uring_enter(2). This deliberately duplicates liburing's own internal
 // __io_uring_flush_sq (src/queue.c) instead of calling io_uring_submit(): io_uring_submit()
-// combines this publish step with the io_uring_enter(2) syscall as one non-splittable call, but
-// only the publish step touches this ring's *local* (non-atomic, non-thread-safe) bookkeeping
-// (sq.sqe_head/sq.sqe_tail) - the io_uring_enter(2) syscall itself is safe to call concurrently
-// from multiple threads for a ring without IORING_SETUP_SINGLE_ISSUER (the kernel serializes it
-// internally). Splitting the two lets the managed caller hold its lock only around the cheap,
-// non-blocking publish step (this function), and call SystemNative_IoRingKick - which just wraps
-// liburing's public io_uring_enter() - without holding any lock, exactly as the ring's
-// completion-side already does not need a lock for SystemNative_IoRingWaitForCompletions.
+// combines this publish step with the io_uring_enter(2) syscall as one non-splittable call.
+// Splitting the two lets SystemNative_IoRingSubmit stay a pure, non-blocking, in-memory
+// operation, with the actual syscall issued separately by SystemNative_IoRingKick (a thin wrapper
+// over liburing's public io_uring_enter()) - useful even though each ring now has a single owning
+// thread for both sides, since it lets that thread submit a request and return to its caller
+// immediately without waiting for the kernel to process it.
 //
 // Returns the number of SQEs now visible to the kernel that have not yet been submit-acked via
 // io_uring_enter(2).
@@ -2331,15 +2331,25 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
         params.cq_entries = (uint32_t)completionQueueDepth;
     }
 
-    // Deliberately no IORING_SETUP_SINGLE_ISSUER / IORING_SETUP_DEFER_TASKRUN here: this ring is
-    // shared across (and submitted to / drained from) many different threads - any Thread Pool
-    // worker thread may call SystemNative_IoRingSubmit (serialized by the managed caller's own
-    // lock), and the thread that reaps completions via SystemNative_IoRingWaitForCompletions
-    // rotates over time. SINGLE_ISSUER requires all submissions to come from one fixed
-    // thread/task, and the kernel enforces this by rejecting io_uring_enter(2) from any other
-    // thread with -EEXIST once a first "issuer" is established - which is incompatible with this
-    // design (see the io_uring PAL/ThreadPool design notes).
+    // The caller (see IoUringThreadPool in the managed layer) guarantees that exactly one thread
+    // ever submits to, or reaps completions from, a given ring for its entire lifetime (each
+    // Thread Pool worker thread owns a private ring created lazily on first use). That makes it
+    // safe - and free extra performance - to opt into IORING_SETUP_SINGLE_ISSUER (the kernel can
+    // then skip some cross-thread synchronization it otherwise has to do defensively) plus
+    // IORING_SETUP_DEFER_TASKRUN (defers most completion-side kernel work to happen only when
+    // this same issuing thread later calls io_uring_enter(2) to wait for completions, instead of
+    // eagerly on a task-work/softirq context, which reduces the amount of work done outside of
+    // calls this thread already has to make anyway). Both require a reasonably recent kernel
+    // (6.0+ for SINGLE_ISSUER, 6.1+ for DEFER_TASKRUN); if either is unsupported, io_uring_setup
+    // fails with -EINVAL and we transparently retry with plain flags.
+    params.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
     int result = io_uring_queue_init_params((uint32_t)submissionQueueDepth, &ring->Ring, &params);
+    if (result == -EINVAL)
+    {
+        params.flags &= ~(IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN);
+        result = io_uring_queue_init_params((uint32_t)submissionQueueDepth, &ring->Ring, &params);
+    }
+
     if (result != 0)
     {
         free(ring);
@@ -2418,13 +2428,12 @@ int32_t SystemNative_IoRingKick(intptr_t ringHandle)
         return -1;
     }
 
-    // io_uring_enter(2) itself (unlike io_uring_get_sqe/io_uring_submit) is safe to call
-    // concurrently from multiple threads for a ring created without IORING_SETUP_SINGLE_ISSUER -
-    // the kernel serializes access to the ring internally. The kernel processes
+    // Only the single thread that owns this ring (see IoUringThreadPool in the managed layer)
+    // ever calls SystemNative_IoRingKick for it, matching the IORING_SETUP_SINGLE_ISSUER
+    // constraint the ring was (best-effort) created with above. The kernel processes
     // min(to_submit, actual pending entries between its own cursor and the published SQ tail),
     // so passing the ring's full capacity here is a safe upper bound that picks up everything
-    // published so far (via IoRingFlushSq above, possibly by another thread) without needing to
-    // know the exact pending count.
+    // published so far via IoRingFlushSq without needing to know the exact pending count.
     // Like io_uring_queue_init(_params) above, liburing's raw syscall wrappers return -errno
     // directly on failure rather than returning -1 and setting the C library's errno.
     int result;
