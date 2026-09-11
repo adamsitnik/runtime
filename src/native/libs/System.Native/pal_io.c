@@ -2240,6 +2240,37 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
     io_uring_sqe_set_data64(sqe, request->UserData);
 }
 
+// Publishes SQEs already filled via io_uring_get_sqe to the kernel-visible SQ ring tail, without
+// calling io_uring_enter(2). This deliberately duplicates liburing's own internal
+// __io_uring_flush_sq (src/queue.c) instead of calling io_uring_submit(): io_uring_submit()
+// combines this publish step with the io_uring_enter(2) syscall as one non-splittable call, but
+// only the publish step touches this ring's *local* (non-atomic, non-thread-safe) bookkeeping
+// (sq.sqe_head/sq.sqe_tail) - the io_uring_enter(2) syscall itself is safe to call concurrently
+// from multiple threads for a ring without IORING_SETUP_SINGLE_ISSUER (the kernel serializes it
+// internally). Splitting the two lets the managed caller hold its lock only around the cheap,
+// non-blocking publish step (this function), and call SystemNative_IoRingKick - which just wraps
+// liburing's public io_uring_enter() - without holding any lock, exactly as the ring's
+// completion-side already does not need a lock for SystemNative_IoRingWaitForCompletions.
+//
+// Returns the number of SQEs now visible to the kernel that have not yet been submit-acked via
+// io_uring_enter(2).
+static unsigned int IoRingFlushSq(struct io_uring* ring)
+{
+    struct io_uring_sq* sq = &ring->sq;
+    unsigned int tail = sq->sqe_tail;
+
+    if (sq->sqe_head != tail)
+    {
+        sq->sqe_head = tail;
+        // Ensure the kernel sees the SQE contents before it sees the updated tail. This ring is
+        // never created with IORING_SETUP_SQPOLL, so a plain relaxed store paired with the
+        // io_uring_enter(2) syscall (a full barrier) is what liburing itself does in this case.
+        __atomic_store_n(sq->ktail, tail, __ATOMIC_RELEASE);
+    }
+
+    return tail - *sq->khead;
+}
+
 #endif // HAVE_LIBURING_H
 
 int32_t SystemNative_IoRingIsAvailable(void)
@@ -2362,19 +2393,52 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
         return 0;
     }
 
-    // io_uring_submit both publishes the newly filled SQEs to the kernel-visible SQ tail and
-    // calls io_uring_enter to ask the kernel to start processing them. Once the SQEs are
-    // published (which happens unconditionally as part of this call), they cannot be
-    // "unsubmitted" - so *submittedCount must reflect `queued` regardless of io_uring_submit's
-    // return value below; a negative return here only means the enter syscall itself reported a
-    // problem (e.g. a transient signal/interrupt), not that the already-published entries won't
-    // eventually produce a completion.
-    io_uring_submit(&ring->Ring);
+    // Publish the newly filled SQEs to the kernel-visible SQ tail (see IoRingFlushSq above for
+    // why this doesn't also call io_uring_enter(2) here). Once published, they are visible to
+    // the kernel and cannot be "unsubmitted" even if the caller never gets around to calling
+    // SystemNative_IoRingKick - so *submittedCount always reflects `queued` from this point on.
+    IoRingFlushSq(&ring->Ring);
 
     *submittedCount = queued;
     return 0;
 #else
     (void)ringHandle, (void)requests, (void)requestCount;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingKick(intptr_t ringHandle)
+{
+#if HAVE_LIBURING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // io_uring_enter(2) itself (unlike io_uring_get_sqe/io_uring_submit) is safe to call
+    // concurrently from multiple threads for a ring created without IORING_SETUP_SINGLE_ISSUER -
+    // the kernel serializes access to the ring internally. The kernel processes
+    // min(to_submit, actual pending entries between its own cursor and the published SQ tail),
+    // so passing the ring's full capacity here is a safe upper bound that picks up everything
+    // published so far (via IoRingFlushSq above, possibly by another thread) without needing to
+    // know the exact pending count.
+    // Like io_uring_queue_init(_params) above, liburing's raw syscall wrappers return -errno
+    // directly on failure rather than returning -1 and setting the C library's errno.
+    int result;
+    while ((result = io_uring_enter((unsigned int)ring->Ring.ring_fd, ring->Ring.sq.ring_entries, 0, 0, NULL)) == -EINTR);
+
+    if (result < 0)
+    {
+        errno = -result;
+        return -1;
+    }
+
+    return 0;
+#else
+    (void)ringHandle;
     errno = ENOTSUP;
     return -1;
 #endif

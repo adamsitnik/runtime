@@ -39,14 +39,17 @@ namespace System.Threading
             // The shared ring handle, or IntPtr.Zero if unavailable/disabled. Set at most once.
             private static readonly IntPtr s_ringHandle;
 
-            // Guards calls to Interop.Sys.IoRingSubmit (which fills SQEs, publishes the SQ tail, and
-            // calls io_uring_enter as one call) in TrySubmit. This mirrors liburing's own documented
-            // thread-safety contract: its submission-side functions are not safe to call concurrently
-            // from multiple threads without external synchronization, so all submitting threads must
-            // be serialized through this lock. The CQ ring needs no lock at all: exclusive access to
-            // it is guaranteed by the s_isDriving CAS below (only the elected driver ever reads
-            // completions), and the SQ/CQ rings are independent ring buffers, so the two don't
-            // contend with each other.
+            // Guards calls to Interop.Sys.IoRingSubmit (which fills SQEs and publishes the SQ tail,
+            // but does not call io_uring_enter) in TrySubmit. This mirrors liburing's own documented
+            // thread-safety contract: io_uring_get_sqe/io_uring_submit touch this ring's local
+            // (non-atomic) submission-queue bookkeeping and are not safe to call concurrently from
+            // multiple threads without external synchronization, so all submitting threads must be
+            // serialized through this lock for that step. The actual io_uring_enter(2) syscall
+            // (Interop.Sys.IoRingKick) is safe to call concurrently and is deliberately called *after*
+            // releasing this lock, so the (relatively expensive) syscall never serializes concurrent
+            // submitters. The CQ ring needs no lock at all: exclusive access to it is guaranteed by the
+            // s_isDriving CAS below (only the elected driver ever reads completions), and the SQ/CQ
+            // rings are independent ring buffers, so the two don't contend with each other.
             private static readonly Lock s_lock = new Lock();
 
             // CAS slot: 0 == no one is currently driving completions, 1 == a driver is active. At most
@@ -118,6 +121,12 @@ namespace System.Threading
 
                 if (submitted)
                 {
+                    // Ask the kernel to start processing the just-published SQE. This is a plain
+                    // io_uring_enter(2) call (safe to call concurrently, unlike IoRingSubmit above) and
+                    // is deliberately done outside s_lock so it never serializes concurrent submitters
+                    // behind one another's syscalls.
+                    Interop.Sys.IoRingKick(s_ringHandle);
+
                     Interlocked.Increment(ref s_inFlightCount);
 
                     // A worker only re-checks TryBecomeDriverAndDrive() opportunistically, right before it

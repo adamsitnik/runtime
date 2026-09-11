@@ -51,6 +51,9 @@ internal static partial class Interop
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingSubmit", SetLastError = true)]
         internal static unsafe partial int IoRingSubmit(IntPtr ringHandle, IoRingRequest* requests, int requestCount, out int submittedCount);
 
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingKick", SetLastError = true)]
+        internal static partial int IoRingKick(IntPtr ringHandle);
+
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingWaitForCompletions", SetLastError = true)]
         internal static unsafe partial int IoRingWaitForCompletions(IntPtr ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, out int completedCount);
 
