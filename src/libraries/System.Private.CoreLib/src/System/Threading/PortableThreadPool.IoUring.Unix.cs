@@ -39,14 +39,14 @@ namespace System.Threading
             // The shared ring handle, or IntPtr.Zero if unavailable/disabled. Set at most once.
             private static readonly IntPtr s_ringHandle;
 
-            // Guards pushing SQEs (writing into the SQE array and publishing the new SQ tail) in
-            // TrySubmit - i.e., only the SQ ring's producer-side bookkeeping. It does NOT guard the
-            // io_uring_enter "kick" syscall (see IoRingKick), which is safe to call concurrently from
-            // multiple threads and is deliberately done outside this lock so that submitting threads
-            // don't serialize behind each other's syscalls - only the (much cheaper) in-memory SQE
-            // write. The CQ ring needs no lock at all: exclusive access to it is guaranteed by the
-            // s_isDriving CAS below (only the elected driver ever reads completions), and the SQ/CQ
-            // rings are separate mmap'd memory regions, so the two don't contend.
+            // Guards calls to Interop.Sys.IoRingSubmit (which fills SQEs, publishes the SQ tail, and
+            // calls io_uring_enter as one call) in TrySubmit. This mirrors liburing's own documented
+            // thread-safety contract: its submission-side functions are not safe to call concurrently
+            // from multiple threads without external synchronization, so all submitting threads must
+            // be serialized through this lock. The CQ ring needs no lock at all: exclusive access to
+            // it is guaranteed by the s_isDriving CAS below (only the elected driver ever reads
+            // completions), and the SQ/CQ rings are independent ring buffers, so the two don't
+            // contend with each other.
             private static readonly Lock s_lock = new Lock();
 
             // CAS slot: 0 == no one is currently driving completions, 1 == a driver is active. At most
@@ -118,12 +118,6 @@ namespace System.Threading
 
                 if (submitted)
                 {
-                    // Ask the kernel to act on the entry just enqueued. Deliberately done outside
-                    // s_lock (see its doc comment): this is a plain io_uring_enter syscall, safe to
-                    // call concurrently with other threads' kicks/enqueues on this non-SINGLE_ISSUER
-                    // ring, so there's no need to serialize it behind the (much shorter) enqueue lock.
-                    Interop.Sys.IoRingKick(s_ringHandle);
-
                     Interlocked.Increment(ref s_inFlightCount);
 
                     // A worker only re-checks TryBecomeDriverAndDrive() opportunistically, right before it

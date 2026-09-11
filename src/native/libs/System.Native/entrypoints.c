@@ -291,7 +291,6 @@ static const Entry s_sysNative[] =
     DllImportEntry(SystemNative_IoRingIsAvailable)
     DllImportEntry(SystemNative_IoRingCreate)
     DllImportEntry(SystemNative_IoRingSubmit)
-    DllImportEntry(SystemNative_IoRingKick)
     DllImportEntry(SystemNative_IoRingWaitForCompletions)
     DllImportEntry(SystemNative_IoRingClose)
     DllImportEntry(SystemNative_CreateThread)

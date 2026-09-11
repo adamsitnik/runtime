@@ -490,29 +490,23 @@ check_symbol_exists(
     sys/epoll.h
     HAVE_EPOLL)
 
-# io_uring is accessed via raw syscalls (no liburing dependency), but we still need the uapi
-# header for the IORING_OP_*/IORING_SETUP_*/struct io_uring_* definitions, and we need the
-# kernel to actually expose the io_uring_setup/enter/register syscall numbers.
+# io_uring support is implemented on top of liburing (https://github.com/axboe/liburing)
+# rather than hand-rolled io_uring_setup/io_uring_enter syscalls and manual submission/
+# completion ring-buffer mmap'ing, so the PAL code only has to deal with liburing's documented,
+# versioned, memory-model-correct API. This requires liburing's development package (headers +
+# library) to be installed wherever System.Native is built; if it isn't, io_uring support is
+# simply unavailable at run time (SystemNative_IoRingIsAvailable returns false) rather than
+# failing the build.
 check_include_files(
-    "linux/io_uring.h"
-    HAVE_LINUX_IO_URING_H)
+    "liburing.h"
+    HAVE_LIBURING_H)
 
-if (HAVE_LINUX_IO_URING_H)
-    check_c_source_compiles(
-        "
-        #include <sys/syscall.h>
-        int main(void)
-        {
-            long numbers = __NR_io_uring_setup + __NR_io_uring_enter + __NR_io_uring_register;
-            return (int)numbers;
-        }
-        "
-        HAVE_IO_URING_SYSCALL_NUMBERS)
-
-    if (NOT HAVE_IO_URING_SYSCALL_NUMBERS)
-        set(HAVE_LINUX_IO_URING_H 0)
-    endif()
-endif()
+if (HAVE_LIBURING_H)
+    find_library(LIBURING_LIBRARY NAMES uring liburing)
+    if (NOT LIBURING_LIBRARY)
+        set(HAVE_LIBURING_H 0)
+    endif ()
+endif ()
 
 check_symbol_exists(
     gethostname
