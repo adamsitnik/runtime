@@ -1012,10 +1012,22 @@ PALEXPORT int32_t SystemNative_IoRingEnter(intptr_t ringHandle);
  * thread-safe with itself: the caller must ensure only one thread ever calls this for a given
  * ring at a time.
  *
+ * When minComplete > 0, timeoutMilliseconds bounds how long the wait may block: a negative value
+ * means wait indefinitely (matching the original behavior); a non-negative value gives up (with
+ * *completedCount left at 0 and success still returned, i.e. this is not treated as an error) once
+ * that many milliseconds have elapsed without a completion becoming available. This exists because
+ * a per-thread ring's completion can, in some architectures (e.g. two peer sockets whose
+ * request/response cycle is serviced by two different Thread Pool worker threads, each waiting
+ * only on its own ring), depend on other, unrelated Thread Pool work running on some other worker
+ * thread first - an unbounded block here would starve that other work of a thread to run on
+ * whenever every worker thread happens to be blocked this way. Ignored (treated as infinite) when
+ * minComplete is 0, since that path never blocks in the first place.
+ *
  * Returns 0 on success (with *completedCount set to the number of completions written into
- * the completions buffer, up to maxCompletions); otherwise, returns -1 and sets errno.
+ * the completions buffer, up to maxCompletions, or to 0 if the wait timed out); otherwise,
+ * returns -1 and sets errno.
  */
-PALEXPORT int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount);
+PALEXPORT int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t timeoutMilliseconds, int32_t* completedCount);
 
 /**
  * Closes the given ring, unmapping its shared memory regions and closing its file descriptor.

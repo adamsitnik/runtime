@@ -62,7 +62,7 @@ internal static partial class Interop
         internal static partial int IoRingEnter(IntPtr ringHandle);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingWaitForCompletions", SetLastError = true)]
-        internal static unsafe partial int IoRingWaitForCompletions(IntPtr ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, out int completedCount);
+        internal static unsafe partial int IoRingWaitForCompletions(IntPtr ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, int timeoutMilliseconds, out int completedCount);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingClose", SetLastError = true)]
         internal static partial int IoRingClose(IntPtr ringHandle);

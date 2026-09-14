@@ -2467,7 +2467,7 @@ int32_t SystemNative_IoRingEnter(intptr_t ringHandle)
 #endif
 }
 
-int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount)
+int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t timeoutMilliseconds, int32_t* completedCount)
 {
     assert(completions != NULL);
     assert(maxCompletions >= 0);
@@ -2490,13 +2490,33 @@ int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingComplet
 
     if (minComplete > 0)
     {
-        // Blocks until at least one completion is available. The cqe returned here is not
-        // consumed (the CQ head is not advanced) - it is simply peeked, and picked up again by
-        // the io_uring_peek_batch_cqe call below along with any other completions that may have
-        // become available in the meantime, so that a single wake-up drains everything ready in
-        // one shot instead of one completion at a time.
+        // Blocks until at least one completion is available (bounded by timeoutMilliseconds, if
+        // non-negative - see the doc comment in pal_io.h for why this matters). The cqe returned
+        // here is not consumed (the CQ head is not advanced) - it is simply peeked, and picked up
+        // again by the io_uring_peek_batch_cqe call below along with any other completions that
+        // may have become available in the meantime, so that a single wake-up drains everything
+        // ready in one shot instead of one completion at a time.
         struct io_uring_cqe* cqe;
-        int result = io_uring_wait_cqe(&ring->Ring, &cqe);
+        int result;
+        if (timeoutMilliseconds < 0)
+        {
+            result = io_uring_wait_cqe(&ring->Ring, &cqe);
+        }
+        else
+        {
+            struct __kernel_timespec ts;
+            ts.tv_sec = timeoutMilliseconds / 1000;
+            ts.tv_nsec = (timeoutMilliseconds % 1000) * 1000000L;
+            result = io_uring_wait_cqe_timeout(&ring->Ring, &cqe, &ts);
+            if (result == -ETIME)
+            {
+                // Timed out with nothing available: not an error from this function's point of
+                // view - the caller should just try again later (e.g. after checking for other,
+                // ordinary work to do in the meantime).
+                return 0;
+            }
+        }
+
         if (result != 0)
         {
             errno = -result;

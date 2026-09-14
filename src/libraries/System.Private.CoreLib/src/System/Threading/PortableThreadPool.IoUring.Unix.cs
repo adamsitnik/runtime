@@ -162,6 +162,19 @@ namespace System.Threading
                 return submitted;
             }
 
+            // Bounds how long a single TryDriveOwnRing call may block waiting for its own ring's
+            // next completion. Per-thread rings work well for RandomAccess (a submitted operation
+            // only ever needs the kernel, never another thread's Thread Pool progress, to complete),
+            // but for sockets two peer connections' request/response cycle can be serviced by two
+            // different worker threads, each blocked only on its own ring - if a completion on one
+            // side genuinely depends on unrelated ordinary Thread Pool work running first (e.g. a
+            // just-queued continuation that hasn't been picked up by any thread yet), an unbounded
+            // wait here could leave every worker thread wedged waiting on the other, with none free
+            // to run that queued work - a real deadlock. Bounding the wait means such a thread will
+            // give up periodically, fall through to the ordinary work-dispatch path below, and come
+            // back to re-check its ring afterwards.
+            private const int DriveOwnRingTimeoutMilliseconds = 100;
+
             /// <summary>
             /// Called by this thread's own <see cref="PortableThreadPool.WorkerThread"/> dispatch loop,
             /// right before it would otherwise park (has no normal Thread Pool work left). If this
@@ -170,7 +183,9 @@ namespace System.Threading
             /// continuations *inline*, directly on this thread - never redispatched through the Thread
             /// Pool queue. Returns true if this thread drove (and should re-check for normal work before
             /// parking, since running a continuation inline may itself have queued new work), false if
-            /// it has no ring, or nothing in flight, and should proceed to park normally.
+            /// it has no ring, nothing in flight, or the wait timed out without any completions arriving
+            /// (see <see cref="DriveOwnRingTimeoutMilliseconds"/>), and should proceed to check ordinary
+            /// Thread Pool work / park normally.
             /// </summary>
             public static unsafe bool TryDriveOwnRing()
             {
@@ -189,10 +204,18 @@ namespace System.Threading
                 int completedCount;
                 fixed (Interop.Sys.IoRingCompletion* completionsPtr = completions)
                 {
-                    int result = Interop.Sys.IoRingWaitForCompletions(ring.Handle, completionsPtr, MaxCompletionsPerWait, minComplete: 1, out completedCount);
-                    if (result != 0 || completedCount == 0)
+                    int result = Interop.Sys.IoRingWaitForCompletions(ring.Handle, completionsPtr, MaxCompletionsPerWait, minComplete: 1, DriveOwnRingTimeoutMilliseconds, out completedCount);
+                    if (result != 0)
                     {
                         return true;
+                    }
+
+                    if (completedCount == 0)
+                    {
+                        // Timed out without any completions becoming available: nothing was driven, so
+                        // let the caller check ordinary Thread Pool work right away instead of treating
+                        // this as a successful "drive" round.
+                        return false;
                     }
                 }
 
@@ -204,7 +227,7 @@ namespace System.Threading
                     int nextCompletedCount;
                     fixed (Interop.Sys.IoRingCompletion* completionsPtr = completions)
                     {
-                        int nextResult = Interop.Sys.IoRingWaitForCompletions(ring.Handle, completionsPtr, MaxCompletionsPerWait, minComplete: 0, out nextCompletedCount);
+                        int nextResult = Interop.Sys.IoRingWaitForCompletions(ring.Handle, completionsPtr, MaxCompletionsPerWait, minComplete: 0, timeoutMilliseconds: -1, out nextCompletedCount);
                         if (nextResult != 0 || nextCompletedCount == 0)
                         {
                             break;
