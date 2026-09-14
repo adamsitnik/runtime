@@ -149,9 +149,9 @@ namespace System.Threading
                 if (submitted)
                 {
                     // No other thread ever submits to this ring, so - unlike the shared-ring design -
-                    // there is no "wave of concurrent submitters" to coalesce the kick across; every
-                    // submission kicks its own ring immediately.
-                    Interop.Sys.IoRingKick(ring.Handle);
+                    // there is no "wave of concurrent submitters" to coalesce the io_uring_enter call
+                    // across; every submission calls IoRingEnter on its own ring immediately.
+                    Interop.Sys.IoRingEnter(ring.Handle);
                     ring.InFlightCount++;
                 }
                 else

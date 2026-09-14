@@ -2199,7 +2199,7 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 // concurrently from multiple threads without external synchronization. The managed
 // IoUringThreadPool layer sidesteps this entirely rather than adding a lock: each ring is owned
 // by exactly one thread for its whole lifetime (only that thread ever calls
-// SystemNative_IoRingSubmit/SystemNative_IoRingKick or reaps completions via
+// SystemNative_IoRingSubmit/SystemNative_IoRingEnter or reaps completions via
 // SystemNative_IoRingWaitForCompletions for that ring), so no synchronization is needed at any
 // layer, native or managed.
 
@@ -2247,7 +2247,7 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 // __io_uring_flush_sq (src/queue.c) instead of calling io_uring_submit(): io_uring_submit()
 // combines this publish step with the io_uring_enter(2) syscall as one non-splittable call.
 // Splitting the two lets SystemNative_IoRingSubmit stay a pure, non-blocking, in-memory
-// operation, with the actual syscall issued separately by SystemNative_IoRingKick (a thin wrapper
+// operation, with the actual syscall issued separately by SystemNative_IoRingEnter (a thin wrapper
 // over liburing's public io_uring_enter()) - useful even though each ring now has a single owning
 // thread for both sides, since it lets that thread submit a request and return to its caller
 // immediately without waiting for the kernel to process it.
@@ -2406,7 +2406,7 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
     // Publish the newly filled SQEs to the kernel-visible SQ tail (see IoRingFlushSq above for
     // why this doesn't also call io_uring_enter(2) here). Once published, they are visible to
     // the kernel and cannot be "unsubmitted" even if the caller never gets around to calling
-    // SystemNative_IoRingKick - so *submittedCount always reflects `queued` from this point on.
+    // SystemNative_IoRingEnter - so *submittedCount always reflects `queued` from this point on.
     IoRingFlushSq(&ring->Ring);
 
     *submittedCount = queued;
@@ -2418,7 +2418,7 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
 #endif
 }
 
-int32_t SystemNative_IoRingKick(intptr_t ringHandle)
+int32_t SystemNative_IoRingEnter(intptr_t ringHandle)
 {
 #if HAVE_LIBURING_H
     IoRing* ring = (IoRing*)ringHandle;
@@ -2429,7 +2429,7 @@ int32_t SystemNative_IoRingKick(intptr_t ringHandle)
     }
 
     // Only the single thread that owns this ring (see IoUringThreadPool in the managed layer)
-    // ever calls SystemNative_IoRingKick for it, matching the IORING_SETUP_SINGLE_ISSUER
+    // ever calls SystemNative_IoRingEnter for it, matching the IORING_SETUP_SINGLE_ISSUER
     // constraint the ring was (best-effort) created with above. The kernel processes
     // min(to_submit, actual pending entries between its own cursor and the published SQ tail),
     // so passing the ring's full capacity here is a safe upper bound that picks up everything
