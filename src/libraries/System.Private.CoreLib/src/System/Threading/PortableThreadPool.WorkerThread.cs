@@ -56,6 +56,15 @@ namespace System.Threading
             }
 
             /// <summary>
+            /// Bounds how many consecutive rounds of <see cref="IoUringThreadPool.TryDriveOwnRing"/>
+            /// this thread will run before pausing to do a single non-blocking check for ordinary
+            /// (non-io_uring) Thread Pool work. See the comment at its call site in
+            /// <see cref="WorkerThreadStart"/> for why this bound is required for correctness, not just
+            /// fairness/performance.
+            /// </summary>
+            private const int IoUringConsecutiveDrivesBeforeCheckingQueue = 32;
+
+            /// <summary>
             /// Semaphore for controlling how many threads are currently working.
             /// </summary>
             private static readonly LowLevelLifoSemaphore s_semaphore =
@@ -124,6 +133,7 @@ namespace System.Threading
                 while (true)
                 {
                     bool noSpin = false;
+                    int consecutiveIoUringDrives = 0;
                     while (true)
                     {
                         // Before parking, give this thread a chance to drain its own io_uring ring (see
@@ -134,10 +144,32 @@ namespace System.Threading
                         {
                             // Drove a round of completions on our own ring, running their continuations
                             // inline (may have queued new ordinary Thread Pool work items as a result).
-                            // Loop back around to pick up any outstanding work before parking again.
+                            // A workload that keeps this thread's own ring continuously busy (e.g. a
+                            // tight request/response loop that immediately resubmits a new io_uring
+                            // operation from each completion's continuation) would otherwise keep this
+                            // thread looping back here forever, never reaching the semaphore wait/dispatch
+                            // below - which is the only place ordinary (non-io_uring) Thread Pool work
+                            // items queued to this thread ever get noticed and run. To guarantee such
+                            // work can never be starved indefinitely, periodically (every
+                            // IoUringConsecutiveDrivesBeforeCheckingQueue rounds) do a single non-blocking
+                            // check for ordinary queued work before resuming ring-draining.
                             noSpin = false;
+                            if (++consecutiveIoUringDrives < IoUringConsecutiveDrivesBeforeCheckingQueue)
+                            {
+                                continue;
+                            }
+
+                            consecutiveIoUringDrives = 0;
+                            if (!semaphore.Wait(0))
+                            {
+                                continue;
+                            }
+
+                            noSpin = WorkerDoWork(threadPoolInstance);
                             continue;
                         }
+
+                        consecutiveIoUringDrives = 0;
 
                         if (!(noSpin ? semaphore.WaitNoSpin(timeoutMs) : semaphore.Wait(timeoutMs)))
                         {
