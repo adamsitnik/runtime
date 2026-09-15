@@ -2549,7 +2549,7 @@ int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingComplet
     *completedCount = (int32_t)count;
     return 0;
 #else
-    (void)ringHandle, (void)completions, (void)maxCompletions, (void)minComplete;
+    (void)ringHandle, (void)completions, (void)maxCompletions, (void)minComplete, (void)timeoutMilliseconds;
     errno = ENOTSUP;
     return -1;
 #endif
