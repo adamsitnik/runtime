@@ -153,6 +153,20 @@ namespace System.Threading
                     // across; every submission calls IoRingEnter on its own ring immediately.
                     Interop.Sys.IoRingEnter(ring.Handle);
                     ring.InFlightCount++;
+
+                    // EXPERIMENTAL: because this architecture completes and runs continuations *inline*
+                    // (see RunInline below) rather than dispatching them as ordinary Thread Pool work
+                    // items, the normal work-queue/semaphore signaling path - which is what the Thread
+                    // Pool's thread-count/hill-climbing machinery observes to decide whether more worker
+                    // threads are needed - never sees this work at all. Left alone, this means the pool
+                    // can get permanently stuck with far fewer worker threads than the workload's true
+                    // concurrency (observed: pinned at 3 threads under 32-way concurrent socket I/O,
+                    // instead of the usual ~ProcessorCount). Explicitly poking the same "there is work
+                    // that may need a worker" accounting that ordinary enqueue uses - on every submission,
+                    // not just when nobody is driving - gives the pool a chance to grow to a healthy
+                    // thread count for this workload. MaybeAddWorkingWorker is a cheap CAS that no-ops
+                    // once the pool considers itself at goal, so this is safe to call unconditionally.
+                    WorkerThread.MaybeAddWorkingWorker(ThreadPoolInstance);
                 }
                 else
                 {
