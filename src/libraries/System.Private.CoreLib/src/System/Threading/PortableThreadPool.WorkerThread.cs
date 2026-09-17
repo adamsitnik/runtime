@@ -124,8 +124,25 @@ namespace System.Threading
                 while (true)
                 {
                     bool noSpin = false;
-                    while (noSpin ? semaphore.WaitNoSpin(timeoutMs) : semaphore.Wait(timeoutMs))
+                    while (true)
                     {
+                        // Before parking, give this thread a chance to become the io_uring "driver"
+                        // (see IoUringThreadPool) and reap completions instead. This is a single cheap
+                        // bool check when io_uring integration is disabled/unavailable.
+                        if (IoUringThreadPool.TryBecomeDriverAndDrive())
+                        {
+                            // Drove a round of completions, which were queued as ordinary work items
+                            // (never run inline here). Loop back around to pick up any of our own
+                            // outstanding work before parking again.
+                            noSpin = false;
+                            continue;
+                        }
+
+                        if (!(noSpin ? semaphore.WaitNoSpin(timeoutMs) : semaphore.Wait(timeoutMs)))
+                        {
+                            break;
+                        }
+
                         noSpin = WorkerDoWork(threadPoolInstance);
                     }
 
