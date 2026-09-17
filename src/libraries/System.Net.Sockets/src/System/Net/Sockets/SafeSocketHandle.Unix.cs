@@ -204,6 +204,25 @@ namespace System.Net.Sockets
         /// <returns>Returns whether operations were canceled.</returns>
         private unsafe bool TryUnblockSocket(bool abortive)
         {
+            // EXPERIMENTAL, PROTOTYPE-ONLY: the per-thread io_uring ring design (see
+            // System.Threading.IoUring) means only the exact thread that submitted an operation can
+            // ever drain its completion - and it normally only does so from the Thread Pool dispatch
+            // loop right before parking. This method is called repeatedly, in a busy-wait loop, by
+            // Dispose/Close while waiting for any in-flight operation on this socket to actually
+            // finish (see the caller, CloseAsIs) - if the very thread running that busy-wait happens
+            // to be the one that owns the ring holding this socket's pending io_uring operation (a
+            // likely occurrence, since ThreadPool.Task.Run(() => socket.Dispose()) tends to be picked
+            // up by a thread that has just gone idle - often the same thread that just submitted the
+            // operation), it would otherwise deadlock with itself forever. Proactively draining this
+            // thread's own ring here - a no-op if it does not own one, or has nothing in flight - lets
+            // the shutdown()/disconnect() call below (which is what actually makes the underlying
+            // in-flight operation observe the close and complete) be picked up promptly regardless of
+            // which thread ends up running this loop.
+            if (IoUring.IsSupported)
+            {
+                IoUring.TryDriveCurrentThreadRing();
+            }
+
             // Calling 'close' on a socket that has pending blocking calls (e.g. recv, send, accept, ...)
             // may block indefinitely. This is a best-effort attempt to not get blocked and make those operations return.
             // We need to ensure we keep the expected TCP behavior that is observed by the socket peer (FIN vs RST close).

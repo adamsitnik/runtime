@@ -20,4 +20,5 @@ macro(append_extra_system_libs NativeLibsExtra)
         find_library(FOUNDATION Foundation REQUIRED)
         list(APPEND ${NativeLibsExtra} ${FOUNDATION})
     endif ()
+
 endmacro()
