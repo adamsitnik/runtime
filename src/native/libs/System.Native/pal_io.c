@@ -101,6 +101,15 @@ extern int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
 # endif
 #pragma clang diagnostic pop
 
+#if HAVE_LINUX_IO_URING_H
+// The CMake HAVE_LINUX_IO_URING_H check also verifies that __NR_io_uring_setup/enter/register
+// are defined by <sys/syscall.h>, so no fallback definitions are needed here.
+#include <linux/io_uring.h>
+#include <stdatomic.h>
+#include <sys/eventfd.h>
+#include <poll.h>
+#endif // HAVE_LINUX_IO_URING_H
+
 #endif
 
 #if HAVE_STAT64
@@ -2178,4 +2187,670 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 
     assert(count >= -1);
     return count;
+}
+
+
+// io_uring PAL implementation.
+//
+// This talks to the kernel via raw io_uring_setup/io_uring_enter syscalls (no liburing
+// dependency), matching the existing pattern used for copy_file_range above. The submission
+// queue (SQ), completion queue (CQ) and SQE array are shared memory regions mapped with mmap;
+// the head/tail indices in those regions are accessed with acquire/release semantics since they
+// are also read/written by the kernel.
+//
+// Submission and the io_uring_enter(2) syscall that actually asks the kernel to process pending
+// entries are deliberately split into two PAL entrypoints (SystemNative_IoRingSubmit /
+// SystemNative_IoRingKick): filling SQEs and publishing them to the SQ tail only touches this
+// ring's local (non-atomic) submission-queue bookkeeping and must be serialized by the caller
+// (e.g. via a lock), but io_uring_enter(2) itself is safe to call concurrently from multiple
+// threads for a ring created without IORING_SETUP_SINGLE_ISSUER (the kernel serializes access to
+// the ring internally) - so it is called outside of whatever lock protects the enqueue step.
+
+#if HAVE_LINUX_IO_URING_H
+
+typedef struct
+{
+    int Fd;
+
+    // eventfd registered with this ring via IORING_REGISTER_EVENTFD (SystemNative_IoRingRegisterEventFd),
+    // or -1 if none has been registered. The kernel writes to it whenever a CQE is posted; unlike every
+    // other field/fd touched by this struct, callers other than the ring's owning thread are also allowed
+    // to write to it directly (see SystemNative_EventFdWrite) to piggyback their own wake-ups onto the
+    // same fd a waiter (see SystemNative_EventFdWait) is already blocked on.
+    int EventFd;
+
+    void* SqRingPtr;
+    size_t SqRingSize;
+    void* CqRingPtr;
+    size_t CqRingSize;
+    void* SqesPtr;
+    size_t SqesSize;
+
+    uint32_t* SqHead;
+    uint32_t* SqTail;
+    uint32_t* SqRingMask;
+    uint32_t* SqArray;
+    uint32_t SqEntries;
+    struct io_uring_sqe* Sqes;
+
+    // SqTail value as of the last time this thread actually asked the kernel to consume SQEs (via
+    // an io_uring_enter call in SystemNative_IoRingKick, or the submit-only flush call in
+    // SystemNative_IoRingWaitForCompletions) - not merely published one via SystemNative_IoRingSubmit,
+    // which only ever touches userspace state. Only ever read/written by the single dedicated issuer
+    // thread (see the io_uring PAL design notes), same as SqTail itself, so no synchronization is
+    // needed. Lets SystemNative_IoRingWaitForCompletions skip its submit-only io_uring_enter call
+    // entirely when nothing new has been published since the last flush - see its doc comment.
+    uint32_t SqFlushedTail;
+
+    uint32_t* CqHead;
+    uint32_t* CqTail;
+    uint32_t* CqRingMask;
+    struct io_uring_cqe* Cqes;
+} IoRing;
+
+static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
+{
+    return syscall(__NR_io_uring_setup, entries, params);
+}
+
+static long IoUringRegister(int fd, unsigned int opcode, void* arg, unsigned int nrArgs)
+{
+    return syscall(__NR_io_uring_register, fd, opcode, arg, nrArgs);
+}
+
+static long IoUringEnter(int fd, uint32_t toSubmit, uint32_t minComplete, uint32_t flags)
+{
+    long result;
+    while ((result = syscall(__NR_io_uring_enter, fd, toSubmit, minComplete, flags, NULL, (size_t)0)) < 0 && errno == EINTR);
+    return result;
+}
+
+static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
+{
+    memset(sqe, 0, sizeof(*sqe));
+    sqe->fd = (int32_t)request->Fd;
+    sqe->user_data = request->UserData;
+
+    switch ((IoRingOp)request->OpCode)
+    {
+        case IoRingOp_Read:
+            // A negative Offset means "non-positional": io_uring treats an off of -1 for
+            // READ/WRITE/READV/WRITEV as "use (and update) the file's current position", just
+            // like plain read(2)/write(2)/readv(2)/writev(2). This field is only meaningful for
+            // these file-offset opcodes: for Recv/Send/Accept/Connect below, sqe->off aliases
+            // other fields (or is unused), and the kernel rejects those opcodes with EINVAL
+            // unless it is left at 0 (its memset'd default), so it must not be set here.
+            sqe->off = request->Offset >= 0 ? (uint64_t)request->Offset : (uint64_t)-1;
+            sqe->opcode = IORING_OP_READ;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = (uint32_t)request->BufferLength;
+            break;
+        case IoRingOp_Write:
+            sqe->off = request->Offset >= 0 ? (uint64_t)request->Offset : (uint64_t)-1;
+            sqe->opcode = IORING_OP_WRITE;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = (uint32_t)request->BufferLength;
+            break;
+        case IoRingOp_ReadV:
+            sqe->off = request->Offset >= 0 ? (uint64_t)request->Offset : (uint64_t)-1;
+            sqe->opcode = IORING_OP_READV;
+            sqe->addr = (uint64_t)(uintptr_t)request->Vectors;
+            // Just like plain readv(2)/writev(2) (see GetAllowedVectorCount above), io_uring
+            // rejects IORING_OP_READV/WRITEV with more than IOV_MAX vectors (EINVAL). The managed
+            // caller is responsible for handling a resulting short read/write by resubmitting the
+            // remainder, the same way it already does for the non-io_uring PReadV/PWriteV path.
+            sqe->len = (uint32_t)GetAllowedVectorCount(request->Vectors, request->VectorCount);
+            break;
+        case IoRingOp_WriteV:
+            sqe->off = request->Offset >= 0 ? (uint64_t)request->Offset : (uint64_t)-1;
+            sqe->opcode = IORING_OP_WRITEV;
+            sqe->addr = (uint64_t)(uintptr_t)request->Vectors;
+            sqe->len = (uint32_t)GetAllowedVectorCount(request->Vectors, request->VectorCount);
+            break;
+        case IoRingOp_Accept:
+            // addr = output sockaddr*, addr2 (aliased with off) = output socklen_t* (peer address
+            // length written back by the kernel on completion), accept_flags = flags.
+            sqe->opcode = IORING_OP_ACCEPT;
+            sqe->addr = (uint64_t)(uintptr_t)request->SockAddr;
+            sqe->off = (uint64_t)(uintptr_t)request->SockAddrLen;
+            sqe->accept_flags = (uint32_t)request->Flags;
+            break;
+        case IoRingOp_Connect:
+            // addr = input sockaddr*, off (aliased with addr2) = input addrlen (by value, not a
+            // pointer - unlike Accept's SockAddrLen).
+            sqe->opcode = IORING_OP_CONNECT;
+            sqe->addr = (uint64_t)(uintptr_t)request->SockAddr;
+            sqe->off = request->SockAddrLen != NULL ? (uint64_t)(*request->SockAddrLen) : 0;
+            break;
+        case IoRingOp_Recv:
+            sqe->opcode = IORING_OP_RECV;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = (uint32_t)request->BufferLength;
+            sqe->msg_flags = (uint32_t)request->Flags;
+            // The managed caller only submits here after an optimistic userspace recv(2) already
+            // returned EWOULDBLOCK, so the data is known not to be immediately available yet -
+            // having io_uring redundantly retry a non-blocking recv(2) first (its default
+            // behavior) is pure wasted work. IORING_RECVSEND_POLL_FIRST (sqe->ioprio, not to be
+            // confused with sqe->msg_flags above) tells the kernel to instead arm poll and wait
+            // for readability before ever attempting the recv(2), matching what actually happens
+            // here.
+#if defined(IORING_RECVSEND_POLL_FIRST)
+            sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+#endif
+            break;
+        case IoRingOp_Send:
+            sqe->opcode = IORING_OP_SEND;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = (uint32_t)request->BufferLength;
+            sqe->msg_flags = (uint32_t)request->Flags;
+            // See IoRingOp_Recv above: the managed caller only submits here after an optimistic
+            // userspace send(2) already returned EWOULDBLOCK.
+#if defined(IORING_RECVSEND_POLL_FIRST)
+            sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
+#endif
+            break;
+    }
+}
+
+#endif // HAVE_LINUX_IO_URING_H
+
+int32_t SystemNative_IoRingIsAvailable(void)
+{
+#if HAVE_LINUX_IO_URING_H
+    static volatile int s_isAvailable = 0;
+
+    int isAvailable = s_isAvailable;
+    if (isAvailable == 0)
+    {
+        struct io_uring_params params;
+        memset(&params, 0, sizeof(params));
+
+        // A minimal ring is enough to probe support (kernel version, seccomp, sysctl, etc.)
+        // without leaving any lasting state behind.
+        long result = IoUringSetup(2, &params);
+        if (result >= 0)
+        {
+            close((int)result);
+            isAvailable = 1;
+        }
+        else
+        {
+            isAvailable = -1;
+        }
+
+        s_isAvailable = isAvailable;
+    }
+
+    return isAvailable == 1 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle)
+{
+    assert(ringHandle != NULL);
+    *ringHandle = 0;
+
+#if HAVE_LINUX_IO_URING_H
+    if (submissionQueueDepth <= 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    if (completionQueueDepth > 0)
+    {
+        params.flags |= IORING_SETUP_CQSIZE;
+        params.cq_entries = (uint32_t)completionQueueDepth;
+    }
+
+    // If the caller asks for it, request IORING_SETUP_SINGLE_ISSUER together with
+    // IORING_SETUP_DEFER_TASKRUN: from this point on, the kernel requires every
+    // SystemNative_IoRingSubmit/SystemNative_IoRingKick/SystemNative_IoRingWaitForCompletions call
+    // for this ring to come from the same single OS thread (whichever one happens to make the
+    // first such call) - any other thread that tries gets -EEXIST. This lets the kernel skip an
+    // internal ring-wide lock it would otherwise need to serialize concurrent submitters/reapers,
+    // which is exactly the contention this pair of flags exists to avoid.
+    //
+    // IMPORTANT / non-obvious kernel requirement discovered empirically (Linux 7.0.0-31-generic):
+    // with DEFER_TASKRUN, an io_uring_enter(2) call that passes IORING_ENTER_GETEVENTS together
+    // with a non-zero to_submit - even when nothing new actually needs submitting, and even when
+    // that same call is the one that happens to perform a real submission - reliably prevents any
+    // deferred task-work (including IORING_OP_ACCEPT completions) from ever being run/posted. This
+    // was confirmed with a minimal, single-threaded, dependency-free repro (a few dozen lines of
+    // raw io_uring_setup/io_uring_enter syscalls, no managed code involved): submitting one ACCEPT
+    // SQE and then repeatedly calling io_uring_enter(ring, N>0, min_complete, GETEVENTS) never
+    // yields a completion, no matter how many times it is called or what N/min_complete are; but
+    // splitting into two separate calls - a plain submit-only call (to_submit=N, flags=0) followed
+    // by a get-events-only call (to_submit=0, flags=GETEVENTS) - reliably works. See
+    // SystemNative_IoRingWaitForCompletions, which must never combine a non-zero to_submit with
+    // IORING_ENTER_GETEVENTS for this reason, at the cost of needing two syscalls (instead of one)
+    // whenever it also needs to flush pending, not-yet-submitted SQEs.
+#if defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
+    if (singleIssuer != 0)
+    {
+        params.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    }
+#else
+    // Older kernel headers used at compile time may not define these flags at all; silently ignore
+    // the request rather than failing the build. The caller-side contract (only ever submit to /
+    // reap from one dedicated thread) still holds; it just won't be kernel-enforced on such a
+    // system, and the ring won't get the associated lock-elision benefit.
+    (void)singleIssuer;
+#endif
+
+    // IORING_SETUP_COOP_TASKRUN: without it, the kernel may send an inter-processor interrupt to
+    // force our issuer thread to stop whatever it's doing in userspace and immediately run
+    // deferred task-work (e.g. posting a completion) as soon as it becomes available. Since this
+    // thread already deterministically transitions into the kernel on its own on every wakeup
+    // (SystemNative_IoRingWaitForCompletions is its entire loop body), that forced preemption
+    // buys nothing here - the work would get picked up on the next transition anyway - and the
+    // IPI itself is pure overhead. Requesting COOP_TASKRUN tells the kernel it can skip sending
+    // it and instead let task-work simply accumulate until this thread's next kernel transition.
+    // Combined with IORING_SETUP_TASKRUN_FLAG (only meaningful together with COOP_TASKRUN), the
+    // kernel additionally sets IORING_SQ_TASKRUN in the SQ ring's flags whenever such deferred
+    // task-work is actually pending - not used by this PAL today (SystemNative_IoRingWaitForCompletions
+    // unconditionally transitions into the kernel every time it's called rather than polling that
+    // flag first), but requesting it is harmless and keeps the door open for that optimization
+    // later.
+#if defined(IORING_SETUP_COOP_TASKRUN)
+    params.flags |= IORING_SETUP_COOP_TASKRUN;
+#if defined(IORING_SETUP_TASKRUN_FLAG)
+    params.flags |= IORING_SETUP_TASKRUN_FLAG;
+#endif
+#endif
+
+    long fd = IoUringSetup((uint32_t)submissionQueueDepth, &params);
+
+
+    if (fd < 0)
+    {
+        return -1;
+    }
+
+    IoRing* ring = (IoRing*)calloc(1, sizeof(IoRing));
+    if (ring == NULL)
+    {
+        close((int)fd);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    ring->Fd = (int)fd;
+    ring->EventFd = -1;
+
+    size_t sqRingSize = (size_t)params.sq_off.array + (size_t)params.sq_entries * sizeof(uint32_t);
+    size_t cqRingSize = (size_t)params.cq_off.cqes + (size_t)params.cq_entries * sizeof(struct io_uring_cqe);
+    size_t sqesSize = (size_t)params.sq_entries * sizeof(struct io_uring_sqe);
+
+    void* sqRingPtr = mmap(NULL, sqRingSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring->Fd, (off_t)IORING_OFF_SQ_RING);
+    void* cqRingPtr = mmap(NULL, cqRingSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring->Fd, (off_t)IORING_OFF_CQ_RING);
+    void* sqesPtr = mmap(NULL, sqesSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring->Fd, (off_t)IORING_OFF_SQES);
+
+    if (sqRingPtr == MAP_FAILED || cqRingPtr == MAP_FAILED || sqesPtr == MAP_FAILED)
+    {
+        int savedErrno = errno;
+        if (sqRingPtr != MAP_FAILED) munmap(sqRingPtr, sqRingSize);
+        if (cqRingPtr != MAP_FAILED) munmap(cqRingPtr, cqRingSize);
+        if (sqesPtr != MAP_FAILED) munmap(sqesPtr, sqesSize);
+        close(ring->Fd);
+        free(ring);
+        errno = savedErrno;
+        return -1;
+    }
+
+    ring->SqRingPtr = sqRingPtr;
+    ring->SqRingSize = sqRingSize;
+    ring->CqRingPtr = cqRingPtr;
+    ring->CqRingSize = cqRingSize;
+    ring->SqesPtr = sqesPtr;
+    ring->SqesSize = sqesSize;
+
+    ring->SqHead = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.head);
+    ring->SqTail = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.tail);
+    ring->SqRingMask = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.ring_mask);
+    ring->SqArray = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.array);
+    ring->SqEntries = params.sq_entries;
+    ring->Sqes = (struct io_uring_sqe*)sqesPtr;
+
+    ring->CqHead = (uint32_t*)((uint8_t*)cqRingPtr + params.cq_off.head);
+    ring->CqTail = (uint32_t*)((uint8_t*)cqRingPtr + params.cq_off.tail);
+    ring->CqRingMask = (uint32_t*)((uint8_t*)cqRingPtr + params.cq_off.ring_mask);
+    ring->Cqes = (struct io_uring_cqe*)((uint8_t*)cqRingPtr + params.cq_off.cqes);
+
+    *ringHandle = (intptr_t)ring;
+    return 0;
+#else
+    (void)submissionQueueDepth, (void)completionQueueDepth;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount)
+{
+    assert(requests != NULL);
+    assert(requestCount >= 0);
+    assert(submittedCount != NULL);
+    *submittedCount = 0;
+
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Single producer: the caller is responsible for ensuring only one thread submits to a
+    // given ring at a time (see the io_uring PAL design notes).
+    uint32_t sqTail = *ring->SqTail;
+    uint32_t sqHead = __atomic_load_n(ring->SqHead, __ATOMIC_ACQUIRE);
+    uint32_t sqMask = *ring->SqRingMask;
+
+    int32_t queued = 0;
+    for (int32_t i = 0; i < requestCount; i++)
+    {
+        if (sqTail - sqHead >= ring->SqEntries)
+        {
+            // The submission queue is full; stop here. The caller should retry the
+            // remaining requests (requests[queued..requestCount)) once there's more room.
+            break;
+        }
+
+        uint32_t index = sqTail & sqMask;
+        IoRingFillSqe(&ring->Sqes[index], &requests[i]);
+        ring->SqArray[index] = index;
+
+        sqTail++;
+        queued++;
+    }
+
+    if (queued == 0)
+    {
+        return 0;
+    }
+
+    __atomic_store_n(ring->SqTail, sqTail, __ATOMIC_RELEASE);
+
+    // The entries above are now published via the SQ tail and visible to the kernel; this
+    // cannot be undone. Deliberately do NOT call io_uring_enter here - see
+    // SystemNative_IoRingKick. Doing the (relatively expensive, and otherwise-unnecessary-to-
+    // serialize) syscall outside of whatever lock protects this enqueue step lets many
+    // threads publish new entries into a shared ring quickly, without each blocking the next
+    // behind a full syscall while holding that lock.
+    *submittedCount = queued;
+    return 0;
+#else
+    (void)ringHandle, (void)requests, (void)requestCount;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingKick(intptr_t ringHandle)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Ask the kernel to consume as many currently-enqueued-but-not-yet-submitted entries as
+    // possible. Passing the full ring depth (rather than trying to track exactly how many are
+    // new) is safe: io_uring_enter only ever consumes what is actually available between its
+    // own internal submission cursor and the current SQ tail, capped at to_submit - so this is
+    // simply "submit everything pending" and never over-consumes or double-processes entries.
+    // A negative/short result is not an error here: if another thread's concurrent kick (or
+    // the driver's own waiting enter call) already consumed everything, this call legitimately
+    // has nothing to do and that is not a failure.
+    IoUringEnter(ring->Fd, ring->SqEntries, 0, 0);
+    ring->SqFlushedTail = *ring->SqTail;
+    return 0;
+#else
+    (void)ringHandle;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // EFD_NONBLOCK: SystemNative_EventFdWait always follows a successful poll() with a read(), so a
+    // blocking read is never actually needed, but non-blocking avoids any possibility of that read
+    // stalling if a spurious/racing drain already consumed the counter first (e.g. two threads' calls
+    // to SystemNative_EventFdWait overlapping - not expected given the single-issuer-thread contract,
+    // but harmless to guard against). EFD_CLOEXEC: standard hygiene, matches other fds created here.
+    int eventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (eventFd < 0)
+    {
+        return -1;
+    }
+
+    // Ask the kernel to bump this eventfd's counter (i.e. make it readable) every time a CQE is
+    // posted to this ring - see SystemNative_EventFdWait's doc comment for how the issuer thread
+    // uses this to actually block (rather than busy-poll) waiting for completions to reap.
+    if (IoUringRegister(ring->Fd, IORING_REGISTER_EVENTFD, &eventFd, 1) < 0)
+    {
+        int savedErrno = errno;
+        close(eventFd);
+        errno = savedErrno;
+        return -1;
+    }
+
+    ring->EventFd = eventFd;
+    return eventFd;
+#else
+    (void)ringHandle;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_EventFdWrite(int32_t eventFd)
+{
+#if HAVE_LINUX_IO_URING_H
+    // Bumps the eventfd's 64-bit counter by 1, making it readable. Safe to call from any thread,
+    // concurrently with other writers and/or with a reader blocked in SystemNative_EventFdWait -
+    // this is the mechanism TrySubmit uses to wake the issuer thread when it enqueues a new
+    // request, sharing the same fd the kernel itself writes to on completion (see
+    // SystemNative_IoRingRegisterEventFd) so a single wait call responds to either kind of event.
+    static const uint64_t value = 1;
+    ssize_t result;
+    while ((result = write(eventFd, &value, sizeof(value))) < 0 && errno == EINTR);
+    return result == (ssize_t)sizeof(value) ? 0 : -1;
+#else
+    (void)eventFd;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilliseconds)
+{
+#if HAVE_LINUX_IO_URING_H
+    assert(timeoutMilliseconds >= -1);
+
+    // A real (kernel-blocking) wait, unlike a spin-then-block managed synchronization primitive:
+    // poll(2) parks this thread with no CPU cost until the eventfd becomes readable (from either a
+    // completion the kernel posted, or a TrySubmit-side SystemNative_EventFdWrite call) or the
+    // timeout elapses. -1 blocks indefinitely.
+    struct pollfd pfd;
+    pfd.fd = eventFd;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    int result;
+    while ((result = poll(&pfd, 1, timeoutMilliseconds)) < 0 && errno == EINTR);
+
+    if (result < 0)
+    {
+        return -1;
+    }
+    if (result == 0)
+    {
+        return 0; // timed out, nothing to report
+    }
+
+    // Readable: drain the counter back to 0 (EFD_NONBLOCK means this never actually blocks) so the
+    // next wait call only returns once the fd becomes readable again from a *new* event, mirroring
+    // the "Reset before re-checking the queue" pattern the previous ManualResetEventSlim-based
+    // design relied on to avoid a missed-wakeup race with TrySubmit's enqueue-then-signal ordering.
+    uint64_t drained;
+    ssize_t readResult;
+    while ((readResult = read(eventFd, &drained, sizeof(drained))) < 0 && errno == EINTR);
+    // EAGAIN here would mean another thread's SystemNative_EventFdWait call already drained it
+    // between our poll() and our read() - not expected given the single-issuer-thread contract for
+    // this fd, but not an error condition worth surfacing either way: the caller still legitimately
+    // observed "signaled" from poll() and should proceed to check for work.
+    (void)readResult;
+
+    return 1;
+#else
+    (void)eventFd, (void)timeoutMilliseconds;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount)
+{
+    assert(completions != NULL);
+    assert(maxCompletions >= 0);
+    assert(minComplete >= 0);
+    assert(completedCount != NULL);
+    *completedCount = 0;
+
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Two separate io_uring_enter calls, deliberately not combined into one: see
+    // SystemNative_IoRingCreate's doc comment for why - with DEFER_TASKRUN, combining a non-zero
+    // to_submit with IORING_ENTER_GETEVENTS in the same call reliably prevents completions (e.g.
+    // IORING_OP_ACCEPT) from ever being posted, even when to_submit is a harmless no-op upper
+    // bound and even when that same call also performs a real submission. So first flush anything
+    // pending (submit-only, no GETEVENTS) - this is what actually asks the kernel to process SQEs
+    // SystemNative_IoRingSubmit has published to the SQ tail but that neither it nor
+    // SystemNative_IoRingKick has flushed yet (e.g. the single-batch common case, where the
+    // issuer thread deliberately skips calling IoRingKick and relies on this call to do it - see
+    // PortableThreadPool.IoUring.Unix.cs's DrainAndSubmit doc comment). Skipping this flush step
+    // here (e.g. by only doing the GETEVENTS-only call below) would leave newly-submitted SQEs
+    // sitting unflushed in the SQ ring forever whenever nothing else happens to call
+    // SystemNative_IoRingKick first.
+    //
+    // However, this flush call is skipped entirely when SqTail hasn't moved since the last time
+    // it was flushed (by this same call or by SystemNative_IoRingKick) - i.e. nothing new was
+    // published since then, so there is nothing for the kernel to consume and the syscall would
+    // be pure overhead. This matters a lot for a single dedicated issuer thread under light load:
+    // most of its wake-ups are purely to reap one or two already-ready completions with nothing
+    // new to submit, and without this check every single one of those wake-ups would still pay
+    // for a wasted io_uring_enter round trip.
+    uint32_t sqTail = *ring->SqTail;
+    if (sqTail != ring->SqFlushedTail)
+    {
+        long submitResult = IoUringEnter(ring->Fd, ring->SqEntries, 0, 0);
+        if (submitResult < 0)
+        {
+            return -1;
+        }
+
+        ring->SqFlushedTail = sqTail;
+    }
+
+    // ...then, in a separate call, wait for completions (to_submit=0, GETEVENTS only). to_submit
+    // is 0 here (not the ring depth) for the same reason explained above: combining a non-zero
+    // to_submit with GETEVENTS breaks completion delivery under DEFER_TASKRUN.
+    long result = IoUringEnter(ring->Fd, 0, (uint32_t)minComplete, IORING_ENTER_GETEVENTS);
+    if (result < 0)
+    {
+        return -1;
+    }
+
+    // Single consumer: the caller is responsible for ensuring only one thread reaps
+    // completions from a given ring at a time (see the io_uring PAL design notes).
+    uint32_t cqHead = *ring->CqHead;
+    uint32_t cqTail = __atomic_load_n(ring->CqTail, __ATOMIC_ACQUIRE);
+    uint32_t cqMask = *ring->CqRingMask;
+
+    int32_t count = 0;
+    while (cqHead != cqTail && count < maxCompletions)
+    {
+        struct io_uring_cqe* cqe = &ring->Cqes[cqHead & cqMask];
+        completions[count].UserData = cqe->user_data;
+        completions[count].Result = cqe->res;
+        completions[count].Flags = cqe->flags;
+
+        cqHead++;
+        count++;
+    }
+
+    if (count > 0)
+    {
+        __atomic_store_n(ring->CqHead, cqHead, __ATOMIC_RELEASE);
+    }
+
+    *completedCount = count;
+    return 0;
+#else
+    (void)ringHandle, (void)completions, (void)maxCompletions, (void)minComplete;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingClose(intptr_t ringHandle)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL)
+    {
+        return 0;
+    }
+
+    int result = 0;
+    if (munmap(ring->SqesPtr, ring->SqesSize) != 0)
+    {
+        result = -1;
+    }
+    if (munmap(ring->CqRingPtr, ring->CqRingSize) != 0)
+    {
+        result = -1;
+    }
+    if (munmap(ring->SqRingPtr, ring->SqRingSize) != 0)
+    {
+        result = -1;
+    }
+    if (close(ring->Fd) != 0)
+    {
+        result = -1;
+    }
+    if (ring->EventFd >= 0 && close(ring->EventFd) != 0)
+    {
+        result = -1;
+    }
+
+    free(ring);
+    return result;
+#else
+    (void)ringHandle;
+    return 0;
+#endif
 }
