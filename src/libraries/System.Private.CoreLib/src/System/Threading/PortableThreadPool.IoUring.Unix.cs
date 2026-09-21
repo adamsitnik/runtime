@@ -82,6 +82,8 @@ namespace System.Threading
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive in a future iteration.
             private const int QueueDepth = 1024;
+            private const ulong OperationSlotTag = 1;
+            private const int OperationSlotGenerationShift = 32;
 
             // Maximum number of completions fetched per IoRingWaitForCompletions call. Batching here
             // means the issuer thread, when it wakes up to many simultaneously-ready completions (e.g.
@@ -143,6 +145,12 @@ namespace System.Threading
             [ThreadStatic]
             private static Ring? t_assignedRing;
 
+            private struct OperationSlot
+            {
+                public IIoUringOperation? Operation;
+                public uint Generation;
+            }
+
             /// <summary>
             /// Per-shard state: one independent <c>IORING_SETUP_SINGLE_ISSUER</c> ring, its own
             /// submission/completion queues, wake-eventfd, and dedicated issuer thread. See this type's
@@ -198,11 +206,17 @@ namespace System.Threading
                 // Running processors may overlap, but at most one additional processor is queued.
                 public int CompletionProcessingRequested;
                 public readonly IThreadPoolWorkItem CompletionProcessor;
+                public readonly OperationSlot[] OperationSlots = new OperationSlot[QueueDepth];
+                public readonly ConcurrentQueue<int> FreeOperationSlots = new();
 
                 public Ring(int index)
                 {
                     Index = index;
                     CompletionProcessor = new CompletionProcessorWorkItem(this);
+                    for (int i = 0; i < OperationSlots.Length; i++)
+                    {
+                        FreeOperationSlots.Enqueue(i);
+                    }
                 }
             }
 
@@ -388,11 +402,34 @@ namespace System.Threading
 
                 Ring ring = GetAssignedRing();
 
-                GCHandle handle = GCHandle.Alloc(operation);
                 Interop.Sys.IoRingRequest localRequest = request;
-                localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
+                if (ring.FreeOperationSlots.TryDequeue(out int slotIndex))
+                {
+                    ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
+                    uint generation = unchecked(slot.Generation + 1);
+                    Volatile.Write(ref slot.Generation, generation);
+                    Volatile.Write(ref slot.Operation, operation);
+                    localRequest.UserData = ((ulong)generation << OperationSlotGenerationShift) |
+                        ((uint)slotIndex << 1) | OperationSlotTag;
+                }
+                else
+                {
+                    // Normal GCHandles have bit zero clear; tagged slot tokens instead refer to
+                    // the ring's bounded array, which roots their operations until completion.
+                    GCHandle handle = GCHandle.Alloc(operation);
+                    localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
+                    Debug.Assert((localRequest.UserData & OperationSlotTag) == 0);
+                }
 
-                ring.PendingSubmissions.Enqueue(localRequest);
+                try
+                {
+                    ring.PendingSubmissions.Enqueue(localRequest);
+                }
+                catch
+                {
+                    ReleaseOperationToken(ring, localRequest.UserData);
+                    throw;
+                }
 
                 // Only the thread that wins the 0->1 transition actually writes to the eventfd; every
                 // other concurrent caller (assigned to this same ring) can rely on that single write to
@@ -596,17 +633,44 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Resolves and releases a completion's GCHandle before completing its operation.
+            /// Resolves and releases a completion's correlation token before completing its operation.
             /// This is the shared bookkeeping used by both
             /// <see cref="DispatchBatch"/> and <see cref="CompletionProcessorWorkItem"/>.
             /// </summary>
             private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion)
-            {
-                GCHandle handle = GCHandle.FromIntPtr((IntPtr)completion.UserData);
-                IIoUringOperation operation = (IIoUringOperation)handle.Target!;
-                handle.Free();
+                => ReleaseOperationToken(ring, completion.UserData).CompleteFromIoUring(completion.Result);
 
-                return operation.CompleteFromIoUring(completion.Result);
+            private static IIoUringOperation ReleaseOperationToken(Ring ring, ulong userData)
+            {
+                IIoUringOperation operation;
+                if ((userData & OperationSlotTag) != 0)
+                {
+                    int slotIndex = (int)((uint)userData >> 1);
+                    if ((uint)slotIndex >= (uint)ring.OperationSlots.Length)
+                    {
+                        Environment.FailFast("Invalid io_uring operation slot.");
+                    }
+
+                    ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
+                    IIoUringOperation? cachedOperation = Volatile.Read(ref slot.Operation);
+                    uint generation = (uint)(userData >> OperationSlotGenerationShift);
+                    if (cachedOperation is null || Volatile.Read(ref slot.Generation) != generation)
+                    {
+                        Environment.FailFast("Stale io_uring operation slot.");
+                    }
+
+                    operation = cachedOperation;
+                    Volatile.Write(ref slot.Operation, null);
+                    ring.FreeOperationSlots.Enqueue(slotIndex);
+                }
+                else
+                {
+                    GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
+                    operation = (IIoUringOperation)handle.Target!;
+                    handle.Free();
+                }
+
+                return operation;
             }
 
             /// <summary>
