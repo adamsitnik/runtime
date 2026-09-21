@@ -202,11 +202,8 @@ namespace Microsoft.Win32.SafeHandles
             }
 
             /// <summary>
-            /// Called by <see cref="PortableThreadPool.IoUringThreadPool"/>'s driver thread when this
-            /// operation's io_uring completion is available. Must only perform minimal, non-blocking
-            /// bookkeeping (per the <see cref="PortableThreadPool.IIoUringOperation"/> contract) and must
-            /// not run continuations inline or queue them itself - the driver batches the returned work
-            /// item together with others drained in the same pass.
+            /// Performs completion bookkeeping and returns the continuation for worker dispatch.
+            /// This can run on the issuer in legacy dispatch mode, so it must not invoke user code.
             /// </summary>
             IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result)
             {
@@ -472,9 +469,10 @@ namespace Microsoft.Win32.SafeHandles
                     request.Buffer = (byte*)_singleSegmentPin.Pointer;
                     request.BufferLength = _singleSegment.Length;
 
+                    // Completion may run as soon as the request is published.
+                    _fileHandleRefAdded = refAdded;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
-                        _fileHandleRefAdded = refAdded;
                         return true;
                     }
                 }
@@ -485,6 +483,7 @@ namespace Microsoft.Win32.SafeHandles
 
                 _singleSegmentPin.Dispose();
                 _singleSegmentPin = default;
+                _fileHandleRefAdded = false;
                 if (refAdded)
                 {
                     _fileHandle.DangerousRelease();
@@ -512,9 +511,9 @@ namespace Microsoft.Win32.SafeHandles
                     request.Buffer = (byte*)_singleSegmentPin.Pointer;
                     request.BufferLength = _singleSegment.Length;
 
+                    _fileHandleRefAdded = refAdded;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
-                        _fileHandleRefAdded = refAdded;
                         return true;
                     }
                 }
@@ -524,6 +523,7 @@ namespace Microsoft.Win32.SafeHandles
 
                 _singleSegmentPin.Dispose();
                 _singleSegmentPin = default;
+                _fileHandleRefAdded = false;
                 if (refAdded)
                 {
                     _fileHandle.DangerousRelease();
@@ -571,12 +571,12 @@ namespace Microsoft.Win32.SafeHandles
                     request.Vectors = (Interop.Sys.IOVector*)vectorsHandle.AddrOfPinnedObject();
                     request.VectorCount = count;
 
+                    _vectorPins = pins;
+                    _vectors = vectors;
+                    _vectorsHandle = vectorsHandle;
+                    _fileHandleRefAdded = refAdded;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
-                        _vectorPins = pins;
-                        _vectors = vectors;
-                        _vectorsHandle = vectorsHandle;
-                        _fileHandleRefAdded = refAdded;
                         return true;
                     }
                 }
@@ -584,6 +584,10 @@ namespace Microsoft.Win32.SafeHandles
                 {
                 }
 
+                _vectorPins = null;
+                _vectors = null;
+                _vectorsHandle = default;
+                _fileHandleRefAdded = false;
                 if (vectorsHandle.IsAllocated)
                 {
                     vectorsHandle.Free();
@@ -642,14 +646,14 @@ namespace Microsoft.Win32.SafeHandles
                     request.Vectors = (Interop.Sys.IOVector*)vectorsHandle.AddrOfPinnedObject();
                     request.VectorCount = count;
 
+                    _vectorPins = pins;
+                    _vectors = vectors;
+                    _vectorsHandle = vectorsHandle;
+                    _vectorsOffset = 0;
+                    _remainingBytesToWrite = totalBytesToWrite;
+                    _fileHandleRefAdded = refAdded;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
-                        _vectorPins = pins;
-                        _vectors = vectors;
-                        _vectorsHandle = vectorsHandle;
-                        _vectorsOffset = 0;
-                        _remainingBytesToWrite = totalBytesToWrite;
-                        _fileHandleRefAdded = refAdded;
                         return true;
                     }
                 }
@@ -657,6 +661,12 @@ namespace Microsoft.Win32.SafeHandles
                 {
                 }
 
+                _vectorPins = null;
+                _vectors = null;
+                _vectorsHandle = default;
+                _vectorsOffset = 0;
+                _remainingBytesToWrite = 0;
+                _fileHandleRefAdded = false;
                 if (vectorsHandle.IsAllocated)
                 {
                     vectorsHandle.Free();
@@ -672,11 +682,6 @@ namespace Microsoft.Win32.SafeHandles
                 return false;
             }
 
-            /// <summary>
-            /// Resubmits the remaining (not-yet-written) portion of a WriteGather operation, using the
-            /// already-pinned vector array advanced by <see cref="AdvanceVectorsAfterPartialWrite"/>.
-            /// Assumes the previous io_uring state has just been released via <see cref="ReleaseIoUringState"/>.
-            /// </summary>
             /// <summary>
             /// Resubmits the remaining (not-yet-written) portion of a WriteGather operation. Reuses the
             /// already-pinned <see cref="_vectorsHandle"/>/<see cref="_vectorPins"/> from the original
@@ -706,9 +711,9 @@ namespace Microsoft.Win32.SafeHandles
                     request.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
                     request.VectorCount = remainingCount;
 
+                    _fileHandleRefAdded = refAdded;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
-                        _fileHandleRefAdded = refAdded;
                         return true;
                     }
                 }
@@ -716,6 +721,7 @@ namespace Microsoft.Win32.SafeHandles
                 {
                 }
 
+                _fileHandleRefAdded = false;
                 if (refAdded)
                 {
                     _fileHandle.DangerousRelease();
