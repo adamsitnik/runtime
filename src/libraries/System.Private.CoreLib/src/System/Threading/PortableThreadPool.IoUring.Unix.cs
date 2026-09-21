@@ -88,6 +88,7 @@ namespace System.Threading
             // under high concurrency), drains all of them via a single syscall instead of one syscall per
             // completion.
             private const int MaxCompletionsPerWait = 64;
+            private const int SubmissionRetryDelayMs = 1;
 
             // Defensive safety-net timeout (milliseconds) for the issuer thread's wait when operations
             // are in flight but nothing is immediately ready. In the common/expected case this timeout
@@ -101,10 +102,6 @@ namespace System.Threading
             // this design replaced.
             private const int InFlightWaitTimeoutMs = 1000;
 
-            // Matches SocketAsyncEngine's own threshold and reasoning (see dotnet/runtime#35330): bounds
-            // how long a single CompletionProcessor work item keeps draining its ring's queue before
-            // yielding the thread back to the Thread Pool, so a sustained stream of completions cannot
-            // starve other kinds of work items.
             private const int CompletionProcessorTimeSliceMs = 15;
 
             // Maximum number of requests the issuer thread pulls off a ring's pending-submissions queue
@@ -113,13 +110,7 @@ namespace System.Threading
             // very large burst, rather than waiting for the entire burst to be dequeued first.
             private const int MaxRequestsPerSubmitBatch = 256;
 
-            // How completions are handed off from an issuer thread to Thread Pool worker threads. See
-            // ScheduleCompletionProcessing/CompletionProcessor's doc comments for the parallelized-enqueue
-            // design (ported from dotnet/runtime#35330's epoll fix), and DispatchBatch's doc comment for
-            // the older single-batched-call design it replaces as the default. Kept selectable (rather
-            // than deleting the older path outright) so the two can be A/B compared later; set
-            // DOTNET_IORING_PARALLELIZED_ENQUEUE=0 to opt back into the older behavior. Shared by every
-            // ring - not a per-ring setting.
+            // Set DOTNET_IORING_PARALLELIZED_ENQUEUE=0 to compare with the legacy batched dispatch.
             private static readonly bool s_useParallelizedEnqueue =
                 AppContextConfigHelper.GetBooleanConfig("System.Threading.ThreadPool.IoUringParallelizedEnqueue", "DOTNET_IORING_PARALLELIZED_ENQUEUE", defaultValue: true);
 
@@ -168,11 +159,7 @@ namespace System.Threading
                 // the static constructor - see the static constructor's doc comment.
                 public IntPtr RingHandle;
 
-                // Number of io_uring operations submitted (i.e., enqueued via TrySubmit) to this ring but
-                // not yet completed. Incremented as soon as a request is handed off to this ring's issuer
-                // thread (not only once it has actually been published to the kernel SQ ring), so the
-                // issuer thread can tell "is anything in flight at all" apart from "nothing in flight,
-                // safe to fully park" - see IssuerLoop.
+                // Number of requests enqueued by producers whose completions have not been dispatched.
                 public int InFlightCount;
 
                 // MPSC hand-off from any thread calling TrySubmit (and assigned to this ring - see
@@ -204,26 +191,10 @@ namespace System.Threading
                 // TrySubmit and IssuerLoop for the reset-then-recheck protocol that makes this safe.
                 public int WakeSignaled;
 
-                // MPSC hand-off in the opposite direction of PendingSubmissions: raw completions this
-                // ring's issuer thread has drained from the ring but not yet processed. Only
-                // populated/consumed when s_useParallelizedEnqueue is true - see
-                // ScheduleCompletionProcessing/CompletionProcessor.
+                // One issuer produces completions; multiple workers may consume them.
                 public readonly ConcurrentQueue<Interop.Sys.IoRingCompletion> CompletionQueue = new();
-
-                // Set to 1 to indicate that a Thread Pool work item is already scheduled to drain this
-                // ring's CompletionQueue; set back to 0 when that work item starts running, so that
-                // either this ring's issuer thread or another worker draining its queue can schedule a
-                // further one. Mirrors SocketAsyncEngine's _eventQueueProcessingRequested field from the
-                // epoll implementation (see dotnet/runtime#35330) - the whole point of this flag is to
-                // guarantee at most one such work item is ever scheduled per ring at a time, so that
-                // additional parallelism only grows on demand (each running work item reschedules one
-                // more before it starts processing - see CompletionProcessor.Execute) rather than up
-                // front.
+                // Running processors may overlap, but at most one additional processor is queued.
                 public int CompletionProcessingRequested;
-
-                // Singleton work item queued via ScheduleCompletionProcessing for this ring; stateless
-                // aside from the Ring back-reference, so one instance per ring can be (re)queued
-                // indefinitely instead of allocating a new one per schedule.
                 public readonly IThreadPoolWorkItem CompletionProcessor;
 
                 public Ring(int index)
@@ -459,10 +430,10 @@ namespace System.Threading
 
                 while (true)
                 {
-                    DrainAndSubmit(ring, submitBatch);
-                    DrainCompletions(ring, completionsBatch, workItemBatch);
+                    DrainAndSubmit(ring, submitBatch, completionsBatch, workItemBatch);
+                    bool moreCompletions = DrainCompletions(ring, completionsBatch, workItemBatch);
 
-                    if (!ring.PendingSubmissions.IsEmpty)
+                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
                     {
                         // Something was enqueued while we were draining; go around again immediately
                         // instead of waiting.
@@ -483,25 +454,18 @@ namespace System.Threading
                     }
 
                     int timeoutMs = Volatile.Read(ref ring.InFlightCount) > 0 ? InFlightWaitTimeoutMs : -1;
-                    Interop.Sys.EventFdWait(ring.WakeEventFd, timeoutMs);
+                    if (Interop.Sys.EventFdWait(ring.WakeEventFd, timeoutMs) < 0)
+                    {
+                        Environment.FailFast($"io_uring eventfd wait failed: {Marshal.GetLastPInvokeError()}.");
+                    }
                 }
             }
 
             /// <summary>
-            /// Repeatedly pulls up to <see cref="MaxRequestsPerSubmitBatch"/> requests at a time off
-            /// <paramref name="ring"/>'s <see cref="Ring.PendingSubmissions"/> and submits each such
-            /// batch, until the queue is empty. Deliberately does *not* call
-            /// <see cref="Interop.Sys.IoRingKick"/> after the final batch: the entries it fills are left
-            /// published to the SQ tail but not yet asked of the kernel, since the
-            /// <see cref="DrainCompletions"/> call that always immediately follows this one (see
-            /// <see cref="IssuerLoop"/>) submits them together with reaping completions, in a single
-            /// syscall - see <see cref="Interop.Sys.IoRingWaitForCompletions"/>'s doc comment. A kick is
-            /// only issued between batches, when there is more still queued to drain: that indicates an
-            /// unusually large burst (more than one batch's worth arrived at once), in which case it is
-            /// worth giving the kernel a chance to make room in the ring before filling more, rather than
-            /// leaving arbitrarily many batches' worth of entries unsubmitted until the end.
+            /// Drains pending submissions in batches, pumping completions between batches.
             /// </summary>
-            private static unsafe void DrainAndSubmit(Ring ring, Interop.Sys.IoRingRequest[] batch)
+            private static unsafe void DrainAndSubmit(Ring ring, Interop.Sys.IoRingRequest[] batch,
+                Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 while (true)
                 {
@@ -518,15 +482,12 @@ namespace System.Threading
 
                     fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
                     {
-                        SubmitBatchWithRetry(ring, batchPtr, count);
+                        SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, workItemBatch);
                     }
 
                     if (!ring.PendingSubmissions.IsEmpty)
                     {
-                        // More still queued - this ring was created with IORING_SETUP_SINGLE_ISSUER
-                        // (and IORING_SETUP_DEFER_TASKRUN), so this call - like every other call
-                        // touching this ring - is only ever made from this ring's one dedicated thread.
-                        Interop.Sys.IoRingKick(ring.RingHandle);
+                        DrainCompletions(ring, completionsBatch, workItemBatch);
                     }
                 }
             }
@@ -540,7 +501,8 @@ namespace System.Threading
             /// would also unnecessarily perturb FIFO-ish submission order for no benefit, since this
             /// thread is the only one that will ever process this ring's queue anyway.
             /// </summary>
-            private static unsafe void SubmitBatchWithRetry(Ring ring, Interop.Sys.IoRingRequest* requestsPtr, int count)
+            private static unsafe void SubmitBatchWithRetry(Ring ring, Interop.Sys.IoRingRequest* requestsPtr, int count,
+                Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int remaining = count;
                 Interop.Sys.IoRingRequest* remainingPtr = requestsPtr;
@@ -550,8 +512,7 @@ namespace System.Threading
                     int result = Interop.Sys.IoRingSubmit(ring.RingHandle, remainingPtr, remaining, out int submittedCount);
                     if (result != 0)
                     {
-                        // Unexpected/fatal - nothing more we can safely do for this batch.
-                        return;
+                        Environment.FailFast($"io_uring SQ publication failed: {Marshal.GetLastPInvokeError()}.");
                     }
 
                     if (submittedCount >= remaining)
@@ -562,23 +523,16 @@ namespace System.Threading
                     remainingPtr += submittedCount;
                     remaining -= submittedCount;
 
-                    // The ring's SQ was momentarily full - give the kernel a brief chance to make room
-                    // (e.g. by processing already-submitted entries) before retrying the remainder.
-                    Thread.SpinWait(100);
+                    // This issuer must enter the kernel to consume SQEs; spinning alone cannot make room.
+                    DrainCompletions(ring, completionsBatch, workItemBatch);
                 }
             }
 
             /// <summary>
-            /// Drains and dispatches every completion currently available on <paramref name="ring"/>,
-            /// looping until none are left, without blocking if none are ready yet (<c>minComplete: 0</c>)
-            /// - any actual waiting for new completions to arrive is done by the caller, in
-            /// <see cref="IssuerLoop"/>. Its first underlying <c>io_uring_enter</c> call (see
-            /// <see cref="Interop.Sys.IoRingWaitForCompletions"/>) also flushes any SQEs
-            /// <see cref="DrainAndSubmit"/> published just before this call but did not itself submit to
-            /// the kernel, so in the common case (a single submit batch per <see cref="IssuerLoop"/>
-            /// iteration) submission and completion-reaping happen via one syscall total, not two.
+            /// Drains available completions without waiting. Returns true when submission must be
+            /// retried, so the issuer does not park while published SQEs still need progress.
             /// </summary>
-            private static unsafe void DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
+            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 while (true)
                 {
@@ -586,9 +540,23 @@ namespace System.Threading
                     fixed (Interop.Sys.IoRingCompletion* completionsPtr = completionsBatch)
                     {
                         int result = Interop.Sys.IoRingWaitForCompletions(ring.RingHandle, completionsPtr, completionsBatch.Length, minComplete: 0, out completedCount);
-                        if (result != 0 || completedCount == 0)
+                        if (result != 0)
                         {
-                            return;
+                            int error = Marshal.GetLastPInvokeError();
+                            if (new Interop.ErrorInfo(error).Error == Interop.Error.EAGAIN)
+                            {
+                                // Published SQEs still own their buffers. Retry without parking on
+                                // eventfd: allocation failure need not generate a completion or wake.
+                                Thread.Sleep(SubmissionRetryDelayMs);
+                                return true;
+                            }
+
+                            Environment.FailFast($"io_uring completion wait failed: {error}.");
+                        }
+
+                        if (completedCount == 0)
+                        {
+                            return false;
                         }
                     }
 
@@ -605,19 +573,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Default completion hand-off path: ported from the parallelized-enqueue fix dotnet/runtime
-            /// applied to the epoll implementation in #35330 (see that PR, and this file's design doc, for
-            /// the full history/rationale). The issuer thread does the least possible amount of work here
-            /// - just copying the raw completions into <paramref name="ring"/>'s
-            /// <see cref="Ring.CompletionQueue"/> - and hands off both resolving each completion's
-            /// operation (<see cref="CompleteOperation"/>) and running its continuation to Thread Pool
-            /// worker threads, via <see cref="Ring.CompletionProcessor"/>. This lets the issuer thread go
-            /// back to submitting/reaping sooner under load, and - unlike <see cref="DispatchBatch"/>'s
-            /// single call moving a whole batch to the Thread Pool queue at once - grows the number of
-            /// worker threads actually pulling from this ring's queue organically, one at a time, as each
-            /// already-running one reschedules a further one before it starts processing (see
-            /// CompletionProcessorWorkItem.Execute), rather than committing up front to exactly as many
-            /// work items as there were completions in this one batch.
+            /// Hands raw completions to workers, which resolve operations and run their callbacks.
             /// </summary>
             private static void EnqueueCompletions(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions)
             {
@@ -629,14 +585,6 @@ namespace System.Threading
                 ScheduleCompletionProcessing(ring);
             }
 
-            /// <summary>
-            /// Schedules <paramref name="ring"/>'s <see cref="Ring.CompletionProcessor"/> to drain its
-            /// <see cref="Ring.CompletionQueue"/>, unless one is already scheduled (see
-            /// <see cref="Ring.CompletionProcessingRequested"/>'s doc comment). Called both by the issuer
-            /// thread (after enqueueing a freshly-drained batch) and by <see cref="CompletionProcessorWorkItem"/>
-            /// itself (to keep parallelizing/continuing the drain - see its doc comment), exactly like
-            /// SocketAsyncEngine.ScheduleToProcessEvents in the epoll implementation this is ported from.
-            /// </summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             private static void ScheduleCompletionProcessing(Ring ring)
             {
@@ -647,21 +595,15 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Resolves the operation referenced by a single completion's <c>UserData</c> GCHandle,
-            /// completes it, and frees the handle - the shared per-completion bookkeeping used by both
-            /// <see cref="DispatchBatch"/> and <see cref="CompletionProcessorWorkItem"/>. Decrements
-            /// <paramref name="ring"/>'s <see cref="Ring.InFlightCount"/>, since every completion
-            /// necessarily corresponds to a request that was previously counted as in flight on that same
-            /// ring (a calling thread's assignment to a ring is sticky - see
-            /// <see cref="GetAssignedRing"/> - so a given operation's submission and completion are always
-            /// handled by the same ring).
+            /// Resolves and releases a completion's GCHandle before completing its operation.
+            /// This is the shared bookkeeping used by both
+            /// <see cref="DispatchBatch"/> and <see cref="CompletionProcessorWorkItem"/>.
             /// </summary>
             private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion)
             {
                 Interlocked.Decrement(ref ring.InFlightCount);
-
                 GCHandle handle = GCHandle.FromIntPtr((IntPtr)completion.UserData);
-                var operation = (IIoUringOperation)handle.Target!;
+                IIoUringOperation operation = (IIoUringOperation)handle.Target!;
                 handle.Free();
 
                 return operation.CompleteFromIoUring(completion.Result);
@@ -698,14 +640,6 @@ namespace System.Threading
                 }
             }
 
-            /// <summary>
-            /// The Thread Pool work item scheduled by <see cref="ScheduleCompletionProcessing"/> to drain
-            /// one specific <see cref="Ring"/>'s <see cref="Ring.CompletionQueue"/> - the
-            /// parallelized-enqueue path ported from SocketAsyncEngine's <c>IThreadPoolWorkItem</c>
-            /// implementation in dotnet/runtime#35330. One instance is created per ring (see
-            /// <see cref="Ring.CompletionProcessor"/>) and reused indefinitely for that ring, rather than
-            /// allocating a new one per schedule.
-            /// </summary>
             private sealed class CompletionProcessorWorkItem : IThreadPoolWorkItem
             {
                 private readonly Ring _ring;
@@ -719,49 +653,26 @@ namespace System.Threading
                 {
                     Ring ring = _ring;
 
-                    // Indicate that a work item is no longer scheduled to process this ring's
-                    // completions, before attempting to dequeue one - this ordering matters (see
-                    // ScheduleCompletionProcessing): if this ring's issuer thread (or another
-                    // CompletionProcessorWorkItem instance for the same ring) enqueues a completion and
-                    // observes this flag still set to 1, it will skip scheduling, relying entirely on
-                    // this instance to still pick that completion up - which it can only guarantee by
-                    // resetting the flag *before* checking the queue, not after.
+                    // Reset before checking the queue so racing producers cannot miss scheduling work.
                     Interlocked.Exchange(ref ring.CompletionProcessingRequested, 0);
-
                     if (!ring.CompletionQueue.TryDequeue(out Interop.Sys.IoRingCompletion completion))
                     {
                         return;
                     }
-
                     int startTimeMs = Environment.TickCount;
-
-                    // A completion was successfully dequeued, and there may be more queued. Schedule
-                    // another work item to parallelize draining before processing this one - from this
-                    // point on, growing further parallelism (if there is more work and idle workers to run
-                    // it) is this chain of work items' own responsibility, not the issuer thread's.
                     ScheduleCompletionProcessing(ring);
-
                     while (true)
                     {
-                        // Unlike DispatchBatch, this runs the continuation directly on this Thread Pool
-                        // worker rather than queuing it as a separate work item - there is no batching to
-                        // wait for here, so there is nothing to gain (and an extra dispatch to lose) by
-                        // deferring it.
                         CompleteOperation(ring, in completion)?.Execute();
-
                         if (Environment.TickCount - startTimeMs >= CompletionProcessorTimeSliceMs)
                         {
                             break;
                         }
-
                         if (!ring.CompletionQueue.TryDequeue(out completion))
                         {
                             return;
                         }
                     }
-
-                    // The queue was not observed to be empty when this loop gave up its time slice;
-                    // schedule another work item before yielding this thread back to the Thread Pool.
                     ScheduleCompletionProcessing(ring);
                 }
             }
@@ -774,18 +685,10 @@ namespace System.Threading
         internal interface IIoUringOperation
         {
             /// <summary>
-            /// Called directly by the issuer thread (synchronously, as part of draining the completion
-            /// queue) with the raw io_uring completion result: the number of bytes transferred on
-            /// success, or <c>-errno</c> on failure. Implementations must only do the minimal bookkeeping
-            /// required (e.g., unpinning buffers, storing the result) and must NOT run the continuation
-            /// body inline on the issuer thread, nor queue it to the Thread Pool themselves. Instead,
-            /// return the <see cref="IThreadPoolWorkItem"/> representing the continuation to run, so the
-            /// issuer thread can batch it together with the other completions drained in the same pass and
-            /// queue them all via a single <see cref="ThreadPool.UnsafeQueueUserWorkItems"/> call, instead
-            /// of calling <see cref="ThreadPool.UnsafeQueueUserWorkItem(IThreadPoolWorkItem, bool)"/> once
-            /// per completion. Return <see langword="null"/> if this completion does not (yet) require a
-            /// continuation to be queued - e.g. a partial write was resubmitted via a new io_uring request
-            /// and remains in flight.
+            /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>.
+            /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
+            /// user continuations. Return the work item for the dispatcher to execute on a worker,
+            /// or <see langword="null"/> when a partial operation has been resubmitted.
             /// </summary>
             IThreadPoolWorkItem? CompleteFromIoUring(int result);
         }

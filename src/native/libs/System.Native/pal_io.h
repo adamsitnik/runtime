@@ -1005,15 +1005,12 @@ PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* 
 
 /**
  * Asks the kernel to start processing any requests already published via
- * SystemNative_IoRingSubmit (by this thread or any other). Unlike SystemNative_IoRingSubmit,
- * this call is just a thin wrapper over the io_uring_enter(2) syscall and is safe to call
- * concurrently from multiple threads without any external synchronization, for a ring created
- * without IORING_SETUP_SINGLE_ISSUER (the kernel serializes access to the ring internally).
+ * SystemNative_IoRingSubmit. The caller must serialize this with submission and completion
+ * reaping. For single-issuer rings, all three run on the creating thread.
  *
  * Returns 0 on success; otherwise, returns -1 and sets errno. A failure here does not mean the
- * previously-published requests were lost - they remain visible to the kernel and will still
- * eventually be processed and produce completions (e.g., a subsequent successful kick, or the
- * driver's blocking wait in SystemNative_IoRingWaitForCompletions, will still pick them up).
+ * previously-published requests were lost. Unconsumed entries, including those remaining after
+ * a short successful submission, remain pending for a later kick or completion wait.
  */
 PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
 
@@ -1052,19 +1049,18 @@ PALEXPORT int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilli
 
 /**
  * Reaps completions from the given ring's completion queue, waiting in-kernel for at least
- * minComplete of them to be available (pass 0 to only drain what is already available - this
- * still issues a plain, non-blocking IORING_ENTER_GETEVENTS call, rather than skipping the
- * io_uring_enter(2) call entirely: for a ring created with IORING_SETUP_DEFER_TASKRUN, this call
- * is what actually pumps the kernel's deferred completion task-work onto the CQ ring - without it,
- * completions never get posted at all, no matter how long the caller waits afterwards). As a side
- * effect, this same io_uring_enter(2) call also flushes any SQEs already published to the SQ tail
+ * minComplete of them to be available. With minComplete == 0, GETEVENTS still enters the kernel
+ * to process deferred task-work before copying CQEs.
+ * The enter also submits any SQEs already published to the SQ tail
  * (e.g. via SystemNative_IoRingSubmit) but not yet asked the kernel to process - the caller does
  * not need to separately call SystemNative_IoRingKick before this to have such entries picked up;
- * calling this instead of Kick+WaitForCompletions separately saves a syscall. Not thread-safe with
- * itself: the caller must ensure only one thread ever calls this for a given ring at a time.
+ * calling this instead of Kick+WaitForCompletions separately saves a syscall. Short submissions
+ * may require an additional GETEVENTS-only call. The caller must serialize this with submission
+ * and kicks, using the creating thread for single-issuer rings.
  *
  * Returns 0 on success (with *completedCount set to the number of completions written into
  * the completions buffer, up to maxCompletions); otherwise, returns -1 and sets errno.
+ * EAGAIN leaves published SQEs pending; the caller must retry after allowing kernel progress.
  */
 PALEXPORT int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount);
 
