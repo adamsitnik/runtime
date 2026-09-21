@@ -88,6 +88,7 @@ namespace System.Threading
             // under high concurrency), drains all of them via a single syscall instead of one syscall per
             // completion.
             private const int MaxCompletionsPerWait = 64;
+            private const int MaxCompletionsPerTurn = 256;
             private const int SubmissionRetryDelayMs = 1;
 
             // Defensive safety-net timeout (milliseconds) for the issuer thread's wait when operations
@@ -462,33 +463,26 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Drains pending submissions in batches, pumping completions between batches.
+            /// Publishes at most one submission batch, then yields to completion reaping. The following
+            /// completion wait submits these SQEs and processes deferred work in the same enter.
             /// </summary>
             private static unsafe void DrainAndSubmit(Ring ring, Interop.Sys.IoRingRequest[] batch,
                 Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
-                while (true)
+                int count = 0;
+                while (count < batch.Length && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
                 {
-                    int count = 0;
-                    while (count < batch.Length && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
-                    {
-                        batch[count++] = request;
-                    }
+                    batch[count++] = request;
+                }
 
-                    if (count == 0)
-                    {
-                        return;
-                    }
+                if (count == 0)
+                {
+                    return;
+                }
 
-                    fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
-                    {
-                        SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, workItemBatch);
-                    }
-
-                    if (!ring.PendingSubmissions.IsEmpty)
-                    {
-                        DrainCompletions(ring, completionsBatch, workItemBatch);
-                    }
+                fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
+                {
+                    SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, workItemBatch);
                 }
             }
 
@@ -529,12 +523,13 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Drains available completions without waiting. Returns true when submission must be
-            /// retried, so the issuer does not park while published SQEs still need progress.
+            /// Drains a bounded number of completions without waiting. Returns true when the budget
+            /// was exhausted, so the issuer alternates with submissions rather than parking.
             /// </summary>
             private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
-                while (true)
+                int processed = 0;
+                while (processed < MaxCompletionsPerTurn)
                 {
                     int completedCount;
                     fixed (Interop.Sys.IoRingCompletion* completionsPtr = completionsBatch)
@@ -560,6 +555,7 @@ namespace System.Threading
                         }
                     }
 
+                    processed += completedCount;
                     ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
                     if (s_useParallelizedEnqueue)
                     {
@@ -570,6 +566,8 @@ namespace System.Threading
                         DispatchBatch(ring, completions, workItemBatch);
                     }
                 }
+
+                return true;
             }
 
             /// <summary>
