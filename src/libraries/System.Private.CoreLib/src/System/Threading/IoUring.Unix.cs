@@ -6,16 +6,13 @@ using System.Runtime.InteropServices;
 namespace System.Threading
 {
     /// <summary>
-    /// EXPERIMENTAL, PROTOTYPE-ONLY API. Exposes a minimal subset of the Thread Pool's shared-ring
-    /// io_uring integration ("Option 3": a single ring shared by every Thread Pool worker thread,
-    /// used internally by <see cref="System.IO.RandomAccess"/> on Linux) to other framework
-    /// assemblies (e.g. System.Net.Sockets), so a socket completion can be submitted onto - and
-    /// reaped from - the same shared ring, instead of requiring a second, dedicated ring per
-    /// subsystem. This type only exists to support an in-progress experiment (measuring the
-    /// maximum throughput achievable with a single shared ring, for comparison against a
-    /// per-thread-ring design) and may change incompatibly, or be removed entirely, in a future
-    /// build without notice.
+    /// Exposes the experimental io_uring Thread Pool infrastructure to other framework components.
     /// </summary>
+    /// <remarks>
+    /// This prototype shares sharded rings with <see cref="System.IO.RandomAccess"/> on Linux.
+    /// Each ring has one dedicated issuer; completion callbacks run on Thread Pool workers.
+    /// The API may change incompatibly or be removed without notice.
+    /// </remarks>
     [CLSCompliant(false)]
     public static class IoUring
     {
@@ -89,32 +86,37 @@ namespace System.Threading
                 return false;
             }
 
+            ActionIoUringOperation operation = ActionIoUringOperation.Rent(handle, onCompleted);
+
             bool refAdded = false;
-            handle.DangerousAddRef(ref refAdded);
-            if (!refAdded)
+            bool submitted = false;
+            try
             {
-                return false;
+                handle.DangerousAddRef(ref refAdded);
+                Interop.Sys.IoRingRequest request = default;
+                request.OpCode = opCode;
+                request.Fd = handle.DangerousGetHandle();
+                request.Offset = -1;
+                request.Buffer = buffer;
+                request.BufferLength = length;
+                request.Flags = flags;
+                request.SockAddr = sockAddr;
+                request.SockAddrLen = sockAddrLen;
+
+                submitted = PortableThreadPool.IoUringThreadPool.TrySubmit(operation, in request);
+                return submitted;
             }
-
-            var operation = new ActionIoUringOperation(handle, onCompleted);
-
-            Interop.Sys.IoRingRequest request = default;
-            request.OpCode = opCode;
-            request.Fd = handle.DangerousGetHandle();
-            request.Offset = -1;
-            request.Buffer = buffer;
-            request.BufferLength = length;
-            request.Flags = flags;
-            request.SockAddr = sockAddr;
-            request.SockAddrLen = sockAddrLen;
-
-            if (PortableThreadPool.IoUringThreadPool.TrySubmit(operation, in request))
+            finally
             {
-                return true;
+                if (!submitted)
+                {
+                    operation.Return();
+                    if (refAdded)
+                    {
+                        handle.DangerousRelease();
+                    }
+                }
             }
-
-            handle.DangerousRelease();
-            return false;
         }
 
         /// <summary>
@@ -129,30 +131,44 @@ namespace System.Threading
         /// </summary>
         private sealed class ActionIoUringOperation : IThreadPoolWorkItem, PortableThreadPool.IIoUringOperation
         {
-            private readonly SafeHandle _handle;
-            private readonly Action<int> _onCompleted;
+            [ThreadStatic]
+            private static ActionIoUringOperation? t_cachedOperation;
+
+            private SafeHandle? _handle;
+            private Action<int>? _onCompleted;
             private int _result;
 
-            public ActionIoUringOperation(SafeHandle handle, Action<int> onCompleted)
+            public static ActionIoUringOperation Rent(SafeHandle handle, Action<int> onCompleted)
             {
-                _handle = handle;
-                _onCompleted = onCompleted;
+                ActionIoUringOperation operation = t_cachedOperation ?? new ActionIoUringOperation();
+                t_cachedOperation = null;
+                operation._handle = handle;
+                operation._onCompleted = onCompleted;
+                return operation;
+            }
+
+            public void Return()
+            {
+                _handle = null;
+                _onCompleted = null;
+                t_cachedOperation ??= this;
             }
 
             IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result)
             {
-                // Called synchronously by the shared ring's driver thread while draining a batch of
-                // completions: only do the minimal bookkeeping here (stash the raw result) and
-                // return `this` so the driver can queue it - possibly batched with other
-                // completions from the same drain pass - instead of running _onCompleted inline.
+                // Legacy dispatch resolves completions on the issuer, so defer the user callback.
                 _result = result;
                 return this;
             }
 
             void IThreadPoolWorkItem.Execute()
             {
-                _handle.DangerousRelease();
-                _onCompleted(_result);
+                SafeHandle handle = _handle!;
+                Action<int> onCompleted = _onCompleted!;
+                int result = _result;
+                Return();
+                handle.DangerousRelease();
+                onCompleted(result);
             }
         }
     }
