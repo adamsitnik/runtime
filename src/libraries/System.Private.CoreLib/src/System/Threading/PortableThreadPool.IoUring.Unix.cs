@@ -160,7 +160,8 @@ namespace System.Threading
                 // the static constructor - see the static constructor's doc comment.
                 public IntPtr RingHandle;
 
-                // Number of requests enqueued by producers whose completions have not been dispatched.
+                // Issuer-owned count of requests taken from PendingSubmissions whose CQEs have not
+                // been reaped. Managed callbacks need not finish before the issuer can park.
                 public int InFlightCount;
 
                 // MPSC hand-off from any thread calling TrySubmit (and assigned to this ring - see
@@ -391,7 +392,6 @@ namespace System.Threading
                 Interop.Sys.IoRingRequest localRequest = request;
                 localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
 
-                Interlocked.Increment(ref ring.InFlightCount);
                 ring.PendingSubmissions.Enqueue(localRequest);
 
                 // Only the thread that wins the 0->1 transition actually writes to the eventfd; every
@@ -454,7 +454,7 @@ namespace System.Threading
                         continue;
                     }
 
-                    int timeoutMs = Volatile.Read(ref ring.InFlightCount) > 0 ? InFlightWaitTimeoutMs : -1;
+                    int timeoutMs = ring.InFlightCount > 0 ? InFlightWaitTimeoutMs : -1;
                     if (Interop.Sys.EventFdWait(ring.WakeEventFd, timeoutMs) < 0)
                     {
                         Environment.FailFast($"io_uring eventfd wait failed: {Marshal.GetLastPInvokeError()}.");
@@ -480,6 +480,7 @@ namespace System.Threading
                     return;
                 }
 
+                ring.InFlightCount += count;
                 fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
                 {
                     SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, workItemBatch);
@@ -555,6 +556,8 @@ namespace System.Threading
                         }
                     }
 
+                    ring.InFlightCount -= completedCount;
+                    Debug.Assert(ring.InFlightCount >= 0);
                     processed += completedCount;
                     ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
                     if (s_useParallelizedEnqueue)
@@ -599,7 +602,6 @@ namespace System.Threading
             /// </summary>
             private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion)
             {
-                Interlocked.Decrement(ref ring.InFlightCount);
                 GCHandle handle = GCHandle.FromIntPtr((IntPtr)completion.UserData);
                 IIoUringOperation operation = (IIoUringOperation)handle.Target!;
                 handle.Free();
