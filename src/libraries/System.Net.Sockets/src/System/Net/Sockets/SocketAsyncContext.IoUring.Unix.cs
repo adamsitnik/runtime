@@ -6,20 +6,14 @@ using System.Threading;
 
 namespace System.Net.Sockets
 {
-    // EXPERIMENTAL, PROTOTYPE-ONLY: implements "Architecture B" (true completion-based
-    // Receive/Send/Accept/Connect, submitted directly via io_uring) for TCP/stream sockets, on top
-    // of "Option 3"'s single, shared io_uring ring (see System.Private.CoreLib's
-    // PortableThreadPool.IoUring.Unix.cs) via the public System.Threading.IoUring API - this file
-    // is a straight port of the equivalent per-thread-ring implementation, used here to measure the
-    // maximum throughput achievable with a single shared ring instead. This is purely additive:
-    // every method here either completes the operation by invoking the caller's callback
-    // asynchronously (returning true), or returns false immediately without side effects, in which
-    // case the caller falls back to the existing epoll-based SocketAsyncEngine path unchanged.
-    // UDP/datagram sockets, multi-buffer scatter/gather, and cancellation are all out of scope -
-    // callers only attempt these methods for the plain single-buffer / no-destination-address
-    // cases; anything else always returns false.
+    // Experimental completion-based socket operations over shared, sharded io_uring rings.
+    // Each ring has one issuer; callbacks run on Thread Pool workers. Returning false leaves
+    // the caller to use the existing SocketAsyncEngine path. This prototype does not yet
+    // integrate the existing operation queues' cancellation and close bookkeeping.
     internal sealed partial class SocketAsyncContext
     {
+        private IoUringReceiveOperation? _cachedIoUringReceiveOperation;
+
         /// <summary>
         /// Attempts to complete a plain, single-buffer, no-destination-address Receive via io_uring
         /// instead of registering the socket for epoll-based readiness notification. Returns
@@ -36,20 +30,61 @@ namespace System.Net.Sockets
                 return false;
             }
 
-            MemoryHandle pin = buffer.Pin();
-            bool submitted = System.Threading.IoUring.TrySubmitRecv(
-                _socket,
-                (byte*)pin.Pointer,
-                buffer.Length,
-                0,
-                result => CompleteReceiveOrSend(pin, callback, result));
+            IoUringReceiveOperation operation = Interlocked.Exchange(ref _cachedIoUringReceiveOperation, null)
+                ?? new IoUringReceiveOperation(this);
+            return operation.TrySubmit(buffer, callback);
+        }
 
-            if (!submitted)
+        private sealed class IoUringReceiveOperation
+        {
+            private readonly SocketAsyncContext _context;
+            private readonly Action<int> _onCompleted;
+            private MemoryHandle _pin;
+            private Action<int, Memory<byte>, SocketFlags, SocketError>? _callback;
+
+            public IoUringReceiveOperation(SocketAsyncContext context)
             {
-                pin.Dispose();
+                _context = context;
+                _onCompleted = Complete;
             }
 
-            return submitted;
+            public unsafe bool TrySubmit(Memory<byte> buffer, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+            {
+                bool submitted = false;
+                try
+                {
+                    _pin = buffer.Pin();
+                    _callback = callback;
+                    submitted = System.Threading.IoUring.TrySubmitRecv(
+                        _context._socket, (byte*)_pin.Pointer, buffer.Length, 0, _onCompleted);
+                    return submitted;
+                }
+                finally
+                {
+                    if (!submitted)
+                    {
+                        MemoryHandle pin = _pin;
+                        Return();
+                        pin.Dispose();
+                    }
+                }
+            }
+
+            private void Complete(int result)
+            {
+                MemoryHandle pin = _pin;
+                Action<int, Memory<byte>, SocketFlags, SocketError> callback = _callback!;
+                Return();
+                CompleteReceiveOrSend(pin, callback, result);
+            }
+
+            private void Return()
+            {
+                _pin = default;
+                _callback = null;
+                // User callbacks (including Unpin) may immediately submit another receive.
+                Interlocked.CompareExchange(ref _context._cachedIoUringReceiveOperation, this, null);
+            }
         }
 
         /// <summary>
