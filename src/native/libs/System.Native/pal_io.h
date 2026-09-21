@@ -1049,8 +1049,9 @@ PALEXPORT int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilli
 
 /**
  * Reaps completions from the given ring's completion queue, waiting in-kernel for at least
- * minComplete of them to be available. With minComplete == 0, GETEVENTS still enters the kernel
- * to process deferred task-work before copying CQEs.
+ * minComplete of them to be available. With minComplete == 0 and TASKRUN_FLAG enabled, an enter
+ * is needed only for pending submissions, deferred task-work, or CQ overflow. Other rings
+ * conservatively enter on each call. GETEVENTS processes deferred task-work before copying CQEs.
  * The enter also submits any SQEs already published to the SQ tail
  * (e.g. via SystemNative_IoRingSubmit) but not yet asked the kernel to process - the caller does
  * not need to separately call SystemNative_IoRingKick before this to have such entries picked up;

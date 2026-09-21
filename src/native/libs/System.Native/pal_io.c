@@ -2226,6 +2226,7 @@ typedef struct
 
     uint32_t* SqHead;
     uint32_t* SqTail;
+    uint32_t* SqFlags;
     uint32_t* SqRingMask;
     uint32_t* SqArray;
     uint32_t SqEntries;
@@ -2235,6 +2236,7 @@ typedef struct
     uint32_t* CqTail;
     uint32_t* CqRingMask;
     struct io_uring_cqe* Cqes;
+    bool HasTaskRunFlag;
 } IoRing;
 
 static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
@@ -2257,6 +2259,20 @@ static long IoUringEnter(int fd, uint32_t toSubmit, uint32_t minComplete, uint32
 static uint32_t IoRingPendingSubmissions(IoRing* ring)
 {
     return *ring->SqTail - __atomic_load_n(ring->SqHead, __ATOMIC_ACQUIRE);
+}
+
+static bool IoRingNeedsEnter(IoRing* ring, int32_t minComplete)
+{
+#if defined(IORING_SQ_TASKRUN) && defined(IORING_SQ_CQ_OVERFLOW)
+    if (ring->HasTaskRunFlag && minComplete == 0 && IoRingPendingSubmissions(ring) == 0)
+    {
+        uint32_t flags = __atomic_load_n(ring->SqFlags, __ATOMIC_ACQUIRE);
+        return (flags & (IORING_SQ_TASKRUN | IORING_SQ_CQ_OVERFLOW)) != 0;
+    }
+#else
+    (void)ring, (void)minComplete;
+#endif
+    return true;
 }
 
 static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
@@ -2417,7 +2433,7 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     // it and instead let task-work simply accumulate until this thread's next kernel transition.
     // Combined with IORING_SETUP_TASKRUN_FLAG (only meaningful together with COOP_TASKRUN), the
     // kernel additionally sets IORING_SQ_TASKRUN in the SQ ring's flags whenever such deferred
-    // task-work is actually pending, allowing future completion reaping to avoid unnecessary enters.
+    // task-work is actually pending, allowing completion reaping to avoid unnecessary enters.
 #if defined(IORING_SETUP_COOP_TASKRUN)
     params.flags |= IORING_SETUP_COOP_TASKRUN;
 #if defined(IORING_SETUP_TASKRUN_FLAG)
@@ -2443,6 +2459,9 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
 
     ring->Fd = (int)fd;
     ring->EventFd = -1;
+#if defined(IORING_SETUP_TASKRUN_FLAG)
+    ring->HasTaskRunFlag = (params.flags & IORING_SETUP_TASKRUN_FLAG) != 0;
+#endif
 
     size_t sqRingSize = (size_t)params.sq_off.array + (size_t)params.sq_entries * sizeof(uint32_t);
     size_t cqRingSize = (size_t)params.cq_off.cqes + (size_t)params.cq_entries * sizeof(struct io_uring_cqe);
@@ -2473,6 +2492,7 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
 
     ring->SqHead = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.head);
     ring->SqTail = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.tail);
+    ring->SqFlags = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.flags);
     ring->SqRingMask = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.ring_mask);
     ring->SqArray = (uint32_t*)((uint8_t*)sqRingPtr + params.sq_off.array);
     ring->SqEntries = params.sq_entries;
@@ -2701,7 +2721,7 @@ int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingComplet
         return -1;
     }
 
-    while (true)
+    while (IoRingNeedsEnter(ring, minComplete))
     {
         // io_uring_enter skips GETEVENTS when fewer SQEs are consumed than requested.
         // Pass the actual pending count, not the ring capacity, so deferred task-work runs.
