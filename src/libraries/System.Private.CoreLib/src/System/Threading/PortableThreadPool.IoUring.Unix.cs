@@ -77,7 +77,7 @@ namespace System.Threading
         /// (the constructor's own) thread publish <see cref="s_isEnabled"/>/<see cref="s_rings"/> itself,
         /// before returning. Only after that does each new thread go on to call <see cref="IssuerLoop"/>.
         /// </summary>
-        internal static class IoUringThreadPool
+        internal static partial class IoUringThreadPool
         {
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive in a future iteration.
@@ -171,6 +171,7 @@ namespace System.Threading
                 // Issuer-owned count of requests taken from PendingSubmissions whose CQEs have not
                 // been reaped. Managed callbacks need not finish before the issuer can park.
                 public int InFlightCount;
+                public int MultishotCount;
 
                 // MPSC hand-off from any thread calling TrySubmit (and assigned to this ring - see
                 // GetAssignedRing) to this ring's single dedicated issuer thread (see IssuerLoop). This
@@ -179,6 +180,7 @@ namespace System.Threading
                 // other thread must go through this queue instead. Unbounded: TrySubmit never blocks or
                 // fails due to this queue being "full".
                 public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingSubmissions = new();
+                public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingCancellations = new();
 
                 // An eventfd registered with this ring via IORING_REGISTER_EVENTFD (see
                 // Interop.Sys.IoRingRegisterEventFd), or -1 if unavailable. The kernel bumps its counter
@@ -402,11 +404,18 @@ namespace System.Threading
 
                 Ring ring = GetAssignedRing();
 
+                QueueOperation(ring, operation, in request, cancellation: false);
+                return true;
+            }
+
+            private static void QueueOperation(Ring ring, IIoUringOperation operation,
+                in Interop.Sys.IoRingRequest request, bool cancellation)
+            {
                 Interop.Sys.IoRingRequest localRequest = request;
                 if (ring.FreeOperationSlots.TryDequeue(out int slotIndex))
                 {
                     ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
-                    uint generation = unchecked(slot.Generation + 1);
+                    uint generation = unchecked(slot.Generation + 1) & OperationSlotGenerationMask;
                     Volatile.Write(ref slot.Generation, generation);
                     Volatile.Write(ref slot.Operation, operation);
                     localRequest.UserData = ((ulong)generation << OperationSlotGenerationShift) |
@@ -417,13 +426,13 @@ namespace System.Threading
                     // Normal GCHandles have bit zero clear; tagged slot tokens instead refer to
                     // the ring's bounded array, which roots their operations until completion.
                     GCHandle handle = GCHandle.Alloc(operation);
-                    localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
+                    localRequest.UserData = (ulong)(nuint)GCHandle.ToIntPtr(handle);
                     Debug.Assert((localRequest.UserData & OperationSlotTag) == 0);
                 }
 
                 try
                 {
-                    ring.PendingSubmissions.Enqueue(localRequest);
+                    (cancellation ? ring.PendingCancellations : ring.PendingSubmissions).Enqueue(localRequest);
                 }
                 catch
                 {
@@ -431,6 +440,11 @@ namespace System.Threading
                     throw;
                 }
 
+                WakeIssuer(ring);
+            }
+
+            private static void WakeIssuer(Ring ring)
+            {
                 // Only the thread that wins the 0->1 transition actually writes to the eventfd; every
                 // other concurrent caller (assigned to this same ring) can rely on that single write to
                 // wake the issuer, since the issuer only resets this flag back to 0 immediately before it
@@ -441,8 +455,6 @@ namespace System.Threading
                 {
                     Interop.Sys.EventFdWrite(ring.WakeEventFd);
                 }
-
-                return true;
             }
 
             /// <summary>
@@ -471,7 +483,7 @@ namespace System.Threading
                     DrainAndSubmit(ring, submitBatch, completionsBatch, workItemBatch);
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, workItemBatch);
 
-                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
+                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty)
                     {
                         // Something was enqueued while we were draining; go around again immediately
                         // instead of waiting.
@@ -486,7 +498,7 @@ namespace System.Threading
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
                     Volatile.Write(ref ring.WakeSignaled, 0);
-                    if (!ring.PendingSubmissions.IsEmpty)
+                    if (!ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty)
                     {
                         continue;
                     }
@@ -507,8 +519,28 @@ namespace System.Threading
                 Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int count = 0;
-                while (count < batch.Length && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
+                while (count < batch.Length && ring.PendingCancellations.TryDequeue(out Interop.Sys.IoRingRequest cancellation))
                 {
+                    batch[count++] = cancellation;
+                }
+                int remaining = batch.Length - count;
+                while (remaining-- > 0 && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
+                {
+                    if ((request.UserData & MultishotOperationTag) != 0)
+                    {
+                        GCHandle token = GCHandle.FromIntPtr((IntPtr)(nuint)(request.UserData & ~MultishotOperationTag));
+                        MultishotAcceptOperation operation = (MultishotAcceptOperation)token.Target!;
+                        if (!operation.TryBeginSubmission())
+                        {
+                            operation.OnCompletion(new Interop.Sys.IoRingCompletion
+                            {
+                                UserData = request.UserData,
+                                Result = -new Interop.ErrorInfo(Interop.Error.ECANCELED).RawErrno
+                            });
+                            continue;
+                        }
+                        ring.MultishotCount++;
+                    }
                     batch[count++] = request;
                 }
 
@@ -593,10 +625,44 @@ namespace System.Threading
                         }
                     }
 
-                    ring.InFlightCount -= completedCount;
-                    Debug.Assert(ring.InFlightCount >= 0);
                     processed += completedCount;
-                    ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
+                    int singleShotCount = completedCount;
+                    if (ring.MultishotCount == 0)
+                    {
+                        ring.InFlightCount -= completedCount;
+                    }
+                    else
+                    {
+                        singleShotCount = 0;
+                        for (int i = 0; i < completedCount; i++)
+                        {
+                            Interop.Sys.IoRingCompletion completion = completionsBatch[i];
+                            bool terminal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                            if (terminal)
+                            {
+                                ring.InFlightCount--;
+                            }
+                            if ((completion.UserData & MultishotOperationTag) != 0)
+                            {
+                                if (terminal)
+                                {
+                                    ring.MultishotCount--;
+                                }
+                                GCHandle handle = GCHandle.FromIntPtr((IntPtr)(nuint)(completion.UserData & ~MultishotOperationTag));
+                                ((MultishotAcceptOperation)handle.Target!).OnCompletion(completion);
+                            }
+                            else
+                            {
+                                completionsBatch[singleShotCount++] = completion;
+                            }
+                        }
+                    }
+                    Debug.Assert(ring.InFlightCount >= 0);
+                    if (singleShotCount == 0)
+                    {
+                        continue;
+                    }
+                    ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, singleShotCount);
                     if (s_useParallelizedEnqueue)
                     {
                         EnqueueCompletions(ring, completions);

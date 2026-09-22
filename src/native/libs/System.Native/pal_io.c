@@ -2206,6 +2206,11 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 
 #if HAVE_LINUX_IO_URING_H
 
+#ifndef IORING_ACCEPT_MULTISHOT
+// Stable io_uring ABI flag since Linux 5.19; older kernels reject it with EINVAL.
+#define IORING_ACCEPT_MULTISHOT (1U << 0)
+#endif
+
 typedef struct
 {
     int Fd;
@@ -2331,6 +2336,15 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->opcode = IORING_OP_CONNECT;
             sqe->addr = (uint64_t)(uintptr_t)request->SockAddr;
             sqe->off = request->SockAddrLen != NULL ? (uint64_t)(*request->SockAddrLen) : 0;
+            break;
+        case IoRingOp_AcceptMultishot:
+            sqe->opcode = IORING_OP_ACCEPT;
+            sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+            sqe->accept_flags = SOCK_CLOEXEC;
+            break;
+        case IoRingOp_Cancel:
+            sqe->opcode = IORING_OP_ASYNC_CANCEL;
+            sqe->addr = (uint64_t)request->Offset;
             break;
         case IoRingOp_Recv:
             sqe->opcode = IORING_OP_RECV;

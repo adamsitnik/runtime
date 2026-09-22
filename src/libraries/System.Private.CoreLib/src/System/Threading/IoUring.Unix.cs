@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Runtime.InteropServices;
 
 namespace System.Threading
@@ -22,6 +23,101 @@ namespace System.Threading
         /// <see langword="false"/> and callers should use their normal (non-io_uring) code path.
         /// </summary>
         public static bool IsSupported => PortableThreadPool.IoUringThreadPool.IsEnabled;
+
+        /// <summary>
+        /// Attempts to submit a persistent, multishot <c>recv(2)</c>-like read on
+        /// <paramref name="handle"/>, drawing destination buffers from a provided-buffer ring chosen
+        /// internally by the Thread Pool (typically the one owned by the ring/issuer thread this
+        /// submission lands on) instead of a caller-supplied buffer. Unlike <see cref="TrySubmitRecv"/>,
+        /// a single successful call here keeps generating completions - via
+        /// <paramref name="onCompleted"/>, on some Thread Pool worker thread, never inline - for as
+        /// long as data keeps arriving, without the caller resubmitting.
+        /// <para>
+        /// <paramref name="onCompleted"/> is invoked with:
+        /// <list type="bullet">
+        /// <item><c>result</c>: bytes received (&gt;= 0), <c>0</c> for FIN, or
+        /// <c>-errno</c> on failure.</item>
+        /// <item><c>buffer</c>: non-<see langword="null"/> exactly when
+        /// <c>result</c> is positive - an <see cref="IMemoryOwner{Byte}"/> whose
+        /// <see cref="IMemoryOwner{Byte}.Memory"/> is already sliced down to exactly
+        /// <c>result</c> valid bytes. The underlying storage belongs to the Thread
+        /// Pool's per-ring provided-buffer pool, not the caller; calling
+        /// <see cref="IDisposable.Dispose"/> on it returns the buffer to that ring so a future
+        /// completion may reuse it, and callers must not touch the memory again afterward. When
+        /// <c>result</c> is <c>0</c> or negative, this is <see langword="null"/> -
+        /// there is nothing to dispose.</item>
+        /// <item><c>more</c>: <see langword="true"/> if this submission remains active and
+        /// will keep generating completions; <see langword="false"/> if it has stopped - either
+        /// terminally (<c>result</c> is <c>0</c> or a hard error) or benignly, because the
+        /// buffer-group ring ran out of free buffers (an <c>ENOBUFS</c>-shaped condition distinct from a
+        /// real error). Callers must be able to tell these two <c>more == false</c> cases apart from
+        /// <c>result</c> alone (e.g. by reserving a specific sentinel negative value, or an
+        /// additional flag) rather than needing to guess from errno.</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        public static bool TrySubmitRecvMultishot(SafeHandle handle, Action<int /* result */, IMemoryOwner<byte>? /* buffer */, bool /* more */> onCompleted) =>
+            throw new NotImplementedException();
+
+        /// <summary>
+        /// Requests cancellation (<c>IORING_ASYNC_CANCEL</c>-equivalent) of the multishot recv
+        /// submission started on <paramref name="handle"/> by <see cref="TrySubmitRecvMultishot"/>, so
+        /// the connection can be torn down (e.g. <c>PipeReader.Complete()</c>/connection abort) without
+        /// waiting for a natural FIN/error. The submission's <c>onCompleted</c> callback will still be
+        /// invoked exactly once more, with <c>more == false</c>, once cancellation has actually taken
+        /// effect. Returns <see langword="false"/> if there was no matching in-flight submission to
+        /// cancel.
+        /// </summary>
+        public static bool TryCancelRecvMultishot(SafeHandle handle) =>
+            throw new NotImplementedException();
+
+        /// <summary>
+        /// Attempts to submit a persistent, multishot <c>accept(2)</c>-like operation on the
+        /// listening socket <paramref name="handle"/>. Unlike <see cref="TrySubmitAccept"/>, a
+        /// single successful call here keeps generating one completion per accepted connection -
+        /// via <paramref name="onCompleted"/>, on some Thread Pool worker thread, never inline -
+        /// for as long as connections keep arriving, without the caller resubmitting. There is no
+        /// buffer-ownership concern here (unlike <see cref="TrySubmitRecvMultishot"/>): each
+        /// completion either hands over a brand-new, caller-owned file descriptor or reports a
+        /// per-attempt failure, nothing to return to a pool.
+        /// <para>
+        /// <paramref name="onCompleted"/> is invoked with:
+        /// <list type="bullet">
+        /// <item><c>result</c>: the accepted connection's raw file descriptor
+        /// (&gt;= 0), or <c>-errno</c> if this particular accept attempt failed (e.g. the peer
+        /// reset the connection while it sat in the backlog) - a per-attempt failure, not
+        /// necessarily fatal to the submission as a whole. The caller owns the descriptor on
+        /// success and must wrap it (e.g. in a <c>SafeSocketHandle</c>) before use.</item>
+        /// <item><c>more</c>: <see langword="true"/> if this submission remains active
+        /// and will keep generating completions; <see langword="false"/> if it has stopped -
+        /// because of cancellation, an error, or kernel/runtime completion-queue pressure.
+        /// A successful result can also end a submission. Callers should resubmit via
+        /// another <see cref="TrySubmitAcceptMultishot"/> call
+        /// if they still want to keep accepting and did not request cancellation themselves.</item>
+        /// </list>
+        /// </para>
+        /// </summary>
+        public static bool TrySubmitAcceptMultishot(SafeHandle handle, Action<int /* result */, bool /* more */> onCompleted)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            ArgumentNullException.ThrowIfNull(onCompleted);
+            return IsSupported && PortableThreadPool.IoUringThreadPool.TrySubmitAcceptMultishot(handle, onCompleted);
+        }
+
+        /// <summary>
+        /// Requests cancellation (<c>IORING_ASYNC_CANCEL</c>-equivalent) of the multishot accept
+        /// submission started on <paramref name="handle"/> by <see cref="TrySubmitAcceptMultishot"/>,
+        /// so the listener can be unbound/disposed without waiting for another connection to
+        /// arrive. Previously produced completions may still be delivered. Callbacks are serialized
+        /// in completion order, ending with one callback whose <c>more</c> argument is false.
+        /// Returns <see langword="false"/> if no matching kernel operation remains to cancel;
+        /// this does not imply that its callbacks have finished.
+        /// </summary>
+        public static bool TryCancelAcceptMultishot(SafeHandle handle)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            return IsSupported && PortableThreadPool.IoUringThreadPool.TryCancelAcceptMultishot(handle);
+        }
 
         /// <summary>
         /// Attempts to submit a <c>recv(2)</c>-like read of up to <paramref name="length"/> bytes
