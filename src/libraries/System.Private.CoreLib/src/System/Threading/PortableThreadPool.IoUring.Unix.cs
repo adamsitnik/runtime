@@ -740,6 +740,9 @@ namespace System.Threading
                         {
                             return;
                         }
+
+                        // Dispatch accounts for the last completion when this work item returns.
+                        ThreadPool.NotifyWorkItemProgress();
                     }
                     ScheduleCompletionProcessing(ring);
                 }

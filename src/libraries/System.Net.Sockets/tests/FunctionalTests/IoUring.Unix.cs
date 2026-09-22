@@ -281,6 +281,7 @@ namespace System.Net.Sockets.Tests
                         }
                     };
 
+                    long initialCompletedWorkItemCount = ThreadPool.CompletedWorkItemCount;
                     unsafe
                     {
                         fixed (byte* pointer = received)
@@ -301,6 +302,7 @@ namespace System.Net.Sockets.Tests
                     }
 
                     completion.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    Assert.InRange(ThreadPool.CompletedWorkItemCount - initialCompletedWorkItemCount, OperationCount, long.MaxValue);
                     Assert.Equal(notify ? OperationCount : 0, contextResets);
                     Assert.Equal(sent, received);
                     GC.KeepAlive(received);
