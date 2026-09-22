@@ -225,6 +225,97 @@ namespace System.Net.Sockets.Tests
             }, CreateOptions(ringCount)).Dispose();
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1, false)]
+        [InlineData(1, true)]
+        [InlineData(3, false)]
+        [InlineData(3, true)]
+        public void PendingReceiveBurst_IsolatesCompletionThreadState(int ringCount, bool useChangeNotifications)
+        {
+            RemoteExecutor.Invoke(useChangeNotificationsText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                LimitThreadPoolToOneWorker();
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    receiver.Blocking = false;
+                    sender.SendTimeout = TestSettings.PassingTestTimeout;
+                    const int OperationCount = 128;
+                    byte[] received = GC.AllocateArray<byte>(OperationCount, pinned: true);
+                    byte[] sent = new byte[OperationCount];
+                    Array.Fill(sent, (byte)0x5A);
+                    bool notify = bool.Parse(useChangeNotificationsText);
+                    int contextResets = 0;
+                    AsyncLocal<int> local = notify ? new AsyncLocal<int>(change =>
+                    {
+                        if (change.ThreadContextChanged)
+                        {
+                            Assert.Equal(1, change.PreviousValue);
+                            Assert.Equal(0, change.CurrentValue);
+                            contextResets++;
+                        }
+                    }) : new AsyncLocal<int>();
+                    SynchronizationContext context = new SynchronizationContext();
+                    TaskCompletionSource completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    int completed = 0;
+                    string? initialThreadName = null;
+                    Action<int> callback = result =>
+                    {
+                        Assert.Equal(1, result);
+                        Assert.Equal(0, local.Value);
+                        Assert.Null(SynchronizationContext.Current);
+                        if (completed == 0)
+                        {
+                            initialThreadName = Thread.CurrentThread.Name;
+                        }
+                        Assert.Equal(initialThreadName, Thread.CurrentThread.Name);
+                        local.Value = 1;
+                        SynchronizationContext.SetSynchronizationContext(context);
+                        Thread.CurrentThread.Name = nameof(PendingReceiveBurst_IsolatesCompletionThreadState);
+                        if (++completed == OperationCount)
+                        {
+                            // Observe cleanup of the final callback after its dispatcher returns.
+                            ThreadPool.UnsafeQueueUserWorkItem(_ => completion.SetResult(), null);
+                        }
+                    };
+
+                    unsafe
+                    {
+                        fixed (byte* pointer = received)
+                        {
+                            for (int i = 0; i < OperationCount; i++)
+                            {
+                                Assert.True(IoUring.TrySubmitRecv(receiver.SafeHandle, pointer + i, 1, 0, callback));
+                            }
+                        }
+                    }
+
+                    int offset = 0;
+                    while (offset < sent.Length)
+                    {
+                        int written = sender.Send(sent.AsSpan(offset));
+                        Assert.True(written > 0);
+                        offset += written;
+                    }
+
+                    completion.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    Assert.Equal(notify ? OperationCount : 0, contextResets);
+                    Assert.Equal(sent, received);
+                    GC.KeepAlive(received);
+                }
+            }, useChangeNotifications.ToString(), CreateOptions(ringCount)).Dispose();
+        }
+
+        private static void LimitThreadPoolToOneWorker()
+        {
+            ThreadPool.GetMinThreads(out _, out int completionPortThreads);
+            Assert.True(ThreadPool.SetMinThreads(1, completionPortThreads));
+            ThreadPool.GetMaxThreads(out _, out completionPortThreads);
+            Assert.True(ThreadPool.SetMaxThreads(1, completionPortThreads));
+        }
+
         private sealed class TrackingMemoryManager : MemoryManager<byte>
         {
             private readonly byte[] _buffer = new byte[1];

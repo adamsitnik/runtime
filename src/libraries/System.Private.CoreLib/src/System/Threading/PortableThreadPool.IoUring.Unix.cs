@@ -716,6 +716,7 @@ namespace System.Threading
                 void IThreadPoolWorkItem.Execute()
                 {
                     Ring ring = _ring;
+                    Thread currentThread = Thread.CurrentThread;
 
                     // Reset before checking the queue so racing producers cannot miss scheduling work.
                     Interlocked.Exchange(ref ring.CompletionProcessingRequested, 0);
@@ -728,6 +729,9 @@ namespace System.Threading
                     while (true)
                     {
                         CompleteOperation(ring, in completion)?.Execute();
+                        // Each completion is a separate callback, even when dispatched in one work item.
+                        ExecutionContext.ResetThreadPoolThread(currentThread);
+                        currentThread.ResetThreadPoolThread();
                         if (Environment.TickCount - startTimeMs >= CompletionProcessorTimeSliceMs)
                         {
                             break;
