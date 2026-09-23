@@ -1727,7 +1727,7 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && TryReceiveViaIoUring(buffer, flags, callback))
+            if (ready && !cancellationToken.CanBeCanceled && TryReceiveViaIoUring(buffer, flags, callback))
             {
                 bytesReceived = 0;
                 return SocketError.IOPending;
@@ -1766,7 +1766,7 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && socketAddress.Length == 0 &&
+            if (ready && !cancellationToken.CanBeCanceled && socketAddress.Length == 0 &&
                 TryReceiveViaIoUring(buffer, flags, callback))
             {
                 socketAddressLen = 0;
@@ -2088,8 +2088,8 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && socketAddress.Length == 0 &&
-                TrySendViaIoUring(buffer, offset, count, flags, callback))
+            if (ready && !cancellationToken.CanBeCanceled && socketAddress.Length == 0 &&
+                TrySendViaIoUring(buffer, offset, count, bytesSent, flags, callback))
             {
                 return SocketError.IOPending;
             }

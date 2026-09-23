@@ -2,6 +2,8 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +15,233 @@ namespace System.Net.Sockets.Tests
     public class IoUringTests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1, true)]
+        [InlineData(3, true)]
+        [InlineData(1, false)]
+        [InlineData(3, false)]
+        public void MultishotReceive_OrderedLeasesAndEof(int ringCount, bool parallelDispatch)
+        {
+            RemoteInvokeOptions options = CreateOptions(ringCount);
+            options.StartInfo.Environment["DOTNET_IORING_PARALLELIZED_ENQUEUE"] = parallelDispatch ? "1" : "0";
+            RemoteExecutor.Invoke(() =>
+            {
+                using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                using SemaphoreSlim received = new(0);
+                TaskCompletionSource terminal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                int count = 0;
+                int active = 0;
+                Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, owner, more) =>
+                {
+                    Assert.True(Thread.CurrentThread.IsThreadPoolThread);
+                    Assert.Equal(1, Interlocked.Increment(ref active));
+                    if (more)
+                    {
+                        Assert.Equal(1, result);
+                        Assert.NotNull(owner);
+                        Assert.Equal(1, owner.Memory.Length);
+                        Assert.Equal((byte)count++, owner.Memory.Span[0]);
+                        owner.Dispose();
+                        owner.Dispose();
+                        received.Release();
+                    }
+                    else
+                    {
+                        Assert.Equal(0, result);
+                        Assert.Null(owner);
+                        Assert.Equal(128, count);
+                        terminal.SetResult();
+                    }
+                    Interlocked.Decrement(ref active);
+                }));
+                for (int i = 0; i < 128; i++)
+                {
+                    Assert.Equal(1, sender.Send(new byte[] { (byte)i }));
+                    Assert.True(received.Wait(TestSettings.PassingTestTimeout));
+                }
+                sender.Shutdown(SocketShutdown.Send);
+                terminal.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+            }, options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void MultishotReceive_RingExhaustionResumesOnAnotherConnectionsReturn(bool cancelHead)
+        {
+            RemoteExecutor.Invoke(headText =>
+            {
+                bool cancelHead = bool.Parse(headText);
+                const int ConnectionCount = 18;
+                using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(ConnectionCount);
+                Socket[] senders = new Socket[ConnectionCount];
+                Socket[] receivers = new Socket[ConnectionCount];
+                SemaphoreSlim[] signals = new SemaphoreSlim[ConnectionCount];
+                TaskCompletionSource[] terminals = new TaskCompletionSource[ConnectionCount];
+                List<IMemoryOwner<byte>>[] owners = new List<IMemoryOwner<byte>>[ConnectionCount];
+                try
+                {
+                    for (int i = 0; i < ConnectionCount; i++)
+                    {
+                        senders[i] = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                        senders[i].Connect(listener.LocalEndPoint!);
+                        receivers[i] = listener.Accept();
+                        signals[i] = new SemaphoreSlim(0);
+                        terminals[i] = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                        owners[i] = new List<IMemoryOwner<byte>>();
+                        int index = i;
+                        Assert.True(IoUring.TrySubmitRecvMultishot(receivers[i].SafeHandle, (result, owner, more) =>
+                        {
+                            if (more)
+                            {
+                                Assert.Equal(1, result);
+                                Assert.NotNull(owner);
+                                owners[index].Add(owner);
+                                signals[index].Release();
+                            }
+                            else
+                            {
+                                Assert.True(result < 0);
+                                terminals[index].SetResult();
+                            }
+                        }));
+                        if (i < 16)
+                        {
+                            for (int j = 0; j < 64; j++)
+                            {
+                                Assert.Equal(1, senders[i].Send(new byte[] { (byte)i }));
+                                Assert.True(signals[i].Wait(TestSettings.PassingTestTimeout));
+                            }
+                        }
+                    }
+                    Assert.Equal(1, senders[16].Send(new byte[] { 99 }));
+                    Assert.False(signals[16].Wait(100));
+                    Assert.Equal(1, senders[17].Send(new byte[] { 100 }));
+                    Assert.False(signals[17].Wait(100));
+                    int canceled = cancelHead ? 16 : 17;
+                    int resumed = cancelHead ? 17 : 16;
+                    if (cancelHead)
+                    {
+                        Type engine = typeof(IoUring).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                        System.Collections.IDictionary operations = (System.Collections.IDictionary)engine.GetField(
+                            "s_receiveOperations", BindingFlags.Static | BindingFlags.NonPublic)!.GetValue(null)!;
+                        object operation;
+                        lock (operations)
+                        {
+                            operation = operations[receivers[canceled].SafeHandle]!;
+                        }
+                        Type operationType = typeof(IoUring).Assembly.GetType(
+                            "System.Threading.PortableThreadPool+IoUringThreadPool+MultishotReceiveOperation", throwOnError: true)!;
+                        FieldInfo waiting = operationType.GetField("_waitingForBuffers", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                        Assert.True(SpinWait.SpinUntil(() => (bool)waiting.GetValue(operation)!, TestSettings.PassingTestTimeout),
+                            "The head operation did not wait for buffers.");
+                        // Pause cancellation between its stop flag and update publication.
+                        operationType.GetField("_stopRequested", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(operation, true);
+                    }
+                    else
+                    {
+                        Assert.True(IoUring.TryCancelRecvMultishot(receivers[canceled].SafeHandle));
+                        terminals[canceled].Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    }
+                    owners[0][0].Dispose();
+                    terminals[canceled].Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    Assert.True(signals[resumed].Wait(TestSettings.PassingTestTimeout),
+                        "A canceled head waiter consumed the only buffer-return wakeup.");
+                    Assert.Equal(cancelHead ? 100 : 99, owners[resumed][0].Memory.Span[0]);
+                    for (int i = 0; i < ConnectionCount; i++)
+                    {
+                        Assert.Equal(i != canceled, IoUring.TryCancelRecvMultishot(receivers[i].SafeHandle));
+                        terminals[i].Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                        foreach (IMemoryOwner<byte> owner in owners[i])
+                        {
+                            owner.Dispose();
+                        }
+                    }
+                }
+                finally
+                {
+                    for (int i = 0; i < ConnectionCount; i++)
+                    {
+                        if (receivers[i] is Socket receiver)
+                        {
+                            IoUring.TryCancelRecvMultishot(receiver.SafeHandle);
+                            receiver.Dispose();
+                        }
+                        senders[i]?.Dispose();
+                        signals[i]?.Dispose();
+                    }
+                }
+            }, cancelHead.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void MultishotReceive_ImmediateCancellationAndCompactionReuseSocket(int ringCount)
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                for (int i = 0; i < 128; i++)
+                {
+                    TaskCompletionSource terminal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, owner, more) =>
+                    {
+                        Assert.Null(owner);
+                        Assert.False(more);
+                        Assert.True(result < 0);
+                        terminal.SetResult();
+                    }));
+                    Assert.True(IoUring.TryCancelRecvMultishot(receiver.SafeHandle));
+                    terminal.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    if (i % 16 == 0)
+                    {
+                        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    }
+                }
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void MultishotReceive_CancellationRacesWithPublication()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                for (int i = 0; i < 1024; i++)
+                {
+                    TaskCompletionSource terminal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Task<bool> submission = Task.Run(() => IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, owner, more) =>
+                    {
+                        Assert.Null(owner);
+                        Assert.False(more);
+                        Assert.True(result < 0);
+                        terminal.SetResult();
+                    }));
+                    Assert.True(SpinWait.SpinUntil(() => IoUring.TryCancelRecvMultishot(receiver.SafeHandle), TestSettings.PassingTestTimeout));
+                    Assert.True(await submission);
+                    await terminal.Task.WaitAsync(TestSettings.PassingTestTimeout);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
 
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1, true)]

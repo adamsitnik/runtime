@@ -2242,6 +2242,13 @@ typedef struct
     uint32_t* CqRingMask;
     struct io_uring_cqe* Cqes;
     bool HasTaskRunFlag;
+#if defined(IORING_RECV_MULTISHOT)
+    struct io_uring_buf_ring* BufferRing;
+    uint8_t* BufferStorage;
+    size_t BufferRingSize;
+    uint32_t BufferSize;
+    uint32_t BufferCount;
+#endif
 } IoRing;
 
 static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
@@ -2345,6 +2352,15 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
         case IoRingOp_Cancel:
             sqe->opcode = IORING_OP_ASYNC_CANCEL;
             sqe->addr = (uint64_t)request->Offset;
+            break;
+        case IoRingOp_RecvMultishot:
+            sqe->opcode = IORING_OP_RECV;
+            // Registration is unavailable with headers predating multishot receive.
+#if defined(IORING_RECV_MULTISHOT)
+            sqe->ioprio = IORING_RECV_MULTISHOT;
+            sqe->flags = IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 0;
+#endif
             break;
         case IoRingOp_Recv:
             sqe->opcode = IORING_OP_RECV;
@@ -2521,6 +2537,90 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     return 0;
 #else
     (void)submissionQueueDepth, (void)completionQueueDepth;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, uint8_t* buffers, int32_t bufferSize, int32_t bufferCount)
+{
+#if HAVE_LINUX_IO_URING_H && defined(IORING_RECV_MULTISHOT)
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL || ring->BufferRing != NULL || buffers == NULL || bufferSize <= 0 ||
+        bufferCount <= 0 || bufferCount > 32768 || (bufferCount & (bufferCount - 1)) != 0 ||
+        (size_t)bufferCount > SIZE_MAX / (size_t)bufferSize)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t size = (size_t)bufferCount * sizeof(struct io_uring_buf);
+    struct io_uring_buf_ring* bufferRing = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bufferRing == MAP_FAILED)
+    {
+        return -1;
+    }
+
+    struct io_uring_buf_reg registration = {0};
+    registration.ring_addr = (uint64_t)(uintptr_t)bufferRing;
+    registration.ring_entries = (uint32_t)bufferCount;
+    if (IoUringRegister(ring->Fd, IORING_REGISTER_PBUF_RING, &registration, 1) < 0)
+    {
+        int savedErrno = errno;
+        munmap(bufferRing, size);
+        errno = savedErrno;
+        return -1;
+    }
+
+    ring->BufferRing = bufferRing;
+    ring->BufferRingSize = size;
+    ring->BufferStorage = buffers;
+    ring->BufferSize = (uint32_t)bufferSize;
+    ring->BufferCount = (uint32_t)bufferCount;
+    for (uint32_t i = 0; i < (uint32_t)bufferCount; i++)
+    {
+        bufferRing->bufs[i].addr = (uint64_t)(uintptr_t)(buffers + (size_t)i * (size_t)bufferSize);
+        bufferRing->bufs[i].len = (uint32_t)bufferSize;
+        bufferRing->bufs[i].bid = (uint16_t)i;
+    }
+    __atomic_store_n(&bufferRing->tail, (uint16_t)bufferCount, __ATOMIC_RELEASE);
+    return 0;
+#else
+    (void)ringHandle, (void)buffers, (void)bufferSize, (void)bufferCount;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferIds, int32_t count)
+{
+#if HAVE_LINUX_IO_URING_H && defined(IORING_RECV_MULTISHOT)
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL || ring->BufferRing == NULL || count < 0 || (uint32_t)count > ring->BufferCount ||
+        (count != 0 && bufferIds == NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    uint16_t tail = ring->BufferRing->tail;
+    for (int32_t i = 0; i < count; i++)
+    {
+        uint16_t id = bufferIds[i];
+        if (id >= ring->BufferCount)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        struct io_uring_buf* buffer = &ring->BufferRing->bufs[(tail + (uint32_t)i) & (ring->BufferCount - 1)];
+        buffer->addr = (uint64_t)(uintptr_t)(ring->BufferStorage + (size_t)id * ring->BufferSize);
+        buffer->len = ring->BufferSize;
+        buffer->bid = id;
+        // Do not overwrite resv: in slot zero it aliases the published tail.
+    }
+    __atomic_store_n(&ring->BufferRing->tail, (uint16_t)(tail + count), __ATOMIC_RELEASE);
+    return 0;
+#else
+    (void)ringHandle, (void)bufferIds, (void)count;
     errno = ENOTSUP;
     return -1;
 #endif
@@ -2827,6 +2927,12 @@ int32_t SystemNative_IoRingClose(intptr_t ringHandle)
     {
         result = -1;
     }
+#if defined(IORING_RECV_MULTISHOT)
+    if (ring->BufferRing != NULL && munmap(ring->BufferRing, ring->BufferRingSize) != 0)
+    {
+        result = -1;
+    }
+#endif
     if (ring->EventFd >= 0 && close(ring->EventFd) != 0)
     {
         result = -1;

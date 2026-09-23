@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -24,6 +25,7 @@ namespace System.Net.Sockets
         private TaskSocketAsyncEventArgs<int>? _multiBufferReceiveEventArgs;
         /// <summary>Cached instance for send operations that return <see cref="Task{Int32}"/>.</summary>
         private TaskSocketAsyncEventArgs<int>? _multiBufferSendEventArgs;
+        private int _multishotReceiving;
 
         /// <summary>
         /// Accepts an incoming connection.
@@ -80,6 +82,109 @@ namespace System.Net.Sockets
             while (true)
             {
                 yield return await AcceptAsync(token).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>Receives stream data as an asynchronous sequence of owned buffers.</summary>
+        /// <param name="cancellationToken">A cancellation token used to stop receiving data.</param>
+        /// <returns>A sequence of independently owned buffers containing exactly the received bytes. EOF ends the sequence.</returns>
+        /// <remarks>
+        /// Uses multishot io_uring receive when available, and repeated asynchronous receives otherwise.
+        /// Dispose every yielded owner when finished with its memory. Advancing or disposing the enumerator
+        /// does not dispose owners already yielded. Retaining owners can pause this connection and other
+        /// connections sharing its ring; consume and dispose buffers before waiting for more data.
+        /// Disposing the enumerator releases unyielded buffers and stops receiving without closing the socket.
+        /// Do not issue other receives while the enumeration is active. This API is experimental.
+        /// </remarks>
+        /// <exception cref="ObjectDisposedException">This socket has been closed.</exception>
+        /// <exception cref="InvalidOperationException">A receive enumeration is already active on this socket.</exception>
+        /// <exception cref="SocketException">This is not a stream socket, or a receive fails.</exception>
+        /// <exception cref="OperationCanceledException">The cancellation token is canceled.</exception>
+        public IAsyncEnumerable<IMemoryOwner<byte>> ReceiveMultishotAsync(CancellationToken cancellationToken = default)
+        {
+            ThrowIfDisposed();
+            if (_socketType != SocketType.Stream)
+            {
+                throw new SocketException((int)SocketError.OperationNotSupported);
+            }
+            return ReceiveMultishotCoreAsync(cancellationToken);
+        }
+
+        partial void CreateMultishotReceiveEnumerable(CancellationToken cancellationToken, ref IAsyncEnumerable<IMemoryOwner<byte>>? enumerable);
+        partial void CancelMultishotReceive();
+
+        private async IAsyncEnumerable<IMemoryOwner<byte>> ReceiveMultishotCoreAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            ThrowIfDisposed();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Interlocked.CompareExchange(ref _multishotReceiving, 1, 0) != 0)
+            {
+                throw new InvalidOperationException(SR.net_sockets_multishot_receive_in_progress);
+            }
+            try
+            {
+                IAsyncEnumerable<IMemoryOwner<byte>>? enumerable = null;
+                CreateMultishotReceiveEnumerable(cancellationToken, ref enumerable);
+                await foreach (IMemoryOwner<byte> owner in (enumerable ?? ReceiveRepeatedlyAsync(cancellationToken)).ConfigureAwait(false))
+                {
+                    yield return owner;
+                }
+            }
+            finally
+            {
+                Volatile.Write(ref _multishotReceiving, 0);
+            }
+        }
+
+        private async IAsyncEnumerable<IMemoryOwner<byte>> ReceiveRepeatedlyAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            using CancellationTokenSource? cancellation = cancellationToken.CanBeCanceled ? null : new CancellationTokenSource();
+            CancellationToken token = cancellation?.Token ?? cancellationToken;
+            while (true)
+            {
+                ReceivedBufferOwner? owner = new();
+                try
+                {
+                    int received = await ReceiveAsync(owner.Memory, SocketFlags.None, token).ConfigureAwait(false);
+                    if (received == 0)
+                    {
+                        yield break;
+                    }
+                    owner.SetLength(received);
+                    IMemoryOwner<byte> result = owner;
+                    owner = null;
+                    yield return result;
+                }
+                finally
+                {
+                    owner?.Dispose();
+                }
+            }
+        }
+
+        private sealed class ReceivedBufferOwner : IMemoryOwner<byte>
+        {
+            private byte[]? _buffer = ArrayPool<byte>.Shared.Rent(4096);
+            private int _length = 4096;
+
+            public Memory<byte> Memory
+            {
+                get
+                {
+                    byte[]? buffer = Volatile.Read(ref _buffer);
+                    ObjectDisposedException.ThrowIf(buffer is null, this);
+                    return buffer.AsMemory(0, _length);
+                }
+            }
+
+            internal void SetLength(int length) => _length = length;
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _buffer, null) is byte[] buffer)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
             }
         }
 

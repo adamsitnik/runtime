@@ -1,6 +1,7 @@
 ﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,8 +9,239 @@ using Xunit;
 
 namespace System.Net.Sockets.Tests
 {
+    public class ReceiveMultishot
+    {
+        private static (Socket Sender, Socket Receiver) CreatePair()
+        {
+            using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            Socket sender = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            sender.Connect(listener.LocalEndPoint!);
+            Socket receiver = listener.Accept();
+            return (sender, receiver);
+        }
+
+        [Theory]
+        [InlineData(0)]
+        [InlineData(1)]
+        [InlineData(8 * 1024 * 1024 + 171)]
+        public async Task BytesRemainOrderedAcrossBufferReuseAndEof(int length)
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            {
+                byte[] payload = new byte[length];
+                for (int i = 0; i < payload.Length; i++)
+                {
+                    payload[i] = (byte)(i % 251);
+                }
+                Task send = Task.Run(() =>
+                {
+                    int offset = 0;
+                    while (offset < payload.Length)
+                    {
+                        offset += sender.Send(payload.AsSpan(offset, Math.Min(65536, payload.Length - offset)));
+                    }
+                    sender.Shutdown(SocketShutdown.Send);
+                });
+                int received = 0;
+                await using IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                while (await enumerator.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout))
+                {
+                    using IMemoryOwner<byte> owner = enumerator.Current;
+                    Assert.InRange(owner.Memory.Length, 1, payload.Length - received);
+                    Assert.True(owner.Memory.Span.SequenceEqual(payload.AsSpan(received, owner.Memory.Length)));
+                    received += owner.Memory.Length;
+                }
+                await send.WaitAsync(TestSettings.PassingTestTimeout);
+                Assert.Equal(length, received);
+            }
+        }
+
+        [Theory]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public async Task CancellationPreservesTokenAndSocket(bool enumeratorToken, bool precanceled)
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            using (CancellationTokenSource cancellation = new())
+            {
+                if (precanceled)
+                {
+                    cancellation.Cancel();
+                }
+                await using (IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync(
+                    enumeratorToken ? default : cancellation.Token).GetAsyncEnumerator(enumeratorToken ? cancellation.Token : default))
+                {
+                    Task<bool> pending = enumerator.MoveNextAsync().AsTask();
+                    cancellation.Cancel();
+                    OperationCanceledException exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                        () => pending.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(cancellation.Token, exception.CancellationToken);
+                }
+                sender.Send(new byte[] { 42 });
+                await using IAsyncEnumerator<IMemoryOwner<byte>> next = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                Assert.True(await next.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                using IMemoryOwner<byte> owner = next.Current;
+                Assert.Equal(new byte[] { 42 }, owner.Memory.ToArray());
+            }
+        }
+
+        [Fact]
+        public async Task SocketDisposalCompletesPendingReceive()
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            {
+                await using IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                Task<bool> pending = enumerator.MoveNextAsync().AsTask();
+                Assert.False(pending.IsCompleted);
+                await Task.Run(receiver.Dispose).WaitAsync(TestSettings.PassingTestTimeout);
+                SocketException exception = await Assert.ThrowsAsync<SocketException>(() => pending.WaitAsync(TestSettings.PassingTestTimeout));
+                Assert.Equal(SocketError.OperationAborted, exception.SocketErrorCode);
+            }
+        }
+
+        [Fact]
+        public async Task YieldedLeaseSurvivesEnumeratorAndSocketDisposal()
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            {
+                IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                Task<bool> pending = enumerator.MoveNextAsync().AsTask();
+                sender.Send(new byte[] { 1, 2, 3 });
+                Assert.True(await pending.WaitAsync(TestSettings.PassingTestTimeout));
+                IMemoryOwner<byte> owner = enumerator.Current;
+                try
+                {
+                    await enumerator.DisposeAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                    receiver.Dispose();
+                    Assert.Equal(new byte[] { 1, 2, 3 }, owner.Memory.ToArray());
+                }
+                finally
+                {
+                    owner.Dispose();
+                    owner.Dispose();
+                }
+                Assert.Throws<ObjectDisposedException>(() => owner.Memory);
+            }
+        }
+
+        [Fact]
+        public async Task ConcurrentEnumerationIsRejected()
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            using (CancellationTokenSource cancellation = new())
+            {
+                await using IAsyncEnumerator<IMemoryOwner<byte>> first = receiver.ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                Task<bool> pending = first.MoveNextAsync().AsTask();
+                await using IAsyncEnumerator<IMemoryOwner<byte>> second = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                await Assert.ThrowsAsync<InvalidOperationException>(() => second.MoveNextAsync().AsTask());
+                cancellation.Cancel();
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(TestSettings.PassingTestTimeout));
+            }
+        }
+
+        [Fact]
+        public void InvalidSocketIsRejected()
+        {
+            using Socket datagram = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            SocketException exception = Assert.Throws<SocketException>(() => datagram.ReceiveMultishotAsync());
+            Assert.Equal(SocketError.OperationNotSupported, exception.SocketErrorCode);
+            datagram.Dispose();
+            Assert.Throws<ObjectDisposedException>(() => datagram.ReceiveMultishotAsync());
+        }
+
+        [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsNotWindows))]
+        public async Task NonOwningSocketDisposalPreservesDescriptor()
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            using (Socket borrowed = new(new SafeSocketHandle(receiver.SafeHandle.DangerousGetHandle(), ownsHandle: false)))
+            {
+                await using IAsyncEnumerator<IMemoryOwner<byte>> enumerator = borrowed.ReceiveMultishotAsync().GetAsyncEnumerator();
+                Task<bool> pending = enumerator.MoveNextAsync().AsTask();
+                await Task.Run(borrowed.Dispose).WaitAsync(TestSettings.PassingTestTimeout);
+                SocketException exception = await Assert.ThrowsAsync<SocketException>(() => pending.WaitAsync(TestSettings.PassingTestTimeout));
+                Assert.Equal(SocketError.OperationAborted, exception.SocketErrorCode);
+                Assert.Equal(1, sender.Send(new byte[] { 57 }));
+                byte[] received = new byte[1];
+                Assert.Equal(1, receiver.Receive(received));
+                Assert.Equal(57, received[0]);
+            }
+        }
+
+        [Fact]
+        public async Task ResetUpdatesConnectedState()
+        {
+            (Socket sender, Socket receiver) = CreatePair();
+            using (sender)
+            using (receiver)
+            {
+                await using IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync().GetAsyncEnumerator();
+                Task<bool> pending = enumerator.MoveNextAsync().AsTask();
+                sender.LingerState = new LingerOption(true, 0);
+                sender.Dispose();
+                SocketException exception = await Assert.ThrowsAsync<SocketException>(() => pending.WaitAsync(TestSettings.PassingTestTimeout));
+                Assert.Equal(SocketError.ConnectionReset, exception.SocketErrorCode);
+                Assert.False(receiver.Connected);
+            }
+        }
+    }
+
     public class SendReceiveMisc
     {
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task SendAsyncBackpressureIncludesSynchronousPrefixAndCompletesRemainder(bool cancellable)
+        {
+            using Socket listener = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            using Socket sender = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            sender.Connect(listener.LocalEndPoint!);
+            using Socket receiver = listener.Accept();
+            sender.SendBufferSize = 4096;
+            byte[] storage = new byte[4 * 1024 * 1024 + 150];
+            for (int i = 0; i < storage.Length; i++)
+            {
+                storage[i] = (byte)(i % 251);
+            }
+            Memory<byte> payload = storage.AsMemory(37);
+            using CancellationTokenSource cancellation = new();
+            Task<int> sending = sender.SendAsync(payload, SocketFlags.None, cancellable ? cancellation.Token : default).AsTask();
+            Assert.False(sending.IsCompleted);
+            Task<byte[]> receiving = Task.Run(() =>
+            {
+                using System.IO.MemoryStream received = new();
+                byte[] buffer = new byte[65536];
+                int count;
+                while ((count = receiver.Receive(buffer)) != 0)
+                {
+                    received.Write(buffer, 0, count);
+                }
+                return received.ToArray();
+            });
+            int sent = await sending.WaitAsync(TestSettings.PassingTestTimeout);
+            sender.Shutdown(SocketShutdown.Send);
+            byte[] actual = await receiving.WaitAsync(TestSettings.PassingTestTimeout);
+            Assert.Equal(payload.Length, sent);
+            Assert.True(payload.Span.SequenceEqual(actual));
+        }
+
         [ConditionalFact(typeof(PlatformDetection), nameof(PlatformDetection.IsMultithreadingSupported))]
         public void SendRecvIovMaxTcp_Success()
         {
