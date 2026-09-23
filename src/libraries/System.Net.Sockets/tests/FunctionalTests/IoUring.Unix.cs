@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,85 @@ namespace System.Net.Sockets.Tests
     public class IoUringTests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        [InlineData(5)]
+        public void PendingReceives_RouteByFileDescriptor(int ringCount)
+        {
+            RemoteExecutor.Invoke(ringCountText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                int count = int.Parse(ringCountText);
+                Type poolType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                Array rings = (Array)poolType.GetField("s_rings", BindingFlags.NonPublic | BindingFlags.Static)!.GetValue(null)!;
+                FieldInfo slotsField = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool+Ring", throwOnError: true)!.GetField("OperationSlots")!;
+                FieldInfo operationField = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool+OperationSlot", throwOnError: true)!.GetField("Operation")!;
+                FieldInfo handleField = typeof(IoUring).GetNestedType("ActionIoUringOperation", BindingFlags.NonPublic)!.GetField("_handle", BindingFlags.NonPublic | BindingFlags.Instance)!;
+                Assert.Equal(count, rings.Length);
+
+                for (int connection = 0; connection < count * 2; connection++)
+                {
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    {
+                        receiver.Blocking = false;
+                        byte[] buffer = GC.AllocateArray<byte>(2, pinned: true);
+                        TaskCompletionSource<int>[] completions =
+                        [
+                            new(TaskCreationOptions.RunContinuationsAsynchronously),
+                            new(TaskCreationOptions.RunContinuationsAsynchronously)
+                        ];
+                        for (int i = 0; i < completions.Length; i++)
+                        {
+                            int index = i;
+                            Task.Factory.StartNew(() =>
+                            {
+                                unsafe
+                                {
+                                    fixed (byte* pointer = buffer)
+                                    {
+                                        Assert.True(IoUring.TrySubmitRecv(receiver.SafeHandle, pointer + index, 1, 0, completions[index].SetResult));
+                                    }
+                                }
+                            }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).GetAwaiter().GetResult();
+                        }
+
+                        int expectedRing = receiver.SafeHandle.DangerousGetHandle().ToInt32() % count;
+                        int found = 0;
+                        try
+                        {
+                            for (int i = 0; i < rings.Length; i++)
+                            {
+                                object ring = rings.GetValue(i)!;
+                                Array slots = (Array)slotsField.GetValue(ring)!;
+                                foreach (object slot in slots)
+                                {
+                                    object? operation = operationField.GetValue(slot);
+                                    if (operation is not null && ReferenceEquals(handleField.GetValue(operation), receiver.SafeHandle))
+                                    {
+                                        Assert.Equal(expectedRing, i);
+                                        found++;
+                                    }
+                                }
+                            }
+                            Assert.Equal(completions.Length, found);
+                        }
+                        finally
+                        {
+                            Assert.Equal(2, sender.Send(new byte[] { 0x5A, 0x5A }));
+                            foreach (TaskCompletionSource<int> completion in completions)
+                            {
+                                Assert.Equal(1, completion.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult());
+                            }
+                        }
+                        Assert.Equal(new byte[] { 0x5A, 0x5A }, buffer);
+                    }
+                }
+            }, ringCount.ToString(), CreateOptions(ringCount)).Dispose();
+        }
 
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1)]

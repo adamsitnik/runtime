@@ -52,11 +52,9 @@ namespace System.Threading
         /// This exists to avoid a single issuer thread becoming a hard, non-scaling bottleneck: profiling
         /// (see this file's git history / design notes) showed a single ring's issuer thread executes
         /// every socket's actual recv/poll syscall work inline as part of <c>io_uring_enter</c>, so its
-        /// absolute throughput is capped regardless of how many cores are otherwise available. Every
-        /// calling thread is assigned to exactly one ring for its lifetime (see
-        /// <see cref="t_assignedRing"/>) rather than picking a ring per call, so that a given caller's
-        /// requests always land on the same ring/issuer thread instead of being scattered arbitrarily
-        /// across all of them.
+        /// absolute throughput is capped regardless of how many cores are otherwise available.
+        /// Requests are assigned by file descriptor (see <see cref="GetAssignedRing"/>), so operations
+        /// on the same descriptor stay on the same ring when their submitting thread changes.
         ///
         /// A second, related gotcha (also confirmed empirically via a standalone native repro, not
         /// documented in the man page): a IORING_SETUP_SINGLE_ISSUER ring's fixed "owning" thread is
@@ -133,18 +131,6 @@ namespace System.Threading
             // doc comment. Null (and unused) if s_isEnabled is false.
             private static Ring[]? s_rings;
 
-            // Round-robin counter used to assign each *calling* thread (not each call) to one of s_rings
-            // the first time it calls TrySubmit - see t_assignedRing and GetAssignedRing.
-            private static int s_nextRingIndex;
-
-            // Sticky per-calling-thread ring assignment: assigned once, on that thread's first TrySubmit
-            // call (see GetAssignedRing), and reused for that thread's entire lifetime afterwards. This
-            // keeps a given caller's requests/completions concentrated on one ring/issuer thread instead
-            // of being scattered round-robin per call, for better cache/data affinity and to keep the
-            // sharding behavior simple to reason about.
-            [ThreadStatic]
-            private static Ring? t_assignedRing;
-
             private struct OperationSlot
             {
                 public IIoUringOperation? Operation;
@@ -155,7 +141,7 @@ namespace System.Threading
             /// Per-shard state: one independent <c>IORING_SETUP_SINGLE_ISSUER</c> ring, its own
             /// submission/completion queues, wake-eventfd, and dedicated issuer thread. See this type's
             /// own doc comment (on <see cref="IoUringThreadPool"/>) for why sharding across multiple
-            /// rings/issuer threads exists and how callers are assigned to one.
+            /// rings/issuer threads exists and how descriptors are assigned to one.
             /// </summary>
             private sealed class Ring
             {
@@ -172,7 +158,7 @@ namespace System.Threading
                 // been reaped. Managed callbacks need not finish before the issuer can park.
                 public int InFlightCount;
 
-                // MPSC hand-off from any thread calling TrySubmit (and assigned to this ring - see
+                // MPSC hand-off from any thread calling TrySubmit for a descriptor on this ring (see
                 // GetAssignedRing) to this ring's single dedicated issuer thread (see IssuerLoop). This
                 // ring was created with IORING_SETUP_SINGLE_ISSUER, so only that one thread is permitted
                 // to ever call Interop.Sys.IoRingSubmit/IoRingKick/IoRingWaitForCompletions for it - every
@@ -196,7 +182,7 @@ namespace System.Threading
                 // Coalescing flag for TrySubmit's wake-up signal on this ring: 0 means no thread has
                 // signaled this ring's issuer since its last reset, 1 means one already has (so no
                 // further EventFdWrite syscall is needed until the issuer resets it again). Turns any
-                // number of concurrent TrySubmit calls (assigned to this ring) between two issuer wake
+                // number of concurrent TrySubmit calls targeting this ring between two issuer wake
                 // cycles into at most one EventFdWrite syscall, without risking a missed wake-up - see
                 // TrySubmit and IssuerLoop for the reset-then-recheck protocol that makes this safe.
                 public int WakeSignaled;
@@ -364,28 +350,18 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Returns the <see cref="Ring"/> the current thread is assigned to, assigning it (via
-            /// round-robin over <see cref="s_rings"/>) on this thread's first call. See
-            /// <see cref="t_assignedRing"/>'s doc comment for why this assignment is sticky rather than
-            /// picked per call.
+            /// Returns the ring assigned to a file descriptor. The caller keeps its handle alive
+            /// until completion, so descriptor reuse cannot change an in-flight operation's ring.
             /// </summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private static Ring GetAssignedRing()
+            private static Ring GetAssignedRing(IntPtr fd)
             {
-                Ring? ring = t_assignedRing;
-                if (ring is null)
-                {
-                    Ring[] rings = s_rings!;
-                    int index = (int)((uint)Interlocked.Increment(ref s_nextRingIndex) % (uint)rings.Length);
-                    ring = rings[index];
-                    t_assignedRing = ring;
-                }
-
-                return ring;
+                Ring[] rings = s_rings!;
+                return rings[(int)((nuint)fd % (uint)rings.Length)];
             }
 
             /// <summary>
-            /// Attempts to submit a single request to this thread's assigned ring (see
+            /// Attempts to submit a single request to its descriptor's assigned ring (see
             /// <see cref="GetAssignedRing"/>). Unlike the other io_uring architectures in this codebase,
             /// this never actually fails once <see cref="IsEnabled"/> is true: the request is simply
             /// enqueued for that ring's dedicated issuer thread to submit, and this method returns
@@ -400,7 +376,7 @@ namespace System.Threading
             {
                 Debug.Assert(s_isEnabled);
 
-                Ring ring = GetAssignedRing();
+                Ring ring = GetAssignedRing(request.Fd);
 
                 Interop.Sys.IoRingRequest localRequest = request;
                 if (ring.FreeOperationSlots.TryDequeue(out int slotIndex))
