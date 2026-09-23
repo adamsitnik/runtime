@@ -164,7 +164,7 @@ namespace System.Threading
         /// API never need to know about (or implement) that internal-only interface. Unlike a
         /// per-thread-ring design, the shared-ring driver never runs continuations inline: this
         /// type also implements <see cref="IThreadPoolWorkItem"/> so it can be returned from
-        /// <see cref="PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int, uint)"/> and queued
+        /// <see cref="PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int, uint, long)"/> and queued
         /// (possibly batched together with other completions drained in the same pass) instead of
         /// being invoked directly on the driver thread.
         /// </summary>
@@ -193,7 +193,7 @@ namespace System.Threading
                 t_cachedOperation ??= this;
             }
 
-            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result, uint flags)
+            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
             {
                 // Legacy dispatch resolves completions on the issuer, so defer the user callback.
                 _result = result;

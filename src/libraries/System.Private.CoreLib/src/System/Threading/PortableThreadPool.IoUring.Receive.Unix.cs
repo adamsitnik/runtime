@@ -207,6 +207,10 @@ namespace System.Threading
                 private readonly IntPtr _fd;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
 
+                // Sequence number of the last completion actually delivered to _onCompleted, or -1 before
+                // the first one - see the ordering gate in Deliver.
+                private long _deliveredThrough = -1;
+
                 public MultishotReceiveOperation(Ring ring, SafeHandle handle, IntPtr fd, Action<int, IMemoryOwner<byte>?, bool> onCompleted)
                 {
                     _ring = ring;
@@ -215,7 +219,7 @@ namespace System.Threading
                     _onCompleted = onCompleted;
                 }
 
-                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags)
+                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
                 {
                     bool hasMore = (flags & Interop.Sys.IoRingCompletion.More) != 0;
                     IMemoryOwner<byte>? buffer = null;
@@ -238,14 +242,32 @@ namespace System.Threading
                     // ThreadPoolValueTaskSource use for their single, ever-only-one completion) can
                     // safely be shared between two such completions, so each dispatch below is fully
                     // self-contained instead of reusing fields on this operation.
-                    ThreadPool.UnsafeQueueUserWorkItem(s_dispatch, new CompletionState(this, result, buffer, hasMore), preferLocal: false);
+                    ThreadPool.UnsafeQueueUserWorkItem(s_dispatch, new CompletionState(this, result, buffer, hasMore, sequence), preferLocal: false);
 
                     return null;
                 }
 
-                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore)
+                /// <summary>
+                /// Invokes <see cref="_onCompleted"/>, but only once every completion with a smaller
+                /// <paramref name="sequence"/> has already been delivered - since two completions of this
+                /// same still-active multishot operation can be processed (see
+                /// <see cref="IIoUringOperation.CompleteFromIoUring"/>) by two different workers, in
+                /// either order, this is what guarantees the caller always observes them in true arrival
+                /// order despite that. Deliberately lock-free: correctly ordered delivery only ever
+                /// requires a very short (typically zero-iteration) spin here, since whichever worker is
+                /// "behind" is either already finished or about to finish its own, earlier delivery.
+                /// </summary>
+                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore, long sequence)
                 {
+                    SpinWait spinner = default;
+                    while (Interlocked.Read(ref _deliveredThrough) != sequence - 1)
+                    {
+                        spinner.SpinOnce();
+                    }
+
                     _onCompleted(result, buffer, hasMore);
+
+                    Volatile.Write(ref _deliveredThrough, sequence);
 
                     if (!hasMore)
                     {
@@ -253,7 +275,8 @@ namespace System.Threading
                     }
                 }
 
-                private static readonly Action<CompletionState> s_dispatch = static state => state.Operation.Deliver(state.Result, state.Buffer, state.HasMore);
+                private static readonly Action<CompletionState> s_dispatch =
+                    static state => state.Operation.Deliver(state.Result, state.Buffer, state.HasMore, state.Sequence);
 
                 private readonly struct CompletionState
                 {
@@ -261,13 +284,15 @@ namespace System.Threading
                     public readonly int Result;
                     public readonly IMemoryOwner<byte>? Buffer;
                     public readonly bool HasMore;
+                    public readonly long Sequence;
 
-                    public CompletionState(MultishotReceiveOperation operation, int result, IMemoryOwner<byte>? buffer, bool hasMore)
+                    public CompletionState(MultishotReceiveOperation operation, int result, IMemoryOwner<byte>? buffer, bool hasMore, long sequence)
                     {
                         Operation = operation;
                         Result = result;
                         Buffer = buffer;
                         HasMore = hasMore;
+                        Sequence = sequence;
                     }
                 }
             }
@@ -287,7 +312,7 @@ namespace System.Threading
                 {
                 }
 
-                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags) => null;
+                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) => null;
             }
         }
     }

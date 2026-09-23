@@ -205,7 +205,7 @@ namespace Microsoft.Win32.SafeHandles
             /// Performs completion bookkeeping and returns the continuation for worker dispatch.
             /// This can run on the issuer in legacy dispatch mode, so it must not invoke user code.
             /// </summary>
-            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result, uint flags)
+            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
             {
                 if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
                     && TryContinuePartialWrite(result, out IThreadPoolWorkItem? fallbackWorkItem))
