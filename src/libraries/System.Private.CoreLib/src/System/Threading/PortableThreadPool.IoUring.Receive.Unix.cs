@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -16,17 +17,19 @@ namespace System.Threading
             /// <paramref name="handle"/>, using this fd's ring's provided-buffer pool (see
             /// <see cref="Ring.ReceiveBuffers"/>). Unlike every other <c>TrySubmit*</c> operation in this
             /// type, a single submission here keeps producing completions - one per datagram/read the
-            /// kernel has data for - until cancelled (<see cref="TryCancelReceiveMultishot"/>), EOF, or an
-            /// error occurs. <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread,
-            /// once per completion, with the raw result (bytes received, 0 on graceful EOF, or
-            /// <c>-errno</c> on failure), the received data (as a buffer leased from the pool - dispose it
-            /// to return it), and whether the operation is still alive and will keep producing further
-            /// completions. <paramref name="handle"/> is ref-counted for as long as the operation remains
-            /// alive. Returns <see langword="false"/> only if this fd's ring's buffer pool could not be
+            /// kernel has data for - until cancelled (see <paramref name="operation"/>'s
+            /// <see cref="IIoUringOperation.RequestCancellation"/>), EOF, or an error occurs.
+            /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
+            /// completion, with the raw result (bytes received, 0 on graceful EOF, or <c>-errno</c> on
+            /// failure), the received data (as a buffer leased from the pool - dispose it to return it),
+            /// and whether the operation is still alive and will keep producing further completions.
+            /// <paramref name="handle"/> is ref-counted for as long as the operation remains alive.
+            /// Returns <see langword="false"/> only if this fd's ring's buffer pool could not be
             /// initialized (extremely unlikely - see the ring-creation handshake in the static
-            /// constructor of <see cref="IoUringThreadPool"/>, which requires it to succeed at all).
+            /// constructor of <see cref="IoUringThreadPool"/>, which requires it to succeed at all); in
+            /// that case <paramref name="operation"/> is <see langword="null"/>.
             /// </summary>
-            public static bool TrySubmitReceiveMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted)
+            public static bool TrySubmitReceiveMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted, out IIoUringOperation? operation)
             {
                 Debug.Assert(s_isEnabled);
 
@@ -39,79 +42,30 @@ namespace System.Threading
                     Ring ring = GetRing(fd);
                     if (ring.ReceiveBuffers is null)
                     {
+                        operation = null;
                         return false;
                     }
 
-                    var operation = new MultishotReceiveOperation(ring, handle, fd, onCompleted);
+                    var multishotOperation = new MultishotReceiveOperation(ring, handle, fd, onCompleted);
 
                     Interop.Sys.IoRingRequest request = default;
                     request.OpCode = Interop.Sys.IoRingOp.RecvMultishot;
                     request.Fd = fd;
                     request.Offset = -1;
 
-                    submitted = TrySubmit(operation, in request, out ulong userData);
+                    submitted = TrySubmit(multishotOperation, in request, out ulong userData);
                     Debug.Assert(submitted);
 
-                    // Recorded so TryCancelReceiveMultishot can find this exact request's token (and the
-                    // operation itself) via the same fd -> ring mapping used to submit it, without a
-                    // separate registry.
-                    ring.ActiveMultishotReceives[fd] = (userData, operation);
+                    // Recorded on the operation itself so a later RequestCancellation call (against this
+                    // very instance, held onto directly by the original caller) knows which exact
+                    // request to target - see MultishotReceiveOperation.RequestCancellation.
+                    multishotOperation.SetUserData(userData);
+                    operation = multishotOperation;
                     return true;
                 }
                 finally
                 {
                     if (!submitted && refAdded)
-                    {
-                        handle.DangerousRelease();
-                    }
-                }
-            }
-
-            /// <summary>
-            /// Attempts to cancel the in-flight <see cref="TrySubmitReceiveMultishot"/> operation, if
-            /// any, currently registered for <paramref name="handle"/>'s fd. This only requests
-            /// cancellation - the operation's <c>onCompleted</c> callback still receives one final
-            /// completion afterwards (typically <c>-ECANCELED</c>) with its "still alive" flag cleared,
-            /// the same as any other terminal outcome. Returns <see langword="false"/> if no such
-            /// operation is currently registered for this fd (e.g. it already completed, or was never
-            /// submitted).
-            /// </summary>
-            public static bool TryCancelReceiveMultishot(SafeHandle handle)
-            {
-                Debug.Assert(s_isEnabled);
-
-                bool refAdded = false;
-                try
-                {
-                    handle.DangerousAddRef(ref refAdded);
-                    IntPtr fd = handle.DangerousGetHandle();
-                    Ring ring = GetRing(fd);
-                    if (!ring.ActiveMultishotReceives.TryGetValue(fd, out (ulong UserData, MultishotReceiveOperation Operation) entry))
-                    {
-                        return false;
-                    }
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.Cancel;
-                    // Routes to the same ring the target request itself was routed to (see GetRing); the
-                    // kernel does not otherwise use Fd for IORING_OP_ASYNC_CANCEL.
-                    request.Fd = fd;
-                    request.Offset = (long)entry.UserData;
-
-                    // Marked before submitting the cancel request itself, so it can never lose a race
-                    // against Deliver's own ENOBUFS auto-rearm (see TryResubmit): once this is set, any
-                    // in-flight or future completion for this operation observes it and will not silently
-                    // keep the receive alive behind the caller's back. Resolved directly from this fd ->
-                    // operation mapping - not via the token/slot machinery (see PeekOperationToken) -
-                    // since this call runs on an arbitrary thread that holds no reference on entry.UserData's
-                    // token, unlike every other caller of that method.
-                    entry.Operation.RequestCancellation();
-
-                    return TrySubmit(CancelSentinelOperation.Instance, in request);
-                }
-                finally
-                {
-                    if (refAdded)
                     {
                         handle.DangerousRelease();
                     }
@@ -210,24 +164,59 @@ namespace System.Threading
 
             /// <summary>
             /// The <see cref="IIoUringOperation"/> behind <see cref="TrySubmitReceiveMultishot"/>.
+            /// Also an <see cref="IThreadPoolWorkItem"/> in its own right: draining and delivering
+            /// completions from <see cref="_pending"/> (rather than each completion carrying its own,
+            /// separately-allocated work item, as every other <see cref="IIoUringOperation"/> does) is
+            /// what lets this type guarantee it only ever has at most one active drainer running - see
+            /// <see cref="ScheduleDispatch"/> and <see cref="IThreadPoolWorkItem.Execute"/>.
             /// </summary>
-            internal sealed class MultishotReceiveOperation : IIoUringOperation
+            internal sealed class MultishotReceiveOperation : IIoUringOperation, IThreadPoolWorkItem
             {
                 private readonly Ring _ring;
                 private readonly SafeHandle _handle;
                 private readonly IntPtr _fd;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
 
-                // Sequence number of the last completion actually delivered to _onCompleted, or -1 before
-                // the first one - see the ordering gate in Deliver. Reset to -1 whenever this operation is
-                // transparently re-armed (see TryResubmit), since a fresh submission's token restarts its
-                // own sequence numbering from 0 (see RetainOperationToken).
-                private long _deliveredThrough = -1;
+                // Completions the issuer thread has decoded (see EnqueueFromIssuer) but this operation's
+                // own drainer (see Execute) has not yet delivered to _onCompleted. This queue has exactly
+                // one producer by construction: every fd - and so this operation, which is permanently
+                // bound to one fd - is routed to exactly one ring (see GetRing), which in turn has
+                // exactly one owning issuer thread. That single-producer guarantee, together with
+                // _dispatchRequested only ever allowing one active drainer at a time (see
+                // ScheduleDispatch), is what delivers every completion to _onCompleted in true arrival
+                // order with no per-completion sequence number needed anywhere in this type, unlike every
+                // other IIoUringOperation's completions, which flow through the generic, order-agnostic
+                // EnqueueCompletions/CompletionProcessorWorkItem path instead (see DrainCompletions).
+                private readonly ConcurrentQueue<PendingCompletion> _pending = new();
 
-                // Set by TryCancelReceiveMultishot (see RequestCancellation) before it ever submits the
-                // actual cancel request - checked by CompleteFromIoUring so an ENOBUFS auto-rearm (see
-                // TryResubmit) can never race ahead of an already-requested cancellation and keep this
-                // receive silently alive behind the caller's back.
+                // 1 while some worker is already draining (or about to drain) _pending, 0 otherwise - the
+                // standard reset-then-recheck single-active-consumer coalescing flag: whoever wins the
+                // CAS from 0 to 1 is now responsible for draining every item currently in the queue *and*
+                // anything enqueued for the remainder of its own Execute call, only giving up that
+                // responsibility once it resets this back to 0 and finds the queue still empty. Unlike
+                // Ring.CompletionProcessingRequested (see CompletionProcessorWorkItem.Execute), which
+                // resets itself before draining specifically so a second instance *can* run concurrently,
+                // this flag must never allow two concurrently active drainers - that would reintroduce
+                // the exact same out-of-order delivery this type exists to avoid.
+                private int _dispatchRequested;
+
+                // The current submission's raw io_uring userData token, read by RequestCancellation
+                // (called from an arbitrary external thread) and written by TryResubmit (called from this
+                // operation's own drainer - see Execute/Deliver) - Volatile-accessed since those two sides
+                // run on different threads with no other synchronization between them.
+                private ulong _userData;
+
+                // Set just before this operation's truly final delivery to _onCompleted (see Deliver) -
+                // checked by RequestCancellation so it never bothers submitting a cancel request once
+                // this operation has already finished on its own (harmless if it raced and missed that,
+                // just a wasted, harmless IORING_OP_ASYNC_CANCEL against a token the kernel no longer
+                // recognizes).
+                private volatile bool _finished;
+
+                // Set by RequestCancellation before it ever submits the actual cancel request - checked
+                // by Deliver so an ENOBUFS auto-rearm (see TryResubmit) can never race ahead of an
+                // already-requested cancellation and keep this receive silently alive behind the caller's
+                // back.
                 private volatile bool _cancelRequested;
 
                 public MultishotReceiveOperation(Ring ring, SafeHandle handle, IntPtr fd, Action<int, IMemoryOwner<byte>?, bool> onCompleted)
@@ -238,9 +227,56 @@ namespace System.Threading
                     _onCompleted = onCompleted;
                 }
 
-                public void RequestCancellation() => _cancelRequested = true;
+                /// <summary>
+                /// Records this submission's userData token - called once right after a successful
+                /// <see cref="TrySubmit(IIoUringOperation, in Interop.Sys.IoRingRequest, out ulong)"/>
+                /// (including a transparent re-arm - see <see cref="TryResubmit"/>).
+                /// </summary>
+                public void SetUserData(ulong userData) => Volatile.Write(ref _userData, userData);
 
-                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+                /// <summary>
+                /// Requests best-effort cancellation of this operation's current submission (see
+                /// <see cref="IIoUringOperation.RequestCancellation"/>). Marked cancel-requested before the
+                /// actual cancel request is even submitted, so it can never lose a race against Deliver's
+                /// own ENOBUFS auto-rearm (see TryResubmit): once this is set, any in-flight or future
+                /// completion for this operation observes it and will not silently keep the receive alive
+                /// behind the caller's back. Safe to call from any thread - unlike every other operation
+                /// this callback of this class touches, this one runs on whichever arbitrary thread the
+                /// caller (that is holding onto this very instance) chooses to call it from.
+                /// </summary>
+                public void RequestCancellation()
+                {
+                    _cancelRequested = true;
+
+                    if (_finished)
+                    {
+                        return;
+                    }
+
+                    Interop.Sys.IoRingRequest request = default;
+                    request.OpCode = Interop.Sys.IoRingOp.Cancel;
+                    // Routes to the same ring the target request itself was routed to (see GetRing); the
+                    // kernel does not otherwise use Fd for IORING_OP_ASYNC_CANCEL.
+                    request.Fd = _fd;
+                    request.Offset = (long)Volatile.Read(ref _userData);
+
+                    TrySubmit(CancelSentinelOperation.Instance, in request);
+                }
+
+                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) =>
+                    // Never actually reached: this operation's completions are always intercepted and
+                    // delivered inline by the issuer thread itself (see DrainCompletions/EnqueueFromIssuer),
+                    // never handed to the generic EnqueueCompletions/CompletionProcessorWorkItem path that
+                    // is the only caller of this method.
+                    throw new UnreachableException();
+
+                /// <summary>
+                /// Decodes one raw completion and queues it for delivery. Called only by this ring's
+                /// single issuer thread, directly from <see cref="DrainCompletions"/> - see
+                /// <see cref="_pending"/>'s own doc comment for why that single-caller invariant is what
+                /// makes this operation's delivery order trivially correct.
+                /// </summary>
+                internal void EnqueueFromIssuer(int result, uint flags)
                 {
                     bool hasMore = (flags & Interop.Sys.IoRingCompletion.More) != 0;
 
@@ -251,43 +287,41 @@ namespace System.Threading
                         buffer = _ring.ReceiveBuffers!.Rent(bufferId, result);
                     }
 
-                    // Deciding whether this terminal completion should be transparently re-armed (see
-                    // Deliver) is deliberately *not* done here: this can run out of order relative to
-                    // this same operation's other completions (see the remark below), so acting on it
-                    // here - in particular resetting _deliveredThrough for the new submission - could
-                    // race with an earlier-sequenced sibling completion that has not been delivered yet,
-                    // corrupting the ordering gate for both the old and new submissions. Deliver only
-                    // ever reaches that decision once it has confirmed (via the gate itself) that this is
-                    // truly the last one, i.e. every prior completion has already been delivered.
+                    _pending.Enqueue(new PendingCompletion(result, buffer, hasMore));
+                    ScheduleDispatch();
+                }
 
-                    // Unlike every other IIoUringOperation, a still-active multishot operation can have
-                    // two of its own completions racing onto two different worker threads (see
-                    // CompletionProcessorWorkItem.Execute, which can schedule a second, concurrently
-                    // running processor for the same ring before the first one has processed anything).
-                    // No per-operation mutable scratch state (of the kind ActionIoUringOperation/
-                    // ThreadPoolValueTaskSource use for their single, ever-only-one completion) can
-                    // safely be shared between two such completions, so each dispatch below is fully
-                    // self-contained instead of reusing fields on this operation.
-                    var state = new CompletionState(this, result, buffer, hasMore, sequence);
-
-                    // Fast path: if this is already confirmed to be the next completion in true arrival
-                    // order, skip the extra queue-and-retry round trip Deliver's own gate would otherwise
-                    // require - simply hand the caller (CompleteOperation) this same state as the work
-                    // item to run (see IIoUringOperation.CompleteFromIoUring's own doc comment: it is
-                    // either executed inline on a worker, or batched, but never invoked here). Reading
-                    // _deliveredThrough here is inherently racy against a sibling completion's own
-                    // Volatile.Write in Deliver - benign, since Deliver's gate re-checks the exact same
-                    // condition unconditionally before ever actually delivering, so a stale/optimistic
-                    // "yes" observed here just means Deliver will do the small amount of extra work of
-                    // re-confirming it, and a stale/pessimistic "no" only costs one extra requeue - either
-                    // way, correctness is entirely owned by Deliver's own check, not this one.
-                    if (Volatile.Read(ref _deliveredThrough) == sequence - 1)
+                private void ScheduleDispatch()
+                {
+                    if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
                     {
-                        return state;
+                        ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
                     }
+                }
 
-                    ThreadPool.UnsafeQueueUserWorkItem(state, preferLocal: false);
-                    return null;
+                /// <summary>
+                /// Drains and delivers every completion currently in <see cref="_pending"/>, in order,
+                /// then gives up this operation's "active drainer" status - unless something was enqueued
+                /// in the narrow gap between draining the queue empty and actually giving that status up,
+                /// in which case this reclaims it and keeps going, rather than leaving that item
+                /// undelivered until some future, unrelated completion happens to schedule a new drainer.
+                /// </summary>
+                void IThreadPoolWorkItem.Execute()
+                {
+                    while (true)
+                    {
+                        while (_pending.TryDequeue(out PendingCompletion completion))
+                        {
+                            Deliver(completion.Result, completion.Buffer, completion.HasMore);
+                        }
+
+                        Volatile.Write(ref _dispatchRequested, 0);
+
+                        if (_pending.IsEmpty || Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) != 0)
+                        {
+                            return;
+                        }
+                    }
                 }
 
                 /// <summary>
@@ -295,11 +329,7 @@ namespace System.Threading
                 /// was terminated by the kernel due to buffer-pool exhaustion (see <see cref="Deliver"/>).
                 /// Reuses this instance (and its still-held reference on <see cref="_handle"/>) rather
                 /// than allocating a new one - the caller never observes any interruption, aside from a
-                /// pause in received data until the pool has room again. Only ever called from
-                /// <see cref="Deliver"/>, once it has confirmed (via its own ordering gate) that every
-                /// completion of the previous submission - including this, its final one - has already
-                /// been delivered, so resetting <see cref="_deliveredThrough"/> here for the new
-                /// submission's own sequence numbering cannot race with any of them.
+                /// pause in received data until the pool has room again.
                 /// </summary>
                 private bool TryResubmit()
                 {
@@ -308,52 +338,33 @@ namespace System.Threading
                     request.Fd = _fd;
                     request.Offset = -1;
 
-                    Volatile.Write(ref _deliveredThrough, -1);
-
                     if (!TrySubmit(this, in request, out ulong userData))
                     {
                         return false;
                     }
 
-                    _ring.ActiveMultishotReceives[_fd] = (userData, this);
+                    SetUserData(userData);
                     return true;
                 }
 
                 /// <summary>
-                /// Invokes <see cref="_onCompleted"/>, but only once every completion with a smaller
-                /// <paramref name="sequence"/> has already been delivered - since two completions of this
-                /// same still-active multishot operation can be processed (see
-                /// <see cref="IIoUringOperation.CompleteFromIoUring"/>) by two different workers, in
-                /// either order, this is what guarantees the caller always observes them in true arrival
-                /// order despite that. Never blocks the calling Thread Pool worker while waiting for its
-                /// turn: doing so (e.g. via a spin-wait) can deadlock the whole pool under load, since the
-                /// completion this call would be waiting on can itself be sitting undispatched in
-                /// <see cref="Ring.CompletionQueue"/> until some worker thread is free to dequeue and
-                /// dispatch it - if every worker is instead blocked spinning here, none ever will be. If
-                /// it is not yet this completion's turn, this simply gives up the calling thread and
-                /// requeues itself to retry later, the same way <see cref="IIoUringOperation.CompleteFromIoUring"/>
-                /// dispatches every completion in the first place.
+                /// Invokes <see cref="_onCompleted"/>. Only ever called from this operation's own
+                /// drainer (see <see cref="IThreadPoolWorkItem.Execute"/>), which guarantees at most one
+                /// active caller of this method at a time, dequeuing completions in the exact order this
+                /// ring's single issuer thread enqueued them (see <see cref="EnqueueFromIssuer"/>) - so,
+                /// unlike the generic <see cref="IIoUringOperation.CompleteFromIoUring"/> path, no
+                /// completion-sequence bookkeeping is needed here at all to guarantee true arrival order.
                 /// </summary>
-                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore, long sequence)
+                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore)
                 {
-                    if (Volatile.Read(ref _deliveredThrough) != sequence - 1)
-                    {
-                        ThreadPool.UnsafeQueueUserWorkItem(new CompletionState(this, result, buffer, hasMore, sequence), preferLocal: false);
-                        return;
-                    }
-
-                    // This is genuinely the last completion this token will ever produce (the kernel does
-                    // not emit any more after one without More), and - because of the gate check above -
-                    // every earlier-sequenced completion of this same token has already been delivered.
-                    // Only at this point is it safe to decide to transparently re-arm: see TryResubmit's
-                    // own doc comment for why. The kernel terminates (rather than pausing) a multishot
-                    // receive once its ring's shared provided-buffer pool (see Ring.ReceiveBuffers) is
-                    // momentarily exhausted - this is expected under enough concurrent long-lived receives
-                    // sharing one pool, not a real error/EOF the caller should ever observe. Buffers keep
-                    // being returned to the kernel as consumers dispose them (see
-                    // ReceiveBufferPool.Return/DrainReceiveBufferReturns) independently of whether this
-                    // particular receive is currently submitted, so the retry only needs to wait for the
-                    // pool to have room again, not for anything specific to this fd.
+                    // The kernel terminates (rather than pausing) a multishot receive once its ring's
+                    // shared provided-buffer pool (see Ring.ReceiveBuffers) is momentarily exhausted -
+                    // this is expected under enough concurrent long-lived receives sharing one pool, not
+                    // a real error/EOF the caller should ever observe. Buffers keep being returned to the
+                    // kernel as consumers dispose them (see ReceiveBufferPool.Return/
+                    // DrainReceiveBufferReturns) independently of whether this particular receive is
+                    // currently submitted, so the retry only needs to wait for the pool to have room
+                    // again, not for anything specific to this fd.
                     if (!hasMore && result < 0 && !_cancelRequested &&
                         new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS &&
                         TryResubmit())
@@ -363,12 +374,10 @@ namespace System.Threading
 
                     if (!hasMore)
                     {
-                        _ring.ActiveMultishotReceives.TryRemove(_fd, out _);
+                        _finished = true;
                     }
 
                     _onCompleted(result, buffer, hasMore);
-
-                    Volatile.Write(ref _deliveredThrough, sequence);
 
                     if (!hasMore)
                     {
@@ -376,33 +385,28 @@ namespace System.Threading
                     }
                 }
 
-                private readonly struct CompletionState : IThreadPoolWorkItem
+                private readonly struct PendingCompletion
                 {
-                    public readonly MultishotReceiveOperation Operation;
                     public readonly int Result;
                     public readonly IMemoryOwner<byte>? Buffer;
                     public readonly bool HasMore;
-                    public readonly long Sequence;
 
-                    public CompletionState(MultishotReceiveOperation operation, int result, IMemoryOwner<byte>? buffer, bool hasMore, long sequence)
+                    public PendingCompletion(int result, IMemoryOwner<byte>? buffer, bool hasMore)
                     {
-                        Operation = operation;
                         Result = result;
                         Buffer = buffer;
                         HasMore = hasMore;
-                        Sequence = sequence;
                     }
-
-                    void IThreadPoolWorkItem.Execute() => Operation.Deliver(Result, Buffer, HasMore, Sequence);
                 }
             }
 
             /// <summary>
             /// Shared, stateless <see cref="IIoUringOperation"/> for <see cref="Interop.Sys.IoRingOp.Cancel"/>
-            /// requests submitted by <see cref="TryCancelReceiveMultishot"/>: the cancel request's own
-            /// completion (typically 0 on success or <c>-ENOENT</c> if the target already finished) is not
-            /// meaningful to any caller - the target operation's own final completion is what actually
-            /// signals cancellation to its <c>onCompleted</c> callback - so it is simply discarded here.
+            /// requests submitted by <see cref="MultishotReceiveOperation.RequestCancellation"/>: the
+            /// cancel request's own completion (typically 0 on success or <c>-ENOENT</c> if the target
+            /// already finished) is not meaningful to any caller - the target operation's own final
+            /// completion is what actually signals cancellation to its <c>onCompleted</c> callback - so it
+            /// is simply discarded here.
             /// </summary>
             private sealed class CancelSentinelOperation : IIoUringOperation
             {
@@ -413,6 +417,8 @@ namespace System.Threading
                 }
 
                 IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) => null;
+
+                void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
             }
         }
     }

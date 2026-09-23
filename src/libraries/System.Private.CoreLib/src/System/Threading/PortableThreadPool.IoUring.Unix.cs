@@ -249,18 +249,6 @@ namespace System.Threading
                 // waking up on its own on essentially every loop iteration to reap new completions).
                 public readonly ConcurrentQueue<ushort> PendingBufferReturns = new();
 
-                // fd -> the UserData token and MultishotReceiveOperation of that fd's currently in-flight
-                // RecvMultishot request, so IoUringThreadPool.TryCancelReceiveMultishot can find the
-                // right token to cancel, and mark the operation itself as cancel-requested (see
-                // MultishotReceiveOperation.RequestCancellation), without a separate registry or touching
-                // the token/slot machinery from an arbitrary calling thread that holds no reference on it
-                // (see PeekOperationToken's own, narrower, safety invariant). This is looked up via the
-                // exact same fd -> ring mapping (GetRing) used to submit the request in the first place.
-                // Entries are added right after a successful submission (including a transparent re-arm,
-                // see MultishotReceiveOperation.TryResubmit) and removed on that operation's true final
-                // completion.
-                internal readonly ConcurrentDictionary<IntPtr, (ulong UserData, MultishotReceiveOperation Operation)> ActiveMultishotReceives = new();
-
                 public Ring(int index)
                 {
                     Index = index;
@@ -748,27 +736,58 @@ namespace System.Threading
 
                     processed += completedCount;
                     ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
-                    Span<long> sequences = sequenceBatch.AsSpan(0, completedCount);
 
                     // InFlightCount tracks requests submitted but not yet finally completed - not raw
                     // completion count: a still-active multishot operation (More flag set) produces many
                     // completions from a single submission, so only its last one (More flag absent)
                     // actually retires the in-flight slot it was submitted with.
                     int finalCompletions = 0;
+                    int keepCount = 0;
                     for (int i = 0; i < completions.Length; i++)
                     {
                         ref readonly Interop.Sys.IoRingCompletion completion = ref completions[i];
-                        if ((completion.Flags & Interop.Sys.IoRingCompletion.More) == 0)
+                        bool isFinal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                        if (isFinal)
                         {
                             finalCompletions++;
                         }
 
                         // Must happen on this single issuer thread, strictly before this completion is
                         // handed off to a worker (below) - see RetainOperationToken's doc comment.
-                        sequences[i] = RetainOperationToken(ring, completion.UserData);
+                        long sequence = RetainOperationToken(ring, completion.UserData);
+
+                        // A still-active multishot receive is delivered entirely inline here instead of
+                        // going through the generic completion queue below: every fd - and so every one
+                        // of its operations - is permanently bound to exactly one ring (see GetRing),
+                        // which in turn has exactly one owning issuer thread: this one. That means this
+                        // is the *only* thread that will ever act as a producer for this operation's own
+                        // pending-completion queue (see MultishotReceiveOperation.EnqueueFromIssuer), so
+                        // its completions are naturally delivered in true arrival order with no
+                        // per-completion sequence bookkeeping needed at all - unlike the generic path
+                        // below (see EnqueueCompletions/CompletionProcessorWorkItem), whose own dispatch
+                        // can otherwise process two completions of the very same operation concurrently,
+                        // out of order, across two different worker threads.
+                        if (PeekOperationToken(ring, completion.UserData) is MultishotReceiveOperation multishotReceive)
+                        {
+                            multishotReceive.EnqueueFromIssuer(completion.Result, completion.Flags);
+                            ReleaseOperationToken(ring, completion.UserData, isFinal);
+                            continue;
+                        }
+
+                        completionsBatch[keepCount] = completion;
+                        sequenceBatch[keepCount] = sequence;
+                        keepCount++;
                     }
                     ring.InFlightCount -= finalCompletions;
                     Debug.Assert(ring.InFlightCount >= 0);
+
+                    if (keepCount == 0)
+                    {
+                        continue;
+                    }
+
+                    completions = completionsBatch.AsSpan(0, keepCount);
+                    Span<long> sequences = sequenceBatch.AsSpan(0, keepCount);
 
                     if (s_useParallelizedEnqueue)
                     {
@@ -1027,28 +1046,50 @@ namespace System.Threading
             }
         }
 
+    }
+
+    /// <summary>
+    /// Implemented by types that can be submitted to <see cref="PortableThreadPool.IoUringThreadPool"/>
+    /// and receive their completion result back. Public (rather than nested/internal to
+    /// <see cref="PortableThreadPool"/>) so a caller across an assembly boundary - e.g.
+    /// <see cref="System.Threading.IoUring.TrySubmitRecvMultishot"/>'s caller - can hold onto the
+    /// operation instance it gets back and later request its cancellation directly, without a
+    /// separate registry keyed by some other identity (like a file descriptor) to find it again.
+    /// This is still an experimental, deliberately minimal surface - e.g. <see cref="RequestCancellation"/>
+    /// is only actually implemented by <see cref="PortableThreadPool"/>'s multishot receive operation
+    /// today - not a finished public contract.
+    /// </summary>
+    [CLSCompliant(false)]
+    public interface IIoUringOperation
+    {
         /// <summary>
-        /// Implemented by types that can be submitted to <see cref="IoUringThreadPool"/> and receive
-        /// their completion result back.
+        /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>,
+        /// together with the completion's raw CQE flags (e.g. <see cref="Interop.Sys.IoRingCompletion.More"/>
+        /// for a still-active multishot operation, or <see cref="Interop.Sys.IoRingCompletion.Buffer"/>/
+        /// <see cref="Interop.Sys.IoRingCompletion.BufferShift"/> for a selected provided-buffer id),
+        /// and this completion's 0-based delivery sequence number (assigned once per completion, in
+        /// true arrival order, regardless of the order in which completions of the same operation are
+        /// actually *processed* by independent workers - see
+        /// <see cref="PortableThreadPool.IoUringThreadPool.RetainOperationToken"/>). Operations that
+        /// can only ever receive one completion (i.e. every one except a still-active multishot
+        /// operation) can safely ignore <paramref name="sequence"/>, since it is always 0 for them.
+        /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
+        /// user continuations. Return the work item for the dispatcher to execute on a worker,
+        /// or <see langword="null"/> when a partial operation has been resubmitted.
         /// </summary>
-        internal interface IIoUringOperation
-        {
-            /// <summary>
-            /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>,
-            /// together with the completion's raw CQE flags (e.g. <see cref="Interop.Sys.IoRingCompletion.More"/>
-            /// for a still-active multishot operation, or <see cref="Interop.Sys.IoRingCompletion.Buffer"/>/
-            /// <see cref="Interop.Sys.IoRingCompletion.BufferShift"/> for a selected provided-buffer id),
-            /// and this completion's 0-based delivery sequence number (assigned once per completion, in
-            /// true arrival order, regardless of the order in which completions of the same operation are
-            /// actually *processed* by independent workers - see
-            /// <see cref="PortableThreadPool.IoUringThreadPool.RetainOperationToken"/>). Operations that
-            /// can only ever receive one completion (i.e. every one except a still-active multishot
-            /// operation) can safely ignore <paramref name="sequence"/>, since it is always 0 for them.
-            /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
-            /// user continuations. Return the work item for the dispatcher to execute on a worker,
-            /// or <see langword="null"/> when a partial operation has been resubmitted.
-            /// </summary>
-            IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
-        }
+        IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
+
+        /// <summary>
+        /// Requests best-effort cancellation of this operation's still-in-flight submission, if any.
+        /// Deliberately named <c>Request</c>Cancellation, not <c>Cancel</c>: calling this does not
+        /// itself guarantee the operation has stopped by the time it returns - the operation's own
+        /// completion (delivered the normal way, via its original callback) is what actually reports
+        /// the outcome (typically <c>-ECANCELED</c>) to the caller. A no-op if this operation has
+        /// already finished on its own. Only <see cref="PortableThreadPool"/>'s multishot receive
+        /// operation implements this today; every other <see cref="IIoUringOperation"/> in this
+        /// prototype only ever completes exactly once and is not (yet) cancellable once submitted, so
+        /// they throw <see cref="NotImplementedException"/>.
+        /// </summary>
+        void RequestCancellation();
     }
 }

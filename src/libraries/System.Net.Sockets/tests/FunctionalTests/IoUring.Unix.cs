@@ -424,12 +424,12 @@ namespace System.Net.Sockets.Tests
         {
             // Regression test for the multishot receive channel's SingleWriter = true setting: with
             // few rings shared by many connections, bursts of unrelated sockets' completions are very
-            // likely to land in the same io_uring_enter call and get dispatched to different Thread Pool
-            // workers concurrently (see IIoUringOperation.CompleteFromIoUring). If
-            // MultishotReceiveOperation.Deliver's sequence gate ever failed to fully serialize calls
-            // into a single connection's channel writer, this reliably surfaces it as out-of-order or
-            // corrupted per-connection data, or a channel-internal exception, rather than a rare/flaky
-            // hang.
+            // likely to land in the same io_uring_enter call. Each connection's own
+            // MultishotReceiveOperation guarantees at most one active drainer delivering its
+            // completions at a time, in the exact order its ring's single issuer thread enqueued them
+            // (see EnqueueFromIssuer/Execute in PortableThreadPool.IoUring.Receive.Unix.cs). If that
+            // guarantee ever broke down, this reliably surfaces it as out-of-order or corrupted
+            // per-connection data, or a channel-internal exception, rather than a rare/flaky hang.
             RemoteInvokeOptions options = CreateOptions(ringCount);
             RemoteExecutor.Invoke(connectionCountText =>
             {

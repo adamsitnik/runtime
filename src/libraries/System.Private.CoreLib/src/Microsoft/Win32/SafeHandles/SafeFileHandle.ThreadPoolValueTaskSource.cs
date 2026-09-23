@@ -29,7 +29,7 @@ namespace Microsoft.Win32.SafeHandles
         /// be completed synchronously on the thread pool, or (on Linux, when
         /// enabled and available) asynchronously via io_uring.
         /// </summary>
-        internal sealed class ThreadPoolValueTaskSource : IThreadPoolWorkItem, IValueTaskSource<int>, IValueTaskSource<long>, IValueTaskSource, PortableThreadPool.IIoUringOperation
+        internal sealed class ThreadPoolValueTaskSource : IThreadPoolWorkItem, IValueTaskSource<int>, IValueTaskSource<long>, IValueTaskSource, IIoUringOperation
         {
             private readonly SafeFileHandle _fileHandle;
             private ManualResetValueTaskSourceCore<long> _source;
@@ -205,7 +205,7 @@ namespace Microsoft.Win32.SafeHandles
             /// Performs completion bookkeeping and returns the continuation for worker dispatch.
             /// This can run on the issuer in legacy dispatch mode, so it must not invoke user code.
             /// </summary>
-            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
             {
                 if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
                     && TryContinuePartialWrite(result, out IThreadPoolWorkItem? fallbackWorkItem))
@@ -222,6 +222,10 @@ namespace Microsoft.Win32.SafeHandles
                 _completedViaIoUring = true;
                 return this;
             }
+
+            // This type's operations complete exactly once and are not (yet) cancellable once submitted
+            // in this prototype - see IIoUringOperation.RequestCancellation's own doc comment.
+            void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
 
             /// <summary>
             /// If <paramref name="bytesWritten"/> represents a partial write (fewer bytes than were

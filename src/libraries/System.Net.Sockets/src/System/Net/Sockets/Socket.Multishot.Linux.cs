@@ -50,16 +50,13 @@ namespace System.Net.Sockets
             // Unbounded - the issuer thread that dispatches completions must never be made to block on
             // this channel filling up; consumption speed is entirely up to the caller's enumeration
             // pace. SingleReader because an IAsyncEnumerable is consumed by exactly one thread at a
-            // time. SingleWriter = true even though two completions of this same still-active
-            // submission can be dispatched onto two different Thread Pool worker threads concurrently
-            // (see MultishotReceiveOperation in PortableThreadPool.IoUring.Receive.Unix.cs):
-            // MultishotReceiveOperation.Deliver's own sequence gate (_deliveredThrough) guarantees only
-            // one of those threads ever reaches the point of calling _onCompleted (and therefore
-            // TryWrite here) at a time, and always in true arrival order - any other one simply
-            // requeues itself instead of writing concurrently. So this write is already effectively
-            // single-writer, letting the channel skip its internal writer synchronization. Verified
-            // under a dedicated multi-producer stress test (see IoUringTests) hammering many concurrent
-            // multishot receives with SingleWriter = true before this was enabled.
+            // time. SingleWriter = true: this same still-active submission's completions are always
+            // delivered by MultishotReceiveOperation's own single active drainer (see
+            // PortableThreadPool.IoUring.Receive.Unix.cs) - never by two Thread Pool worker threads
+            // concurrently - so this write is already effectively single-writer, letting the channel
+            // skip its internal writer synchronization. Verified under a dedicated multi-producer stress
+            // test (see IoUringTests) hammering many concurrent multishot receives with
+            // SingleWriter = true before this was enabled.
             Channel<IMemoryOwner<byte>> channel = Channel.CreateUnbounded<IMemoryOwner<byte>>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -87,7 +84,7 @@ namespace System.Net.Sockets
                 }
             }
 
-            if (!System.Threading.IoUring.TrySubmitRecvMultishot(handle, OnCompleted))
+            if (!System.Threading.IoUring.TrySubmitRecvMultishot(handle, OnCompleted, out System.Threading.IIoUringOperation? operation))
             {
                 throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
             }
@@ -99,7 +96,7 @@ namespace System.Net.Sockets
                 ? cancellationToken.UnsafeRegister(_ =>
                 {
                     cancellationRequested = true;
-                    System.Threading.IoUring.TryCancelRecvMultishot(handle);
+                    operation!.RequestCancellation();
                 }, null)
                 : default;
 
@@ -115,8 +112,8 @@ namespace System.Net.Sockets
                 // The caller may stop enumerating (break, or dispose the enumerator) while the
                 // underlying receive is still active - request its cancellation so the kernel
                 // eventually stops producing completions for it instead of leaking an in-flight
-                // multishot receive. A no-op (returns false) if it already completed on its own.
-                System.Threading.IoUring.TryCancelRecvMultishot(handle);
+                // multishot receive. A no-op if it already completed on its own.
+                operation!.RequestCancellation();
 
                 // Return any buffers that arrived but were never yielded - either because enumeration
                 // stopped early, or because they raced in after the final completion was already
