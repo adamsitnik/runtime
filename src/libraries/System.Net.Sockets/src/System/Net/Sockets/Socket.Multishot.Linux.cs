@@ -50,10 +50,17 @@ namespace System.Net.Sockets
             // Unbounded - the issuer thread that dispatches completions must never be made to block on
             // this channel filling up; consumption speed is entirely up to the caller's enumeration
             // pace. SingleReader because an IAsyncEnumerable is consumed by exactly one thread at a
-            // time. NOT SingleWriter: two completions of this very same still-active submission can be
-            // dispatched onto two different Thread Pool worker threads concurrently (see
-            // MultishotReceiveOperation in PortableThreadPool.IoUring.Receive.Unix.cs), so two writers
-            // can genuinely race here.
+            // time. SingleWriter is conservatively left false even though two completions of this same
+            // still-active submission can be dispatched onto two different Thread Pool worker threads
+            // concurrently (see MultishotReceiveOperation in PortableThreadPool.IoUring.Receive.Unix.cs):
+            // MultishotReceiveOperation.Deliver's own sequence gate (_deliveredThrough) already
+            // guarantees only one of those threads ever reaches the point of calling _onCompleted (and
+            // therefore TryWrite here) at a time, and always in true arrival order - any other one
+            // simply requeues itself instead of writing concurrently. So this write is already
+            // effectively single-writer today; SingleWriter = true would likely be safe to set now, not
+            // just after some future issuer-loop batching change. Left false out of caution / until that
+            // guarantee is verified under stress specifically for this option, rather than as a
+            // known-required correctness fix.
             Channel<IMemoryOwner<byte>> channel = Channel.CreateUnbounded<IMemoryOwner<byte>>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -86,11 +93,16 @@ namespace System.Net.Sockets
                 throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
             }
 
-            using CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(_ =>
-            {
-                cancellationRequested = true;
-                System.Threading.IoUring.TryCancelRecvMultishot(handle);
-            }, null);
+            // Skip allocating the callback delegate entirely when the token can never be canceled
+            // (e.g. CancellationToken.None) - UnsafeRegister would end up being a no-op internally,
+            // but the delegate passed to it is still allocated by the caller regardless.
+            using CancellationTokenRegistration registration = cancellationToken.CanBeCanceled
+                ? cancellationToken.UnsafeRegister(_ =>
+                {
+                    cancellationRequested = true;
+                    System.Threading.IoUring.TryCancelRecvMultishot(handle);
+                }, null)
+                : default;
 
             try
             {
