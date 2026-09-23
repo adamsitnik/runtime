@@ -922,17 +922,27 @@ typedef enum
     IoRingOp_Connect = 5, // connect(2)-like; SockAddr/SockAddrLen give the destination address
     IoRingOp_Recv = 6,    // recv(2)-like single buffer read from a socket; Flags carries MSG_* flags
     IoRingOp_Send = 7,    // send(2)-like single buffer write to a socket; Flags carries MSG_* flags
+    IoRingOp_Cancel = 8,          // cancels a still-pending request; Offset carries the target request's UserData
+    IoRingOp_RecvMultishot = 9,   // persistent recv(2)-like read from a socket, using provided-buffer group zero
+                                  // (see SystemNative_IoRingRegisterBufferRing); keeps producing completions,
+                                  // each selecting one buffer, until cancelled, EOF, or an error occurs; every
+                                  // completion but the last one carries IORING_CQE_F_MORE in its Flags
 } IoRingOp;
 
 /**
  * A single io_uring request to be submitted via SystemNative_IoRingSubmit.
  * Exactly one of (Buffer, BufferLength) or (Vectors, VectorCount) is used, depending on OpCode.
+ * IoRingOp_RecvMultishot uses neither: the kernel selects a buffer from provided-buffer group
+ * zero for each completion instead. IoRingOp_Cancel uses neither Buffer nor Fd (Offset carries
+ * the target request's UserData; the target ring is selected the same way the target request
+ * itself was, by its owning fd).
  */
 typedef struct
 {
     int32_t OpCode;      // IoRingOp
     intptr_t Fd;
-    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops
+    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops; for
+                          // IoRingOp_Cancel, the target request's UserData instead
     uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write / IoRingOp_Recv / IoRingOp_Send
     int32_t BufferLength;
     IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
@@ -1026,6 +1036,30 @@ PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
  * -1 and sets errno on failure.
  */
 PALEXPORT int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle);
+
+/**
+ * Allocates bufferCount page-aligned buffers of bufferSize bytes each (owned by, and freed
+ * together with, ringHandle), registers them as provided-buffer group zero via
+ * IORING_REGISTER_PBUF_RING, and publishes all of them to the kernel. bufferCount must be a
+ * power of two. Must be called at most once per ring, on the ring's owning issuer thread, before
+ * any IoRingOp_RecvMultishot request is submitted against it.
+ *
+ * Returns 0 on success, with *bufferStorage set to the base address of the allocated storage
+ * (buffer i occupies [*bufferStorage + i * bufferSize, *bufferStorage + (i + 1) * bufferSize));
+ * otherwise, returns -1 and sets errno (e.g. ENOTSUP on kernels/headers lacking multishot receive
+ * with provided buffers - see the HAVE_LINUX_IO_URING_H CMake check).
+ */
+PALEXPORT int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, int32_t bufferSize, int32_t bufferCount, uint8_t** bufferStorage);
+
+/**
+ * Returns previously-selected buffers to provided-buffer group zero with a single release
+ * publication and no syscall. Must be called only by the ring's owning issuer thread; each
+ * buffer id must be returned exactly once, after the IoRingOp_RecvMultishot completion that
+ * selected it has been fully consumed.
+ *
+ * Returns 0 on success; otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferIds, int32_t count);
 
 /**
  * Bumps the given eventfd's counter by 1, making it readable. Safe to call from any thread,
