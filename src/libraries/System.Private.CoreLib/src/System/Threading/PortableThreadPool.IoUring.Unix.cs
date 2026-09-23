@@ -80,7 +80,7 @@ namespace System.Threading
         /// (the constructor's own) thread publish <see cref="s_isEnabled"/>/<see cref="s_rings"/> itself,
         /// before returning. Only after that does each new thread go on to call <see cref="IssuerLoop"/>.
         /// </summary>
-        internal static class IoUringThreadPool
+        internal static partial class IoUringThreadPool
         {
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive in a future iteration.
@@ -136,7 +136,7 @@ namespace System.Threading
             // doc comment. Null (and unused) if s_isEnabled is false.
             private static Ring[]? s_rings;
 
-            private struct OperationSlot
+            internal struct OperationSlot
             {
                 public IIoUringOperation? Operation;
                 public uint Generation;
@@ -148,7 +148,7 @@ namespace System.Threading
             /// own doc comment (on <see cref="IoUringThreadPool"/>) for why sharding across multiple
             /// rings/issuer threads exists and how callers are assigned to one.
             /// </summary>
-            private sealed class Ring
+            internal sealed class Ring
             {
                 // The index this ring was created at (0-based) - used only for the issuer thread's name,
                 // to make multiple issuer threads distinguishable in a debugger/process list.
@@ -200,6 +200,26 @@ namespace System.Threading
                 public readonly OperationSlot[] OperationSlots = new OperationSlot[QueueDepth];
                 public readonly ConcurrentQueue<int> FreeOperationSlots = new();
 
+                // This ring's provided-buffer group zero (see SystemNative_IoRingRegisterBufferRing),
+                // used by IoRingOp_RecvMultishot; null until registered by the static constructor's
+                // handshake, alongside RingHandle/WakeEventFd.
+                public ReceiveBufferPool? ReceiveBuffers;
+
+                // Consumed buffer ids a ReceiveBufferLease.Dispose() (on any thread) wants returned to
+                // the kernel. MPSC, mirroring PendingSubmissions: any thread may enqueue, only the issuer
+                // dequeues (see IssuerLoop) - draining opportunistically each loop iteration rather than
+                // waking the issuer just to return a single buffer (a receive-heavy ring is already
+                // waking up on its own on essentially every loop iteration to reap new completions).
+                public readonly ConcurrentQueue<ushort> PendingBufferReturns = new();
+
+                // fd -> the UserData token of that fd's currently in-flight RecvMultishot request, so
+                // IoUringThreadPool.TryCancelReceiveMultishot can find the right token to cancel without
+                // a separate registry: this is looked up via the exact same fd -> ring mapping (GetRing)
+                // used to submit the request in the first place. Entries are added right after a
+                // successful submission and removed on that operation's final completion (see
+                // MultishotReceiveOperation).
+                public readonly ConcurrentDictionary<IntPtr, ulong> ActiveMultishotReceives = new();
+
                 public Ring(int index)
                 {
                     Index = index;
@@ -222,6 +242,8 @@ namespace System.Threading
                 }
 
                 int ringCount = GetRingCount();
+                int receiveBufferSize = GetReceiveBufferSize();
+                int receiveBufferCount = GetReceiveBufferCount();
                 var rings = new Ring[ringCount];
                 bool allCreated = true;
 
@@ -267,6 +289,27 @@ namespace System.Threading
                         {
                             ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
                             created = ring.WakeEventFd >= 0;
+                        }
+
+                        if (created)
+                        {
+                            // Registers this ring's provided-buffer group zero for RecvMultishot. Per
+                            // the mandatory HAVE_LINUX_IO_URING_H check (see configure.cmake), a kernel
+                            // that supports io_uring at all also supports this - so a failure here is
+                            // treated exactly like a failure to create the ring or register its eventfd:
+                            // this ring (and, transitively, the whole io_uring integration - see
+                            // s_isEnabled below) is abandoned in favor of the non-io_uring fallback path.
+                            unsafe
+                            {
+                                byte* bufferStorage = null;
+                                int registerResult = Interop.Sys.IoRingRegisterBufferRing(
+                                    ring.RingHandle, receiveBufferSize, receiveBufferCount, &bufferStorage);
+                                created = registerResult == 0;
+                                if (created)
+                                {
+                                    ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, bufferStorage);
+                                }
+                            }
                         }
 
                         readyToRun.Set();
@@ -355,6 +398,26 @@ namespace System.Threading
             }
 
             /// <summary>
+            /// Size, in bytes, of each provided buffer in a ring's RecvMultishot buffer pool. Set
+            /// DOTNET_IORING_RECV_BUFFER_SIZE to override; defaults to 16 KiB. Read once per ring, from
+            /// the static constructor.
+            /// </summary>
+            private static int GetReceiveBufferSize() =>
+                AppContextConfigHelper.GetInt32Config(
+                    "System.Threading.ThreadPool.IoUringReceiveBufferSize", "DOTNET_IORING_RECV_BUFFER_SIZE",
+                    defaultValue: 16 * 1024, allowNegative: false);
+
+            /// <summary>
+            /// Number of provided buffers in a ring's RecvMultishot buffer pool (must be a power of two -
+            /// see SystemNative_IoRingRegisterBufferRing). Set DOTNET_IORING_RECV_BUFFER_COUNT to
+            /// override; defaults to 128. Read once per ring, from the static constructor.
+            /// </summary>
+            private static int GetReceiveBufferCount() =>
+                AppContextConfigHelper.GetInt32Config(
+                    "System.Threading.ThreadPool.IoUringReceiveBufferCount", "DOTNET_IORING_RECV_BUFFER_COUNT",
+                    defaultValue: 128, allowNegative: false);
+
+            /// <summary>
             /// Returns the <see cref="Ring"/> that <paramref name="fd"/> is routed to: every request for
             /// a given fd is routed to the same ring regardless of which thread submits it (unlike a
             /// per-calling-thread assignment), both so that a fd's requests stay concentrated on one
@@ -378,13 +441,22 @@ namespace System.Threading
             /// this never actually fails once <see cref="IsEnabled"/> is true: the request is simply
             /// enqueued for that ring's dedicated issuer thread to submit, and this method returns
             /// immediately. The operation is now considered in flight; its completion will eventually be
-            /// delivered via <see cref="IIoUringOperation.CompleteFromIoUring(int)"/>, invoked on a Thread
-            /// Pool work item. The queue backing this hand-off is unbounded - under sustained overload
-            /// (submissions arriving faster than the kernel/NIC can drain them), memory usage here could
-            /// grow without bound; this is a known, accepted limitation of this experimental
+            /// delivered via <see cref="IIoUringOperation.CompleteFromIoUring(int, uint)"/>, invoked on a
+            /// Thread Pool work item. The queue backing this hand-off is unbounded - under sustained
+            /// overload (submissions arriving faster than the kernel/NIC can drain them), memory usage
+            /// here could grow without bound; this is a known, accepted limitation of this experimental
             /// architecture, not an oversight.
             /// </summary>
-            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request)
+            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request) =>
+                TrySubmit(operation, in request, out _);
+
+            /// <summary>
+            /// Same as <see cref="TrySubmit(IIoUringOperation, in Interop.Sys.IoRingRequest)"/>, but also
+            /// reports the <c>UserData</c> token this request was actually assigned - needed by callers
+            /// (e.g. <see cref="TrySubmitReceiveMultishot"/>) that must later be able to target this
+            /// exact request for cancellation (<see cref="Interop.Sys.IoRingOp.Cancel"/>'s Offset).
+            /// </summary>
+            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request, out ulong userData)
             {
                 Debug.Assert(s_isEnabled);
 
@@ -408,6 +480,8 @@ namespace System.Threading
                     localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
                     Debug.Assert((localRequest.UserData & OperationSlotTag) == 0);
                 }
+
+                userData = localRequest.UserData;
 
                 try
                 {
@@ -453,11 +527,18 @@ namespace System.Threading
                 var submitBatch = new Interop.Sys.IoRingRequest[MaxRequestsPerSubmitBatch];
                 var completionsBatch = new Interop.Sys.IoRingCompletion[MaxCompletionsPerWait];
                 var workItemBatch = new IThreadPoolWorkItem[MaxCompletionsPerWait];
+                var bufferReturnBatch = new ushort[MaxCompletionsPerWait];
 
                 while (true)
                 {
                     DrainAndSubmit(ring, submitBatch, completionsBatch, workItemBatch);
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, workItemBatch);
+
+                    // Opportunistic only: a ReceiveBufferLease.Dispose() on any other thread never wakes
+                    // this issuer just to return one buffer (see Ring.PendingBufferReturns) - buffers sit
+                    // there until this thread is next awake anyway (e.g. for a completion or submission),
+                    // at which point republishing them costs no syscall (see IoRingReturnBuffers).
+                    DrainReceiveBufferReturns(ring, bufferReturnBatch);
 
                     if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
                     {
@@ -485,6 +566,42 @@ namespace System.Threading
                         Environment.FailFast($"io_uring eventfd wait failed: {Marshal.GetLastPInvokeError()}.");
                     }
                 }
+            }
+
+            /// <summary>
+            /// Republishes every buffer id currently queued in <see cref="Ring.PendingBufferReturns"/> to
+            /// the kernel, in batches of at most <paramref name="batch"/>'s length. No syscall is needed
+            /// (see <see cref="Interop.Sys.IoRingReturnBuffers"/>); this only runs on the issuer thread.
+            /// </summary>
+            private static unsafe void DrainReceiveBufferReturns(Ring ring, ushort[] batch)
+            {
+                if (ring.PendingBufferReturns.IsEmpty)
+                {
+                    return;
+                }
+
+                int count;
+                while ((count = DequeueBufferReturnBatch(ring, batch)) > 0)
+                {
+                    fixed (ushort* batchPtr = batch)
+                    {
+                        if (Interop.Sys.IoRingReturnBuffers(ring.RingHandle, batchPtr, count) != 0)
+                        {
+                            Environment.FailFast($"io_uring provided-buffer return failed: {Marshal.GetLastPInvokeError()}.");
+                        }
+                    }
+                }
+            }
+
+            private static int DequeueBufferReturnBatch(Ring ring, ushort[] batch)
+            {
+                int count = 0;
+                while (count < batch.Length && ring.PendingBufferReturns.TryDequeue(out ushort bufferId))
+                {
+                    batch[count++] = bufferId;
+                }
+
+                return count;
             }
 
             /// <summary>
@@ -581,10 +698,24 @@ namespace System.Threading
                         }
                     }
 
-                    ring.InFlightCount -= completedCount;
-                    Debug.Assert(ring.InFlightCount >= 0);
                     processed += completedCount;
                     ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
+
+                    // InFlightCount tracks requests submitted but not yet finally completed - not raw
+                    // completion count: a still-active multishot operation (More flag set) produces many
+                    // completions from a single submission, so only its last one (More flag absent)
+                    // actually retires the in-flight slot it was submitted with.
+                    int finalCompletions = 0;
+                    foreach (ref readonly Interop.Sys.IoRingCompletion completion in completions)
+                    {
+                        if ((completion.Flags & Interop.Sys.IoRingCompletion.More) == 0)
+                        {
+                            finalCompletions++;
+                        }
+                    }
+                    ring.InFlightCount -= finalCompletions;
+                    Debug.Assert(ring.InFlightCount >= 0);
+
                     if (s_useParallelizedEnqueue)
                     {
                         EnqueueCompletions(ring, completions);
@@ -621,12 +752,53 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Resolves and releases a completion's correlation token before completing its operation.
-            /// This is the shared bookkeeping used by both
+            /// Resolves a completion's correlation token and completes its operation, releasing the
+            /// token only if this is the operation's final completion. A multishot operation (e.g.
+            /// <see cref="Interop.Sys.IoRingOp.RecvMultishot"/>) keeps producing completions - every one
+            /// but the last carries <see cref="Interop.Sys.IoRingCompletion.More"/> in its
+            /// <see cref="Interop.Sys.IoRingCompletion.Flags"/> - so its token must stay alive (and
+            /// resolvable by further completions) across all of them, and is released only once that
+            /// flag is finally absent. This is the shared bookkeeping used by both
             /// <see cref="DispatchBatch"/> and <see cref="CompletionProcessorWorkItem"/>.
             /// </summary>
             private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion)
-                => ReleaseOperationToken(ring, completion.UserData).CompleteFromIoUring(completion.Result);
+            {
+                bool isFinal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                IIoUringOperation operation = isFinal
+                    ? ReleaseOperationToken(ring, completion.UserData)
+                    : PeekOperationToken(ring, completion.UserData);
+                return operation.CompleteFromIoUring(completion.Result, completion.Flags);
+            }
+
+            /// <summary>
+            /// Resolves a completion's correlation token to its operation without releasing it - used
+            /// for every completion of a still-active multishot operation but the last (see
+            /// <see cref="CompleteOperation"/>).
+            /// </summary>
+            private static IIoUringOperation PeekOperationToken(Ring ring, ulong userData)
+            {
+                if ((userData & OperationSlotTag) != 0)
+                {
+                    int slotIndex = (int)((uint)userData >> 1);
+                    if ((uint)slotIndex >= (uint)ring.OperationSlots.Length)
+                    {
+                        Environment.FailFast("Invalid io_uring operation slot.");
+                    }
+
+                    ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
+                    IIoUringOperation? cachedOperation = Volatile.Read(ref slot.Operation);
+                    uint generation = (uint)(userData >> OperationSlotGenerationShift);
+                    if (cachedOperation is null || Volatile.Read(ref slot.Generation) != generation)
+                    {
+                        Environment.FailFast("Stale io_uring operation slot.");
+                    }
+
+                    return cachedOperation;
+                }
+
+                GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
+                return (IIoUringOperation)handle.Target!;
+            }
 
             private static IIoUringOperation ReleaseOperationToken(Ring ring, ulong userData)
             {
@@ -744,12 +916,15 @@ namespace System.Threading
         internal interface IIoUringOperation
         {
             /// <summary>
-            /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>.
+            /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>,
+            /// together with the completion's raw CQE flags (e.g. <see cref="Interop.Sys.IoRingCompletion.More"/>
+            /// for a still-active multishot operation, or <see cref="Interop.Sys.IoRingCompletion.Buffer"/>/
+            /// <see cref="Interop.Sys.IoRingCompletion.BufferShift"/> for a selected provided-buffer id).
             /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
             /// user continuations. Return the work item for the dispatcher to execute on a worker,
             /// or <see langword="null"/> when a partial operation has been resubmitted.
             /// </summary>
-            IThreadPoolWorkItem? CompleteFromIoUring(int result);
+            IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags);
         }
     }
 }
