@@ -38,51 +38,6 @@ namespace System.Net.Sockets
         /// <returns>An asynchronous task that completes with the accepted Socket.</returns>
         public ValueTask<Socket> AcceptAsync(CancellationToken cancellationToken) => AcceptAsync((Socket?)null, cancellationToken);
 
-        /// <summary>Accepts incoming connections as an asynchronous sequence.</summary>
-        /// <param name="cancellationToken">A cancellation token used to stop accepting connections.</param>
-        /// <returns>An asynchronous sequence of connected sockets owned by the caller.</returns>
-        /// <remarks>
-        /// Uses multishot io_uring accept when available, and repeated <see cref="AcceptAsync(CancellationToken)"/>
-        /// otherwise. Dispose the enumerator to stop accepting and release connections that were
-        /// accepted but not yielded. Disposing the enumerator does not close the listening socket
-        /// or sockets already yielded. This API is experimental.
-        /// </remarks>
-        /// <exception cref="ObjectDisposedException">This socket has been closed.</exception>
-        /// <exception cref="InvalidOperationException">This socket is not bound and listening.</exception>
-        /// <exception cref="SocketException">An error occurs while accepting a connection.</exception>
-        /// <exception cref="OperationCanceledException">The cancellation token is canceled.</exception>
-        public IAsyncEnumerable<Socket> AcceptMultishotAsync(CancellationToken cancellationToken = default)
-        {
-            ThrowIfDisposed();
-            if (_rightEndPoint is null)
-            {
-                throw new InvalidOperationException(SR.net_sockets_mustbind);
-            }
-            if (!_isListening)
-            {
-                throw new InvalidOperationException(SR.net_sockets_mustlisten);
-            }
-
-            IAsyncEnumerable<Socket>? enumerable = null;
-            CreateMultishotAcceptEnumerable(cancellationToken, ref enumerable);
-            return enumerable ?? AcceptRepeatedlyAsync(cancellationToken);
-        }
-
-        partial void CreateMultishotAcceptEnumerable(CancellationToken cancellationToken, ref IAsyncEnumerable<Socket>? enumerable);
-        partial void CancelMultishotAccept();
-
-        private async IAsyncEnumerable<Socket> AcceptRepeatedlyAsync([EnumeratorCancellation] CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            // A cancellable operation uses the normal socket queue, including its close handling.
-            using CancellationTokenSource? cancellation = cancellationToken.CanBeCanceled ? null : new CancellationTokenSource();
-            CancellationToken token = cancellation?.Token ?? cancellationToken;
-            while (true)
-            {
-                yield return await AcceptAsync(token).ConfigureAwait(false);
-            }
-        }
-
         /// <summary>
         /// Accepts an incoming connection.
         /// </summary>

@@ -17451,10 +17451,6 @@ namespace System.Threading
     public static class IoUring
     {
         public static bool IsSupported { get { throw null; } }
-        public static bool TryCancelAcceptMultishot(System.Runtime.InteropServices.SafeHandle handle) { throw null; }
-        public static bool TryCancelRecvMultishot(System.Runtime.InteropServices.SafeHandle handle) { throw null; }
-        public static bool TrySubmitAcceptMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, bool> onCompleted) { throw null; }
-        public static bool TrySubmitRecvMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted) { throw null; }
         public static unsafe bool TrySubmitRecv(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitSend(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitAccept(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, int flags, System.Action<int> onCompleted) { throw null; }

@@ -210,7 +210,6 @@
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Unix.cs" />
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Unix.OptionTracking.cs" />
     <Compile Include="System\Net\Sockets\Socket.Unix.cs" />
-    <Compile Include="System\Net\Sockets\Socket.Multishot.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.IoUring.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncEventArgs.Unix.cs" />

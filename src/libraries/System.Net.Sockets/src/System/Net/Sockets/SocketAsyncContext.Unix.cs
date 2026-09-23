@@ -1510,7 +1510,7 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && !cancellationToken.CanBeCanceled && TryAcceptViaIoUring(socketAddress, callback))
+            if (ready && TryAcceptViaIoUring(socketAddress, callback))
             {
                 acceptedFd = (IntPtr)(-1);
                 socketAddressLen = 0;

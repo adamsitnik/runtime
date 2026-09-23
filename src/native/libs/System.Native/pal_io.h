@@ -922,8 +922,6 @@ typedef enum
     IoRingOp_Connect = 5, // connect(2)-like; SockAddr/SockAddrLen give the destination address
     IoRingOp_Recv = 6,    // recv(2)-like single buffer read from a socket; Flags carries MSG_* flags
     IoRingOp_Send = 7,    // send(2)-like single buffer write to a socket; Flags carries MSG_* flags
-    IoRingOp_AcceptMultishot = 8,
-    IoRingOp_Cancel = 9,  // Offset contains the target request's user_data
 } IoRingOp;
 
 /**
@@ -934,7 +932,7 @@ typedef struct
 {
     int32_t OpCode;      // IoRingOp
     intptr_t Fd;
-    int64_t Offset;      // file offset; -1 for non-positional ops; target user_data for Cancel
+    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops
     uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write / IoRingOp_Recv / IoRingOp_Send
     int32_t BufferLength;
     IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
