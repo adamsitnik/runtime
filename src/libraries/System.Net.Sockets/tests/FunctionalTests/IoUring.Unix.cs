@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,6 +14,7 @@ namespace System.Net.Sockets.Tests
     public class IoUringTests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
+        public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1)]
@@ -308,6 +310,126 @@ namespace System.Net.Sockets.Tests
                     GC.KeepAlive(received);
                 }
             }, useChangeNotifications.ToString(), CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void ReceiveMultishotAsync_StreamsMultipleSends_InOrder(int ringCount)
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.True(IoUring.IsSupported);
+                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                sender.SendTimeout = TestSettings.PassingTestTimeout;
+
+                const int ChunkCount = 5;
+                const int ChunkSize = 16;
+                byte[] sent = new byte[ChunkCount * ChunkSize];
+                for (int i = 0; i < ChunkCount; i++)
+                {
+                    Array.Fill(sent, (byte)(i + 1), i * ChunkSize, ChunkSize);
+                }
+
+                using CancellationTokenSource cts = new CancellationTokenSource(TestSettings.PassingTestTimeout);
+                IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync(cts.Token).GetAsyncEnumerator();
+
+                for (int i = 0; i < ChunkCount; i++)
+                {
+                    Assert.Equal(ChunkSize, sender.Send(sent.AsSpan(i * ChunkSize, ChunkSize)));
+                }
+
+                List<byte> received = new List<byte>();
+                while (received.Count < sent.Length)
+                {
+                    Assert.True(enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult());
+                    using IMemoryOwner<byte> buffer = enumerator.Current;
+                    received.AddRange(buffer.Memory.Span.ToArray());
+                }
+
+                Assert.Equal(sent, received.ToArray());
+                enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void ReceiveMultishotAsync_GracefulShutdown_EndsEnumerationWithoutError(int ringCount)
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.True(IoUring.IsSupported);
+                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+
+                byte[] sent = new byte[] { 0x2A };
+                Assert.Equal(1, sender.Send(sent));
+                sender.Shutdown(SocketShutdown.Send);
+
+                using CancellationTokenSource cts = new CancellationTokenSource(TestSettings.PassingTestTimeout);
+                IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync(cts.Token).GetAsyncEnumerator();
+
+                Assert.True(enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult());
+                using (IMemoryOwner<byte> buffer = enumerator.Current)
+                {
+                    Assert.Equal(sent, buffer.Memory.ToArray());
+                }
+
+                // EOF: enumeration ends cleanly, without throwing.
+                Assert.False(enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult());
+                enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void ReceiveMultishotAsync_Cancellation_ThrowsOperationCanceled(int ringCount)
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.True(IoUring.IsSupported);
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    using CancellationTokenSource cts = new CancellationTokenSource();
+                    IAsyncEnumerator<IMemoryOwner<byte>> enumerator = receiver.ReceiveMultishotAsync(cts.Token).GetAsyncEnumerator();
+
+                    ValueTask<bool> moveNextTask = enumerator.MoveNextAsync();
+                    cts.Cancel();
+
+                    OperationCanceledException exception = Assert.Throws<OperationCanceledException>(() =>
+                        moveNextTask.AsTask().WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult());
+                    Assert.Equal(cts.Token, exception.CancellationToken);
+                    enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsRemoteExecutorSupported))]
+        public void ReceiveMultishotAsync_NotSupported_ThrowsInvalidOperationException()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.False(IoUring.IsSupported);
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    Assert.Throws<InvalidOperationException>(() => receiver.ReceiveMultishotAsync());
+                }
+            }, new RemoteInvokeOptions { StartInfo = { Environment = { ["DOTNET_USE_IO_URING"] = "0" } } }).Dispose();
         }
 
         private static void LimitThreadPoolToOneWorker()
