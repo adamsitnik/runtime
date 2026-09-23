@@ -50,21 +50,20 @@ namespace System.Net.Sockets
             // Unbounded - the issuer thread that dispatches completions must never be made to block on
             // this channel filling up; consumption speed is entirely up to the caller's enumeration
             // pace. SingleReader because an IAsyncEnumerable is consumed by exactly one thread at a
-            // time. SingleWriter is conservatively left false even though two completions of this same
-            // still-active submission can be dispatched onto two different Thread Pool worker threads
-            // concurrently (see MultishotReceiveOperation in PortableThreadPool.IoUring.Receive.Unix.cs):
-            // MultishotReceiveOperation.Deliver's own sequence gate (_deliveredThrough) already
-            // guarantees only one of those threads ever reaches the point of calling _onCompleted (and
-            // therefore TryWrite here) at a time, and always in true arrival order - any other one
-            // simply requeues itself instead of writing concurrently. So this write is already
-            // effectively single-writer today; SingleWriter = true would likely be safe to set now, not
-            // just after some future issuer-loop batching change. Left false out of caution / until that
-            // guarantee is verified under stress specifically for this option, rather than as a
-            // known-required correctness fix.
+            // time. SingleWriter = true even though two completions of this same still-active
+            // submission can be dispatched onto two different Thread Pool worker threads concurrently
+            // (see MultishotReceiveOperation in PortableThreadPool.IoUring.Receive.Unix.cs):
+            // MultishotReceiveOperation.Deliver's own sequence gate (_deliveredThrough) guarantees only
+            // one of those threads ever reaches the point of calling _onCompleted (and therefore
+            // TryWrite here) at a time, and always in true arrival order - any other one simply
+            // requeues itself instead of writing concurrently. So this write is already effectively
+            // single-writer, letting the channel skip its internal writer synchronization. Verified
+            // under a dedicated multi-producer stress test (see IoUringTests) hammering many concurrent
+            // multishot receives with SingleWriter = true before this was enabled.
             Channel<IMemoryOwner<byte>> channel = Channel.CreateUnbounded<IMemoryOwner<byte>>(new UnboundedChannelOptions
             {
                 SingleReader = true,
-                SingleWriter = false,
+                SingleWriter = true,
             });
 
             void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)

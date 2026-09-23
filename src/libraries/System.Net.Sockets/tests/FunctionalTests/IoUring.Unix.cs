@@ -417,6 +417,106 @@ namespace System.Net.Sockets.Tests
             }, CreateOptions(ringCount)).Dispose();
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1, 24)]
+        [InlineData(3, 24)]
+        public void ReceiveMultishotAsync_ManyConcurrentConnections_PreserveOrderWithSingleWriterChannel(int ringCount, int connectionCount)
+        {
+            // Regression test for the multishot receive channel's SingleWriter = true setting: with
+            // few rings shared by many connections, bursts of unrelated sockets' completions are very
+            // likely to land in the same io_uring_enter call and get dispatched to different Thread Pool
+            // workers concurrently (see IIoUringOperation.CompleteFromIoUring). If
+            // MultishotReceiveOperation.Deliver's sequence gate ever failed to fully serialize calls
+            // into a single connection's channel writer, this reliably surfaces it as out-of-order or
+            // corrupted per-connection data, or a channel-internal exception, rather than a rare/flaky
+            // hang.
+            RemoteInvokeOptions options = CreateOptions(ringCount);
+            RemoteExecutor.Invoke(connectionCountText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                int connections = int.Parse(connectionCountText);
+                const int ChunkCount = 500;
+
+                Socket[] senders = new Socket[connections];
+                Socket[] receivers = new Socket[connections];
+                byte[][] expected = new byte[connections][];
+                try
+                {
+                    Random random = new Random(42);
+                    for (int c = 0; c < connections; c++)
+                    {
+                        (senders[c], receivers[c]) = SocketTestExtensions.CreateConnectedSocketPair();
+                        byte[] data = new byte[ChunkCount];
+                        random.NextBytes(data);
+                        expected[c] = data;
+                    }
+
+                    Task[] sendTasks = new Task[connections];
+                    for (int c = 0; c < connections; c++)
+                    {
+                        int idx = c;
+                        sendTasks[idx] = Task.Run(() =>
+                        {
+                            Socket sender = senders[idx];
+                            byte[] data = expected[idx];
+                            // One byte at a time, as fast as possible, so each connection produces a
+                            // long run of individually-completed reads instead of a single big one.
+                            for (int i = 0; i < data.Length; i++)
+                            {
+                                Assert.Equal(1, sender.Send(data, i, 1, SocketFlags.None));
+                            }
+                        });
+                    }
+
+                    Task<byte[]>[] receiveTasks = new Task<byte[]>[connections];
+                    for (int c = 0; c < connections; c++)
+                    {
+                        int idx = c;
+                        receiveTasks[idx] = Task.Run(async () =>
+                        {
+                            Socket receiver = receivers[idx];
+                            using CancellationTokenSource cts = new CancellationTokenSource(TestSettings.PassingTestTimeout);
+                            List<byte> received = new List<byte>(expected[idx].Length);
+                            await foreach (IMemoryOwner<byte> buffer in receiver.ReceiveMultishotAsync(cts.Token))
+                            {
+                                using (buffer)
+                                {
+                                    received.AddRange(buffer.Memory.Span.ToArray());
+                                }
+
+                                if (received.Count >= expected[idx].Length)
+                                {
+                                    break;
+                                }
+                            }
+
+                            return received.ToArray();
+                        });
+                    }
+
+                    Task.WhenAll(sendTasks).WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    byte[][] results = Task.WhenAll(receiveTasks).WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+
+                    for (int c = 0; c < connections; c++)
+                    {
+                        Assert.Equal(expected[c], results[c]);
+                    }
+                }
+                finally
+                {
+                    foreach (Socket s in senders)
+                    {
+                        s?.Dispose();
+                    }
+
+                    foreach (Socket r in receivers)
+                    {
+                        r?.Dispose();
+                    }
+                }
+            }, connectionCount.ToString(), options).Dispose();
+        }
+
         [ConditionalFact(nameof(IsRemoteExecutorSupported))]
         public void ReceiveMultishotAsync_NotSupported_ThrowsInvalidOperationException()
         {
