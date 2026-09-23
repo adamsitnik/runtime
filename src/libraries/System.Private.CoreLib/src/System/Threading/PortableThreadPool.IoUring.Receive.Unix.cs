@@ -268,8 +268,25 @@ namespace System.Threading
                     // ThreadPoolValueTaskSource use for their single, ever-only-one completion) can
                     // safely be shared between two such completions, so each dispatch below is fully
                     // self-contained instead of reusing fields on this operation.
-                    ThreadPool.UnsafeQueueUserWorkItem(s_dispatch, new CompletionState(this, result, buffer, hasMore, sequence), preferLocal: false);
+                    var state = new CompletionState(this, result, buffer, hasMore, sequence);
 
+                    // Fast path: if this is already confirmed to be the next completion in true arrival
+                    // order, skip the extra queue-and-retry round trip Deliver's own gate would otherwise
+                    // require - simply hand the caller (CompleteOperation) this same state as the work
+                    // item to run (see IIoUringOperation.CompleteFromIoUring's own doc comment: it is
+                    // either executed inline on a worker, or batched, but never invoked here). Reading
+                    // _deliveredThrough here is inherently racy against a sibling completion's own
+                    // Volatile.Write in Deliver - benign, since Deliver's gate re-checks the exact same
+                    // condition unconditionally before ever actually delivering, so a stale/optimistic
+                    // "yes" observed here just means Deliver will do the small amount of extra work of
+                    // re-confirming it, and a stale/pessimistic "no" only costs one extra requeue - either
+                    // way, correctness is entirely owned by Deliver's own check, not this one.
+                    if (Volatile.Read(ref _deliveredThrough) == sequence - 1)
+                    {
+                        return state;
+                    }
+
+                    ThreadPool.UnsafeQueueUserWorkItem(state, preferLocal: false);
                     return null;
                 }
 
@@ -321,7 +338,7 @@ namespace System.Threading
                 {
                     if (Volatile.Read(ref _deliveredThrough) != sequence - 1)
                     {
-                        ThreadPool.UnsafeQueueUserWorkItem(s_dispatch, new CompletionState(this, result, buffer, hasMore, sequence), preferLocal: false);
+                        ThreadPool.UnsafeQueueUserWorkItem(new CompletionState(this, result, buffer, hasMore, sequence), preferLocal: false);
                         return;
                     }
 
@@ -359,10 +376,7 @@ namespace System.Threading
                     }
                 }
 
-                private static readonly Action<CompletionState> s_dispatch =
-                    static state => state.Operation.Deliver(state.Result, state.Buffer, state.HasMore, state.Sequence);
-
-                private readonly struct CompletionState
+                private readonly struct CompletionState : IThreadPoolWorkItem
                 {
                     public readonly MultishotReceiveOperation Operation;
                     public readonly int Result;
@@ -378,6 +392,8 @@ namespace System.Threading
                         HasMore = hasMore;
                         Sequence = sequence;
                     }
+
+                    void IThreadPoolWorkItem.Execute() => Operation.Deliver(Result, Buffer, HasMore, Sequence);
                 }
             }
 
