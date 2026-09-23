@@ -115,7 +115,7 @@ namespace System.Net.Sockets.Tests
                         }));
                         if (i < 16)
                         {
-                            for (int j = 0; j < 8; j++)
+                            for (int j = 0; j < 64; j++)
                             {
                                 Assert.Equal(1, senders[i].Send(new byte[] { (byte)i }));
                                 Assert.True(signals[i].Wait(TestSettings.PassingTestTimeout));
