@@ -249,13 +249,17 @@ namespace System.Threading
                 // waking up on its own on essentially every loop iteration to reap new completions).
                 public readonly ConcurrentQueue<ushort> PendingBufferReturns = new();
 
-                // fd -> the UserData token of that fd's currently in-flight RecvMultishot request, so
-                // IoUringThreadPool.TryCancelReceiveMultishot can find the right token to cancel without
-                // a separate registry: this is looked up via the exact same fd -> ring mapping (GetRing)
-                // used to submit the request in the first place. Entries are added right after a
-                // successful submission and removed on that operation's final completion (see
-                // MultishotReceiveOperation).
-                public readonly ConcurrentDictionary<IntPtr, ulong> ActiveMultishotReceives = new();
+                // fd -> the UserData token and MultishotReceiveOperation of that fd's currently in-flight
+                // RecvMultishot request, so IoUringThreadPool.TryCancelReceiveMultishot can find the
+                // right token to cancel, and mark the operation itself as cancel-requested (see
+                // MultishotReceiveOperation.RequestCancellation), without a separate registry or touching
+                // the token/slot machinery from an arbitrary calling thread that holds no reference on it
+                // (see PeekOperationToken's own, narrower, safety invariant). This is looked up via the
+                // exact same fd -> ring mapping (GetRing) used to submit the request in the first place.
+                // Entries are added right after a successful submission (including a transparent re-arm,
+                // see MultishotReceiveOperation.TryResubmit) and removed on that operation's true final
+                // completion.
+                internal readonly ConcurrentDictionary<IntPtr, (ulong UserData, MultishotReceiveOperation Operation)> ActiveMultishotReceives = new();
 
                 public Ring(int index)
                 {
