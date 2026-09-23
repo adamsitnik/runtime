@@ -103,7 +103,9 @@ extern int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
 
 #if HAVE_LINUX_IO_URING_H
 // The CMake HAVE_LINUX_IO_URING_H check also verifies that __NR_io_uring_setup/enter/register
-// are defined by <sys/syscall.h>, so no fallback definitions are needed here.
+// are defined by <sys/syscall.h>, and that IORING_RECV_MULTISHOT/IORING_REGISTER_PBUF_RING/
+// struct io_uring_buf_ring/IOSQE_BUFFER_SELECT (multishot receive with ring-mapped provided
+// buffers) are available, so no fallback definitions are needed here.
 #include <linux/io_uring.h>
 #include <stdatomic.h>
 #include <sys/eventfd.h>
