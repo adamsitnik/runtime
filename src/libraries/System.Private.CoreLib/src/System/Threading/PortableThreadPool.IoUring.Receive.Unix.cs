@@ -72,8 +72,8 @@ internal sealed partial class PortableThreadPool
 
         private sealed class ReceiveBufferPool
         {
-            internal const int BufferSize = 4096;
-            internal const int BufferCount = 1024;
+            internal const int BufferSize = 16 * 1024;
+            internal const int BufferCount = 128;
             private readonly Ring _ring;
             private readonly ConcurrentQueue<ushort> _returns = new();
             private readonly ushort[] _returnBatch = new ushort[MaxRequestsPerSubmitBatch];
