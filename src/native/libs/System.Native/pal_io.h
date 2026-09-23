@@ -908,3 +908,166 @@ PALEXPORT int64_t SystemNative_ReadV(intptr_t fd, IOVector* vectors, int32_t vec
  * Returns the number of bytes written on success; otherwise, -1 is returned and errno is set.
  */
 PALEXPORT int64_t SystemNative_WriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount);
+
+/**
+ * Operation code for an IoRingRequest. Mirrors a subset of the Linux IORING_OP_* opcodes.
+ */
+typedef enum
+{
+    IoRingOp_Read = 0,    // single buffer read; positional (pread-like) if Offset >= 0, else read-like
+    IoRingOp_Write = 1,   // single buffer write; positional (pwrite-like) if Offset >= 0, else write-like
+    IoRingOp_ReadV = 2,   // scatter read into Vectors; positional (preadv-like) if Offset >= 0, else readv-like
+    IoRingOp_WriteV = 3,  // gather write from Vectors; positional (pwritev-like) if Offset >= 0, else writev-like
+    IoRingOp_Accept = 4,  // accept(2)-like; writes the peer address into SockAddr/SockAddrLen; Result is the new fd
+    IoRingOp_Connect = 5, // connect(2)-like; SockAddr/SockAddrLen give the destination address
+    IoRingOp_Recv = 6,    // recv(2)-like single buffer read from a socket; Flags carries MSG_* flags
+    IoRingOp_Send = 7,    // send(2)-like single buffer write to a socket; Flags carries MSG_* flags
+} IoRingOp;
+
+/**
+ * A single io_uring request to be submitted via SystemNative_IoRingSubmit.
+ * Exactly one of (Buffer, BufferLength) or (Vectors, VectorCount) is used, depending on OpCode.
+ */
+typedef struct
+{
+    int32_t OpCode;      // IoRingOp
+    intptr_t Fd;
+    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops
+    uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write / IoRingOp_Recv / IoRingOp_Send
+    int32_t BufferLength;
+    IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
+    int32_t VectorCount;
+    int32_t Flags;       // MSG_* flags for IoRingOp_Recv / IoRingOp_Send; accept flags for IoRingOp_Accept
+    uint8_t* SockAddr;   // used by IoRingOp_Accept (output, peer address) / IoRingOp_Connect (input, destination address)
+    int32_t* SockAddrLen; // in/out length of SockAddr: Accept writes the actual peer address length back into it;
+                          // Connect reads it once, by value, as the input address length
+    uint64_t UserData;   // opaque correlation token, echoed back in the matching IoRingCompletion
+} IoRingRequest;
+
+/**
+ * A single io_uring completion, as reaped via SystemNative_IoRingWaitForCompletions.
+ */
+typedef struct
+{
+    uint64_t UserData; // matches the UserData of the IoRingRequest that produced this completion
+    int32_t Result;    // number of bytes transferred on success, or -errno on failure
+    uint32_t Flags;    // raw CQE flags (e.g. IORING_CQE_F_MORE)
+} IoRingCompletion;
+
+/**
+ * Determines whether io_uring is usable on this system (kernel support, not blocked by
+ * seccomp/sysctl, etc.). This performs a real io_uring_setup/close probe and caches the result.
+ *
+ * Returns 1 if io_uring is available, 0 if not.
+ */
+PALEXPORT int32_t SystemNative_IoRingIsAvailable(void);
+
+/**
+ * Creates a new io_uring instance with the requested submission/completion queue depths.
+ *
+ * If singleIssuer is non-zero, requests IORING_SETUP_SINGLE_ISSUER together with
+ * IORING_SETUP_DEFER_TASKRUN: from that point on, the kernel requires every
+ * SystemNative_IoRingSubmit/SystemNative_IoRingKick/SystemNative_IoRingWaitForCompletions call for
+ * this ring to come from a single, fixed OS thread for the ring's entire lifetime - specifically,
+ * whichever thread called this function to create it (not merely whichever thread happens to make
+ * the first io_uring_enter(2) call afterwards - confirmed empirically, not documented in the man
+ * page). Any other thread's call fails with -EEXIST. This includes plain completion-wait calls
+ * with nothing to submit, so submission and completion-reaping cannot be split across two
+ * different threads when singleIssuer is requested - both roles must be owned by the one thread
+ * that created the ring. DEFER_TASKRUN additionally means SystemNative_IoRingWaitForCompletions
+ * must be called periodically by that same thread even when nothing is known to be ready, or
+ * completions will never be posted to the CQ ring at all (see that function's doc comment).
+ * If singleIssuer is zero, no such flags are requested: the created ring can be shared by many
+ * different threads, both for submission and (over time, as some rotating "driver" role) for
+ * reaping completions.
+ *
+ * Returns 0 on success (with *ringHandle set to an opaque, non-zero handle);
+ * otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle);
+
+/**
+ * Fills one SQE per request and publishes them to the ring's kernel-visible submission queue
+ * tail, but does *not* call io_uring_enter(2) - see SystemNative_IoRingKick for that. Not
+ * thread-safe with itself: the caller must serialize concurrent calls to this function for a
+ * given ring (e.g. via a lock), since it touches this ring's local (non-atomic) submission-queue
+ * bookkeeping - this mirrors liburing's own documented thread-safety contract for its
+ * submission-side functions (io_uring_get_sqe/io_uring_submit).
+ *
+ * Returns 0 on success (with *submittedCount set to the number of requests actually queued
+ * into the ring's submission queue - i.e., durably published and guaranteed to eventually
+ * produce a matching completion once SystemNative_IoRingKick is called). A return of 0 with
+ * *submittedCount less than requestCount means the submission queue was full; the caller should
+ * retry the remaining requests later. Returns -1 and sets errno only when no requests at all
+ * could be queued due to a genuine failure (e.g., an invalid ring handle).
+ */
+PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
+
+/**
+ * Asks the kernel to start processing any requests already published via
+ * SystemNative_IoRingSubmit. The caller must serialize this with submission and completion
+ * reaping. For single-issuer rings, all three run on the creating thread.
+ *
+ * Returns 0 on success; otherwise, returns -1 and sets errno. A failure here does not mean the
+ * previously-published requests were lost. Unconsumed entries, including those remaining after
+ * a short successful submission, remain pending for a later kick or completion wait.
+ */
+PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
+
+/**
+ * Creates an eventfd and registers it with the given ring via IORING_REGISTER_EVENTFD: from then
+ * on, the kernel bumps that eventfd's counter (making it readable) every time a CQE is posted to
+ * this ring's completion queue. The returned fd is also safe for any *other* thread to write to
+ * directly (see SystemNative_EventFdWrite) to piggyback its own wake-up onto the same fd a single
+ * waiter is blocked on in SystemNative_EventFdWait - this lets one blocking wait call respond to
+ * either "a completion is ready" or "a new request was enqueued" without polling.
+ *
+ * Returns the eventfd on success (also owned by, and closed together with, ringHandle); returns
+ * -1 and sets errno on failure.
+ */
+PALEXPORT int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle);
+
+/**
+ * Bumps the given eventfd's counter by 1, making it readable. Safe to call from any thread,
+ * concurrently with other writers and/or with a reader blocked in SystemNative_EventFdWait.
+ *
+ * Returns 0 on success; otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_EventFdWrite(int32_t eventFd);
+
+/**
+ * Blocks the calling thread (a real, non-spinning kernel wait - see poll(2)) until the given
+ * eventfd becomes readable or timeoutMilliseconds elapses (pass -1 to block indefinitely). If it
+ * becomes readable, drains its counter back to 0 before returning, so a subsequent call only
+ * returns once a *new* event has occurred - the same "wait, then reset" pattern a
+ * ManualResetEventSlim-based design would use, but implemented with a real kernel-level wait
+ * instead of any userland spin-before-blocking behavior.
+ *
+ * Returns 1 if the fd became readable, 0 if the call timed out, or -1 (with errno set) on error.
+ */
+PALEXPORT int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilliseconds);
+
+/**
+ * Reaps completions from the given ring's completion queue, waiting in-kernel for at least
+ * minComplete of them to be available. With minComplete == 0 and TASKRUN_FLAG enabled, an enter
+ * is needed only for pending submissions, deferred task-work, or CQ overflow. Other rings
+ * conservatively enter on each call. GETEVENTS processes deferred task-work before copying CQEs.
+ * The enter also submits any SQEs already published to the SQ tail
+ * (e.g. via SystemNative_IoRingSubmit) but not yet asked the kernel to process - the caller does
+ * not need to separately call SystemNative_IoRingKick before this to have such entries picked up;
+ * calling this instead of Kick+WaitForCompletions separately saves a syscall. Short submissions
+ * may require an additional GETEVENTS-only call. The caller must serialize this with submission
+ * and kicks, using the creating thread for single-issuer rings.
+ *
+ * Returns 0 on success (with *completedCount set to the number of completions written into
+ * the completions buffer, up to maxCompletions); otherwise, returns -1 and sets errno.
+ * EAGAIN leaves published SQEs pending; the caller must retry after allowing kernel progress.
+ */
+PALEXPORT int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingCompletion* completions, int32_t maxCompletions, int32_t minComplete, int32_t* completedCount);
+
+/**
+ * Closes the given ring, unmapping its shared memory regions and closing its file descriptor.
+ *
+ * Returns 0 on success; otherwise, returns -1 and sets errno.
+ */
+PALEXPORT int32_t SystemNative_IoRingClose(intptr_t ringHandle);
