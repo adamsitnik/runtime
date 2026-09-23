@@ -243,9 +243,6 @@
   <data name="net_io_readfailure" xml:space="preserve">
     <value>Unable to read data from the transport connection: {0}.</value>
   </data>
-  <data name="net_sockets_multishot_receive_in_progress" xml:space="preserve">
-    <value>A multishot receive enumeration is already active on this socket.</value>
-  </data>
   <data name="net_io_invalidasyncresult" xml:space="preserve">
     <value>The IAsyncResult object was not returned from the corresponding asynchronous method on this class.</value>
   </data>

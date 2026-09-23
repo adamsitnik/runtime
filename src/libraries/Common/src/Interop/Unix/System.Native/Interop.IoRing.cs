@@ -21,7 +21,6 @@ internal static partial class Interop
             Send = 7,
             AcceptMultishot = 8,
             Cancel = 9,
-            RecvMultishot = 10,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -48,8 +47,6 @@ internal static partial class Interop
         internal struct IoRingCompletion
         {
             public const uint More = 1 << 1;
-            public const uint Buffer = 1;
-            public const int BufferShift = 16;
 
             public ulong UserData;
             public int Result;
@@ -80,12 +77,6 @@ internal static partial class Interop
         // waiter is blocked on in EventFdWait - see PortableThreadPool.IoUring.Unix.cs.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterEventFd", SetLastError = true)]
         internal static partial int IoRingRegisterEventFd(IntPtr ringHandle);
-
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterBufferRing", SetLastError = true)]
-        internal static unsafe partial int IoRingRegisterBufferRing(IntPtr ringHandle, byte* buffers, int bufferSize, int bufferCount);
-
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingReturnBuffers", SetLastError = true)]
-        internal static unsafe partial int IoRingReturnBuffers(IntPtr ringHandle, ushort* bufferIds, int count);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_EventFdWrite", SetLastError = true)]
         internal static partial int EventFdWrite(int eventFd);

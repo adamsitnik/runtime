@@ -82,7 +82,6 @@ namespace System.Threading
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive in a future iteration.
             private const int QueueDepth = 1024;
-            private const int CompletionQueueDepth = QueueDepth * 4;
             private const ulong OperationSlotTag = 1;
             private const int OperationSlotGenerationShift = 32;
 
@@ -152,12 +151,6 @@ namespace System.Threading
                 public uint Generation;
             }
 
-            private interface IMultishotOperation
-            {
-                bool TryBeginSubmission();
-                void OnCompletion(Interop.Sys.IoRingCompletion completion);
-            }
-
             /// <summary>
             /// Per-shard state: one independent <c>IORING_SETUP_SINGLE_ISSUER</c> ring, its own
             /// submission/completion queues, wake-eventfd, and dedicated issuer thread. See this type's
@@ -188,8 +181,6 @@ namespace System.Threading
                 // fails due to this queue being "full".
                 public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingSubmissions = new();
                 public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingCancellations = new();
-                public readonly ConcurrentQueue<MultishotReceiveOperation> ReceiveUpdates = new();
-                public ReceiveBufferPool? ReceiveBuffers;
 
                 // An eventfd registered with this ring via IORING_REGISTER_EVENTFD (see
                 // Interop.Sys.IoRingRegisterEventFd), or -1 if unavailable. The kernel bumps its counter
@@ -229,8 +220,6 @@ namespace System.Threading
                         FreeOperationSlots.Enqueue(i);
                     }
                 }
-
-                public void InitializeReceiveBuffers() => ReceiveBuffers = ReceiveBufferPool.Create(this);
             }
 
 #pragma warning disable CA1810 // remove the explicit static constructor
@@ -281,7 +270,7 @@ namespace System.Threading
                         // thread (which just called io_uring_setup(2) here, and will be the only thread
                         // that ever touches this ring from now on) ever touches it, so the kernel can skip
                         // its internal ring-wide lock.
-                        int result = Interop.Sys.IoRingCreate(QueueDepth, CompletionQueueDepth, singleIssuer: 1, out IntPtr ringHandle);
+                        int result = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, out IntPtr ringHandle);
                         created = result == 0;
                         ring.RingHandle = ringHandle;
 
@@ -289,14 +278,6 @@ namespace System.Threading
                         {
                             ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
                             created = ring.WakeEventFd >= 0;
-                        }
-                        if (created)
-                        {
-                            ring.InitializeReceiveBuffers();
-                        }
-                        else if (ringHandle != IntPtr.Zero)
-                        {
-                            Interop.Sys.IoRingClose(ringHandle);
                         }
 
                         readyToRun.Set();
@@ -310,14 +291,7 @@ namespace System.Threading
                             // point the constructor no longer depends on this thread for anything, so it
                             // (and every other ring's handshake still pending) will finish and return
                             // almost immediately, unblocking this call.
-                            if (IsEnabled)
-                            {
-                                IssuerLoop(ring);
-                            }
-                            else
-                            {
-                                Interop.Sys.IoRingClose(ringHandle);
-                            }
+                            IssuerLoop(ring);
                         }
                     })
                     {
@@ -479,10 +453,7 @@ namespace System.Threading
                 // the issuer's own post-reset recheck of the queue.
                 if (Interlocked.Exchange(ref ring.WakeSignaled, 1) == 0)
                 {
-                    if (Interop.Sys.EventFdWrite(ring.WakeEventFd) != 0)
-                    {
-                        Environment.FailFast($"io_uring eventfd wake failed: {Marshal.GetLastPInvokeError()}.");
-                    }
+                    Interop.Sys.EventFdWrite(ring.WakeEventFd);
                 }
             }
 
@@ -509,17 +480,10 @@ namespace System.Threading
 
                 while (true)
                 {
-                    ring.ReceiveBuffers?.PublishReturns();
-                    int updateBudget = MaxRequestsPerSubmitBatch;
-                    while (updateBudget-- > 0 && ring.ReceiveUpdates.TryDequeue(out MultishotReceiveOperation? receive))
-                    {
-                        receive.ProcessUpdate();
-                    }
                     DrainAndSubmit(ring, submitBatch, completionsBatch, workItemBatch);
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, workItemBatch);
 
-                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty ||
-                        !ring.ReceiveUpdates.IsEmpty || ring.ReceiveBuffers?.HasReturns == true)
+                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty)
                     {
                         // Something was enqueued while we were draining; go around again immediately
                         // instead of waiting.
@@ -534,8 +498,7 @@ namespace System.Threading
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
                     Volatile.Write(ref ring.WakeSignaled, 0);
-                    if (!ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty ||
-                        !ring.ReceiveUpdates.IsEmpty || ring.ReceiveBuffers?.HasReturns == true)
+                    if (!ring.PendingSubmissions.IsEmpty || !ring.PendingCancellations.IsEmpty)
                     {
                         continue;
                     }
@@ -566,7 +529,7 @@ namespace System.Threading
                     if ((request.UserData & MultishotOperationTag) != 0)
                     {
                         GCHandle token = GCHandle.FromIntPtr((IntPtr)(nuint)(request.UserData & ~MultishotOperationTag));
-                        IMultishotOperation operation = (IMultishotOperation)token.Target!;
+                        MultishotAcceptOperation operation = (MultishotAcceptOperation)token.Target!;
                         if (!operation.TryBeginSubmission())
                         {
                             operation.OnCompletion(new Interop.Sys.IoRingCompletion
@@ -686,7 +649,7 @@ namespace System.Threading
                                     ring.MultishotCount--;
                                 }
                                 GCHandle handle = GCHandle.FromIntPtr((IntPtr)(nuint)(completion.UserData & ~MultishotOperationTag));
-                                ((IMultishotOperation)handle.Target!).OnCompletion(completion);
+                                ((MultishotAcceptOperation)handle.Target!).OnCompletion(completion);
                             }
                             else
                             {

@@ -924,7 +924,6 @@ typedef enum
     IoRingOp_Send = 7,    // send(2)-like single buffer write to a socket; Flags carries MSG_* flags
     IoRingOp_AcceptMultishot = 8,
     IoRingOp_Cancel = 9,  // Offset contains the target request's user_data
-    IoRingOp_RecvMultishot = 10,
 } IoRingOp;
 
 /**
@@ -1029,19 +1028,6 @@ PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
  * -1 and sets errno on failure.
  */
 PALEXPORT int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle);
-
-/**
- * Registers provided-buffer group zero and publishes bufferCount buffers of bufferSize bytes.
- * Storage must remain valid until the ring is closed. Called once on the creating issuer thread.
- * Returns -1 with errno ENOTSUP/EINVAL on unsupported headers/kernels.
- */
-PALEXPORT int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, uint8_t* buffers, int32_t bufferSize, int32_t bufferCount);
-
-/**
- * Returns consumed buffers to group zero with one release publication and no syscall.
- * Only the issuer may call this; each buffer must be returned exactly once after its CQE.
- */
-PALEXPORT int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferIds, int32_t count);
 
 /**
  * Bumps the given eventfd's counter by 1, making it readable. Safe to call from any thread,

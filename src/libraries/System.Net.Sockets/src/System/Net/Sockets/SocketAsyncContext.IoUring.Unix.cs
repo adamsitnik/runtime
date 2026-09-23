@@ -13,7 +13,6 @@ namespace System.Net.Sockets
     internal sealed partial class SocketAsyncContext
     {
         private IoUringReceiveOperation? _cachedIoUringReceiveOperation;
-        private IoUringSendOperation? _cachedIoUringSendOperation;
 
         /// <summary>
         /// Attempts to complete a plain, single-buffer, no-destination-address Receive via io_uring
@@ -93,120 +92,28 @@ namespace System.Net.Sockets
         /// instead of registering the socket for epoll-based readiness notification. See
         /// <see cref="TryReceiveViaIoUring"/> for the submission/callback contract.
         /// </summary>
-        private bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, int bytesSent, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        private unsafe bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
             if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
             {
                 return false;
             }
 
-            IoUringSendOperation operation = Interlocked.Exchange(ref _cachedIoUringSendOperation, null)
-                ?? new IoUringSendOperation(this);
-            return operation.TrySubmit(buffer, offset, count, bytesSent, callback);
-        }
+            MemoryHandle pin = buffer.Pin();
+            byte* bufferPtr = (byte*)pin.Pointer + offset;
+            bool submitted = System.Threading.IoUring.TrySubmitSend(
+                _socket,
+                bufferPtr,
+                count,
+                0,
+                result => CompleteReceiveOrSend(pin, callback, result));
 
-        private sealed class IoUringSendOperation
-        {
-            private readonly SocketAsyncContext _context;
-            private readonly Action<int> _onCompleted;
-            private MemoryHandle _pin;
-            private Action<int, Memory<byte>, SocketFlags, SocketError>? _callback;
-            private int _offset;
-            private int _remaining;
-            private int _bytesTransferred;
-
-            internal IoUringSendOperation(SocketAsyncContext context)
+            if (!submitted)
             {
-                _context = context;
-                _onCompleted = Complete;
-            }
-
-            internal bool TrySubmit(Memory<byte> buffer, int offset, int count, int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
-            {
-                bool submitted = false;
-                try
-                {
-                    _pin = buffer.Pin();
-                    _callback = callback;
-                    _offset = offset;
-                    _remaining = count;
-                    _bytesTransferred = bytesSent;
-                    submitted = SubmitRemaining();
-                    return submitted;
-                }
-                finally
-                {
-                    if (!submitted)
-                    {
-                        MemoryHandle pin = _pin;
-                        Return();
-                        pin.Dispose();
-                    }
-                }
-            }
-
-            private unsafe bool SubmitRemaining() => IoUring.TrySubmitSend(
-                _context._socket, (byte*)_pin.Pointer + _offset, _remaining, 0, _onCompleted);
-
-            private void Complete(int result)
-            {
-                if (result < 0)
-                {
-                    Finish(SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error));
-                    return;
-                }
-                _bytesTransferred += result;
-                _offset += result;
-                _remaining -= result;
-                if (_remaining == 0)
-                {
-                    Finish(SocketError.Success);
-                    return;
-                }
-                if (result == 0)
-                {
-                    Finish(SocketError.ConnectionReset);
-                    return;
-                }
-
-                try
-                {
-                    if (SubmitRemaining())
-                    {
-                        return;
-                    }
-                }
-                catch (ObjectDisposedException)
-                {
-                    Finish(SocketError.OperationAborted);
-                    return;
-                }
-                catch
-                {
-                    MemoryHandle pin = _pin;
-                    Return();
-                    pin.Dispose();
-                    throw;
-                }
-                Finish(SocketError.OperationNotSupported);
-            }
-
-            private void Finish(SocketError error)
-            {
-                MemoryHandle pin = _pin;
-                Action<int, Memory<byte>, SocketFlags, SocketError> callback = _callback!;
-                int bytesTransferred = _bytesTransferred;
-                Return();
                 pin.Dispose();
-                callback(bytesTransferred, Memory<byte>.Empty, SocketFlags.None, error);
             }
 
-            private void Return()
-            {
-                _pin = default;
-                _callback = null;
-                Interlocked.CompareExchange(ref _context._cachedIoUringSendOperation, this, null);
-            }
+            return submitted;
         }
 
         private static void CompleteReceiveOrSend(MemoryHandle pin, Action<int, Memory<byte>, SocketFlags, SocketError> callback, int result)

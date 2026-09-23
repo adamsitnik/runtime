@@ -69,7 +69,7 @@ internal sealed partial class PortableThreadPool
             return operation?.Cancel() ?? false;
         }
 
-        private sealed class MultishotAcceptOperation : IThreadPoolWorkItem, IMultishotOperation
+        private sealed class MultishotAcceptOperation : IThreadPoolWorkItem
         {
             private const int MaxPendingCompletions = 64;
             private readonly Ring _ring;
@@ -118,7 +118,7 @@ internal sealed partial class PortableThreadPool
                 WakeIssuer(_ring);
             }
 
-            public bool TryBeginSubmission()
+            internal bool TryBeginSubmission()
             {
                 lock (_lock)
                 {
@@ -174,7 +174,7 @@ internal sealed partial class PortableThreadPool
                 }
             }
 
-            public void OnCompletion(Interop.Sys.IoRingCompletion completion)
+            internal void OnCompletion(Interop.Sys.IoRingCompletion completion)
             {
                 bool terminal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
                 if (terminal)

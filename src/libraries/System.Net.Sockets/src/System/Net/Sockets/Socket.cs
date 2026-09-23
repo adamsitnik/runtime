@@ -3424,7 +3424,6 @@ namespace System.Net.Sockets
             SetToDisconnected();
 
             CancelMultishotAccept();
-            CancelMultishotReceive();
 
             SafeSocketHandle? handle = _handle;
             if (handle is not null)
