@@ -324,7 +324,9 @@ namespace System.Threading
                             currentThread.ResetThreadPoolThread();
                         }
 
-                        Volatile.Write(ref _dispatchRequested, 0);
+                        // Publish the reset before checking for work so neither side can miss
+                        // the other's publication and leave a completion without a drainer.
+                        Interlocked.Exchange(ref _dispatchRequested, 0);
 
                         if (_pending.IsEmpty || Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) != 0)
                         {

@@ -590,7 +590,7 @@ namespace System.Threading
                     // cycle, so skipped its own EventFdWrite, right before we set it back to 0) - the
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
-                    Volatile.Write(ref ring.WakeSignaled, 0);
+                    Interlocked.Exchange(ref ring.WakeSignaled, 0);
                     if (!ring.PendingSubmissions.IsEmpty)
                     {
                         continue;

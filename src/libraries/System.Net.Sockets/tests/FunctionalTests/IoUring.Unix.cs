@@ -533,6 +533,76 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalFact(nameof(IsSupported))]
+        [OuterLoop]
+        public void Multishot_RepeatedPendingReceiveBursts_DoNotLoseWakeup()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                const int ConnectionCount = 64;
+                const int BatchCount = 15000;
+                Socket[] senders = new Socket[ConnectionCount];
+                Socket[] receivers = new Socket[ConnectionCount];
+                IAsyncEnumerator<IMemoryOwner<byte>>[] readers = new IAsyncEnumerator<IMemoryOwner<byte>>[ConnectionCount];
+                ValueTask<bool>[] pending = new ValueTask<bool>[ConnectionCount];
+                byte[] payload = new byte[128];
+                using CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout);
+                try
+                {
+                    for (int i = 0; i < ConnectionCount; i++)
+                    {
+                        (senders[i], receivers[i]) = SocketTestExtensions.CreateConnectedSocketPair();
+                        senders[i].NoDelay = true;
+                        readers[i] = receivers[i].ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                    }
+
+                    for (int batch = 0; batch < BatchCount; batch++)
+                    {
+                        for (int i = 0; i < ConnectionCount; i++)
+                        {
+                            pending[i] = readers[i].MoveNextAsync();
+                        }
+                        foreach (Socket sender in senders)
+                        {
+                            Assert.Equal(payload.Length, sender.Send(payload));
+                        }
+                        for (int i = 0; i < ConnectionCount; i++)
+                        {
+                            int received = 0;
+                            do
+                            {
+                                Assert.True(await pending[i]);
+                                using (IMemoryOwner<byte> owner = readers[i].Current)
+                                {
+                                    received += owner.Memory.Length;
+                                    Assert.True(owner.Memory.Span.IndexOfAnyExcept((byte)0) < 0);
+                                }
+                                if (received < payload.Length)
+                                {
+                                    pending[i] = readers[i].MoveNextAsync();
+                                }
+                            } while (received < payload.Length);
+                            Assert.Equal(payload.Length, received);
+                        }
+                        cancellation.CancelAfter(TestSettings.PassingTestTimeout);
+                    }
+                }
+                finally
+                {
+                    cancellation.Cancel();
+                    for (int i = 0; i < ConnectionCount; i++)
+                    {
+                        senders[i]?.Dispose();
+                        receivers[i]?.Dispose();
+                        if (readers[i] is not null)
+                        {
+                            await readers[i].DisposeAsync();
+                        }
+                    }
+                }
+            }, CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
         public void Multishot_EarlyBreakDrainsQueuedBuffers()
         {
             RemoteInvokeOptions options = CreateOptions(1);
