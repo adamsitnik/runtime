@@ -47,20 +47,14 @@ namespace System.Net.Sockets
             SafeSocketHandle handle = _handle;
             bool cancellationRequested = false;
 
-            // Unbounded - the issuer thread that dispatches completions must never be made to block on
-            // this channel filling up; consumption speed is entirely up to the caller's enumeration
-            // pace. SingleReader because an IAsyncEnumerable is consumed by exactly one thread at a
-            // time. SingleWriter = true: this same still-active submission's completions are always
-            // delivered by MultishotReceiveOperation's own single active drainer (see
-            // PortableThreadPool.IoUring.Receive.Unix.cs) - never by two Thread Pool worker threads
-            // concurrently - so this write is already effectively single-writer, letting the channel
-            // skip its internal writer synchronization. Verified under a dedicated multi-producer stress
-            // test (see IoUringTests) hammering many concurrent multishot receives with
-            // SingleWriter = true before this was enabled.
+            // Completion callbacks have one active worker drainer, and enumeration has one consumer.
+            // Inline continuations avoid another worker hop; the finite provided-buffer pool bounds
+            // how many leases can be queued even though the channel itself is unbounded.
             Channel<IMemoryOwner<byte>> channel = Channel.CreateUnbounded<IMemoryOwner<byte>>(new UnboundedChannelOptions
             {
                 SingleReader = true,
                 SingleWriter = true,
+                AllowSynchronousContinuations = true,
             });
 
             void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
@@ -77,7 +71,7 @@ namespace System.Net.Sockets
                     // instead of the raw (usually -ECANCELED) SocketException.
                     Exception? error = result >= 0
                         ? null
-                        : cancellationRequested
+                        : Volatile.Read(ref cancellationRequested)
                             ? new OperationCanceledException(cancellationToken)
                             : new SocketException((int)SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error));
                     channel.Writer.TryComplete(error);
@@ -95,16 +89,19 @@ namespace System.Net.Sockets
             using CancellationTokenRegistration registration = cancellationToken.CanBeCanceled
                 ? cancellationToken.UnsafeRegister(_ =>
                 {
-                    cancellationRequested = true;
+                    Volatile.Write(ref cancellationRequested, true);
                     operation!.RequestCancellation();
                 }, null)
                 : default;
 
             try
             {
-                await foreach (IMemoryOwner<byte> buffer in channel.Reader.ReadAllAsync(CancellationToken.None).ConfigureAwait(false))
+                while (await channel.Reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
                 {
-                    yield return buffer;
+                    while (channel.Reader.TryRead(out IMemoryOwner<byte>? buffer))
+                    {
+                        yield return buffer;
+                    }
                 }
             }
             finally
@@ -113,14 +110,22 @@ namespace System.Net.Sockets
                 // underlying receive is still active - request its cancellation so the kernel
                 // eventually stops producing completions for it instead of leaking an in-flight
                 // multishot receive. A no-op if it already completed on its own.
+                Volatile.Write(ref cancellationRequested, true);
                 operation!.RequestCancellation();
-
-                // Return any buffers that arrived but were never yielded - either because enumeration
-                // stopped early, or because they raced in after the final completion was already
-                // observed above.
-                while (channel.Reader.TryRead(out IMemoryOwner<byte>? leftover))
+                try
                 {
-                    leftover.Dispose();
+                    // Cancellation is asynchronous. Keep returning unyielded leases until the
+                    // terminal callback, including completions queued behind this continuation.
+                    while (await channel.Reader.WaitToReadAsync(CancellationToken.None).ConfigureAwait(false))
+                    {
+                        while (channel.Reader.TryRead(out IMemoryOwner<byte>? leftover))
+                        {
+                            leftover.Dispose();
+                        }
+                    }
+                }
+                catch (OperationCanceledException) when (Volatile.Read(ref cancellationRequested))
+                {
                 }
             }
         }

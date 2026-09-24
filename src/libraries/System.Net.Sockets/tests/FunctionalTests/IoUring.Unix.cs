@@ -532,6 +532,37 @@ namespace System.Net.Sockets.Tests
             }, new RemoteInvokeOptions { StartInfo = { Environment = { ["DOTNET_USE_IO_URING"] = "0" } } }).Dispose();
         }
 
+        [ConditionalFact(nameof(IsSupported))]
+        public void Multishot_EarlyBreakDrainsQueuedBuffers()
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "4";
+            RemoteExecutor.Invoke(async () =>
+            {
+                LimitThreadPoolToOneWorker();
+                byte[] bytes = new byte[65536];
+                for (int iteration = 0; iteration < 16; iteration++)
+                {
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    using (CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout))
+                    {
+                        int sent = 0;
+                        while (sent < bytes.Length)
+                        {
+                            sent += sender.Send(bytes.AsSpan(sent));
+                        }
+                        await foreach (IMemoryOwner<byte> owner in receiver.ReceiveMultishotAsync(cancellation.Token))
+                        {
+                            owner.Dispose();
+                            break;
+                        }
+                    }
+                }
+            }, options).Dispose();
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1)]
         [InlineData(3)]
