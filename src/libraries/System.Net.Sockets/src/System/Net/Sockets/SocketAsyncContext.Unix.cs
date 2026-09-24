@@ -1510,7 +1510,9 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && !cancellationToken.CanBeCanceled && TryAcceptViaIoUring(socketAddress, callback))
+            // TODO: io_uring: Add accept cancellation support. Cancellation is intentionally
+            // unsupported while we compare io_uring performance against epoll.
+            if (ready && TryAcceptViaIoUring(socketAddress, callback))
             {
                 acceptedFd = (IntPtr)(-1);
                 socketAddressLen = 0;
