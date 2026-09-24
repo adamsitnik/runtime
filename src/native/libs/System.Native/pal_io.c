@@ -103,7 +103,9 @@ extern int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
 
 #if HAVE_LINUX_IO_URING_H
 // The CMake HAVE_LINUX_IO_URING_H check also verifies that __NR_io_uring_setup/enter/register
-// are defined by <sys/syscall.h>, so no fallback definitions are needed here.
+// are defined by <sys/syscall.h>, and that IORING_RECV_MULTISHOT/IORING_REGISTER_PBUF_RING/
+// struct io_uring_buf_ring/IOSQE_BUFFER_SELECT (multishot receive with ring-mapped provided
+// buffers) are available, so no fallback definitions are needed here.
 #include <linux/io_uring.h>
 #include <stdatomic.h>
 #include <sys/eventfd.h>
@@ -2237,6 +2239,15 @@ typedef struct
     uint32_t* CqRingMask;
     struct io_uring_cqe* Cqes;
     bool HasTaskRunFlag;
+
+    // Provided-buffer group zero (SystemNative_IoRingRegisterBufferRing), used by
+    // IoRingOp_RecvMultishot. BufferRing is NULL until registered; BufferStorage is the
+    // natively-allocated (page-aligned), ring-owned backing store for all of its buffers.
+    struct io_uring_buf_ring* BufferRing;
+    size_t BufferRingSize;
+    uint8_t* BufferStorage;
+    uint32_t BufferSize;
+    uint32_t BufferCount;
 } IoRing;
 
 static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
@@ -2350,6 +2361,23 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 #if defined(IORING_RECVSEND_POLL_FIRST)
             sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
 #endif
+            break;
+        case IoRingOp_Cancel:
+            // Targets a still-pending request by its own user_data (addr), looked up within this
+            // same ring - the target request must have been submitted to the very ring this
+            // cancellation is submitted to (every request for a given fd is routed to the same
+            // ring, so this holds as long as the caller resolves the target ring the same way).
+            sqe->opcode = IORING_OP_ASYNC_CANCEL;
+            sqe->addr = (uint64_t)request->Offset;
+            break;
+        case IoRingOp_RecvMultishot:
+            // No Buffer/BufferLength: the kernel selects a buffer from provided-buffer group
+            // zero (registered via SystemNative_IoRingRegisterBufferRing) for each completion.
+            sqe->opcode = IORING_OP_RECV;
+            sqe->ioprio = IORING_RECV_MULTISHOT;
+            sqe->flags = IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 0;
+            sqe->msg_flags = (uint32_t)request->Flags;
             break;
     }
 }
@@ -2639,6 +2667,119 @@ int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle)
 #endif
 }
 
+int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, int32_t bufferSize, int32_t bufferCount, uint8_t** bufferStorage)
+{
+    assert(bufferStorage != NULL);
+    *bufferStorage = NULL;
+
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    // bufferCount must be a power of two (io_uring_buf_ring indexing masks the tail with it) and
+    // small enough that neither the ring-entries array nor the total buffer storage can overflow.
+    if (ring == NULL || ring->BufferRing != NULL || bufferSize <= 0 || bufferCount <= 0 ||
+        bufferCount > 32768 || (bufferCount & (bufferCount - 1)) != 0 ||
+        (size_t)bufferCount > SIZE_MAX / (size_t)bufferSize)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t storageSize = (size_t)bufferCount * (size_t)bufferSize;
+    uint8_t* storage = NULL;
+    // Page-aligned so each buffer's backing pages are dedicated to it (no false sharing with
+    // unrelated heap data), matching what the kernel itself expects to pin for I/O.
+    int allocError = posix_memalign((void**)&storage, (size_t)sysconf(_SC_PAGESIZE), storageSize);
+    if (allocError != 0)
+    {
+        errno = allocError;
+        return -1;
+    }
+
+    size_t ringSize = (size_t)bufferCount * sizeof(struct io_uring_buf);
+    struct io_uring_buf_ring* bufferRing = mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (bufferRing == MAP_FAILED)
+    {
+        int savedErrno = errno;
+        free(storage);
+        errno = savedErrno;
+        return -1;
+    }
+
+    struct io_uring_buf_reg registration;
+    memset(&registration, 0, sizeof(registration));
+    registration.ring_addr = (uint64_t)(uintptr_t)bufferRing;
+    registration.ring_entries = (uint32_t)bufferCount;
+    if (IoUringRegister(ring->Fd, IORING_REGISTER_PBUF_RING, &registration, 1) < 0)
+    {
+        int savedErrno = errno;
+        munmap(bufferRing, ringSize);
+        free(storage);
+        errno = savedErrno;
+        return -1;
+    }
+
+    ring->BufferRing = bufferRing;
+    ring->BufferRingSize = ringSize;
+    ring->BufferStorage = storage;
+    ring->BufferSize = (uint32_t)bufferSize;
+    ring->BufferCount = (uint32_t)bufferCount;
+    for (uint32_t i = 0; i < (uint32_t)bufferCount; i++)
+    {
+        bufferRing->bufs[i].addr = (uint64_t)(uintptr_t)(storage + (size_t)i * (size_t)bufferSize);
+        bufferRing->bufs[i].len = (uint32_t)bufferSize;
+        bufferRing->bufs[i].bid = (uint16_t)i;
+    }
+    // Release semantics: pairs with the kernel's acquire load of tail before it reads any bufs[]
+    // entry it now considers published.
+    __atomic_store_n(&bufferRing->tail, (uint16_t)bufferCount, __ATOMIC_RELEASE);
+
+    *bufferStorage = storage;
+    return 0;
+#else
+    (void)ringHandle, (void)bufferSize, (void)bufferCount;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferIds, int32_t count)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL || ring->BufferRing == NULL || count < 0 || (uint32_t)count > ring->BufferCount ||
+        (count != 0 && bufferIds == NULL))
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // No syscall: republishing consumed buffer ids is purely a userspace ring-buffer append,
+    // exactly like SystemNative_IoRingSubmit is for SQEs, just for provided buffers instead.
+    uint16_t tail = ring->BufferRing->tail;
+    for (int32_t i = 0; i < count; i++)
+    {
+        uint16_t id = bufferIds[i];
+        if (id >= ring->BufferCount)
+        {
+            errno = EINVAL;
+            return -1;
+        }
+        struct io_uring_buf* buffer = &ring->BufferRing->bufs[(uint16_t)(tail + (uint16_t)i) & (uint16_t)(ring->BufferCount - 1)];
+        buffer->addr = (uint64_t)(uintptr_t)(ring->BufferStorage + (size_t)id * ring->BufferSize);
+        buffer->len = ring->BufferSize;
+        buffer->bid = id;
+        // Do not touch resv: in the slot that currently aliases the ring's published tail this
+        // would corrupt it before the atomic store below makes the whole batch visible.
+    }
+    __atomic_store_n(&ring->BufferRing->tail, (uint16_t)(tail + (uint16_t)count), __ATOMIC_RELEASE);
+    return 0;
+#else
+    (void)ringHandle, (void)bufferIds, (void)count;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 int32_t SystemNative_EventFdWrite(int32_t eventFd)
 {
 #if HAVE_LINUX_IO_URING_H
@@ -2817,6 +2958,11 @@ int32_t SystemNative_IoRingClose(intptr_t ringHandle)
     {
         result = -1;
     }
+    if (ring->BufferRing != NULL && munmap(ring->BufferRing, ring->BufferRingSize) != 0)
+    {
+        result = -1;
+    }
+    free(ring->BufferStorage);
 
     free(ring);
     return result;

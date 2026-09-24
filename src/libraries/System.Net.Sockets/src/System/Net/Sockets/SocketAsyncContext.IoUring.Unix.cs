@@ -92,7 +92,7 @@ namespace System.Net.Sockets
         /// instead of registering the socket for epoll-based readiness notification. See
         /// <see cref="TryReceiveViaIoUring"/> for the submission/callback contract.
         /// </summary>
-        private unsafe bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        private unsafe bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
             if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
             {
@@ -106,7 +106,7 @@ namespace System.Net.Sockets
                 bufferPtr,
                 count,
                 0,
-                result => CompleteReceiveOrSend(pin, callback, result));
+                result => CompleteReceiveOrSend(pin, callback, result, bytesSent));
 
             if (!submitted)
             {
@@ -116,11 +116,11 @@ namespace System.Net.Sockets
             return submitted;
         }
 
-        private static void CompleteReceiveOrSend(MemoryHandle pin, Action<int, Memory<byte>, SocketFlags, SocketError> callback, int result)
+        private static void CompleteReceiveOrSend(MemoryHandle pin, Action<int, Memory<byte>, SocketFlags, SocketError> callback, int result, int bytesAlreadyTransferred = 0)
         {
             pin.Dispose();
 
-            int bytesTransferred = result >= 0 ? result : 0;
+            int bytesTransferred = bytesAlreadyTransferred + (result >= 0 ? result : 0);
             SocketError errorCode = result >= 0
                 ? SocketError.Success
                 : SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error);

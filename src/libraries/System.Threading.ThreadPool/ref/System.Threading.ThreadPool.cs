@@ -79,4 +79,24 @@ namespace System.Threading
     }
     public delegate void WaitCallback(object? state);
     public delegate void WaitOrTimerCallback(object? state, bool timedOut);
+    // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
+    // src/libraries/System.Private.CoreLib/src/System/Threading/PortableThreadPool.IoUring.Unix.cs for details.
+    [System.CLSCompliantAttribute(false)]
+    public interface IIoUringOperation
+    {
+        System.Threading.IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
+        void RequestCancellation();
+    }
+    // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
+    // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.Unix.cs for details.
+    [System.CLSCompliantAttribute(false)]
+    public static class IoUring
+    {
+        public static bool IsSupported { get { throw null; } }
+        public static unsafe bool TrySubmitRecv(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
+        public static unsafe bool TrySubmitSend(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
+        public static unsafe bool TrySubmitAccept(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, int flags, System.Action<int> onCompleted) { throw null; }
+        public static unsafe bool TrySubmitConnect(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, System.Action<int> onCompleted) { throw null; }
+        public static bool TrySubmitRecvMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted, out System.Threading.IIoUringOperation? operation) { throw null; }
+    }
 }

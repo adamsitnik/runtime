@@ -19,6 +19,8 @@ internal static partial class Interop
             Connect = 5,
             Recv = 6,
             Send = 7,
+            Cancel = 8,
+            RecvMultishot = 9,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -44,6 +46,15 @@ internal static partial class Interop
         [StructLayout(LayoutKind.Sequential)]
         internal struct IoRingCompletion
         {
+            // IORING_CQE_F_MORE: this is not the final completion for the request that produced
+            // it (e.g. a RecvMultishot request that is still active and will keep completing).
+            public const uint More = 1 << 1;
+            // IORING_CQE_F_BUFFER: Flags encodes the selected provided-buffer id, shifted left by
+            // BufferShift (IORING_CQE_BUFFER_SHIFT) - only set for ops that use provided buffers
+            // (RecvMultishot).
+            public const uint Buffer = 1;
+            public const int BufferShift = 16;
+
             public ulong UserData;
             public int Result;
             public uint Flags;
@@ -73,6 +84,16 @@ internal static partial class Interop
         // waiter is blocked on in EventFdWait - see PortableThreadPool.IoUring.Unix.cs.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterEventFd", SetLastError = true)]
         internal static partial int IoRingRegisterEventFd(IntPtr ringHandle);
+
+        // Allocates bufferCount page-aligned buffers of bufferSize bytes each, natively owned by
+        // (and freed together with) the ring, registers them as provided-buffer group zero, and
+        // publishes all of them. On success, *bufferStorage points at the base of that storage
+        // (buffer i occupies [bufferStorage + i * bufferSize, bufferStorage + (i + 1) * bufferSize)).
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterBufferRing", SetLastError = true)]
+        internal static unsafe partial int IoRingRegisterBufferRing(IntPtr ringHandle, int bufferSize, int bufferCount, byte** bufferStorage);
+
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingReturnBuffers", SetLastError = true)]
+        internal static unsafe partial int IoRingReturnBuffers(IntPtr ringHandle, ushort* bufferIds, int count);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_EventFdWrite", SetLastError = true)]
         internal static partial int EventFdWrite(int eventFd);

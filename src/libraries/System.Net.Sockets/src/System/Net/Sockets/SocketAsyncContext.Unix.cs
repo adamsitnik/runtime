@@ -1510,6 +1510,8 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
+            // TODO: io_uring: Add accept cancellation support. Cancellation is intentionally
+            // unsupported while we compare io_uring performance against epoll.
             if (ready && TryAcceptViaIoUring(socketAddress, callback))
             {
                 acceptedFd = (IntPtr)(-1);
@@ -2089,7 +2091,7 @@ namespace System.Net.Sockets
             }
 
             if (ready && socketAddress.Length == 0 &&
-                TrySendViaIoUring(buffer, offset, count, flags, callback))
+                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback))
             {
                 return SocketError.IOPending;
             }

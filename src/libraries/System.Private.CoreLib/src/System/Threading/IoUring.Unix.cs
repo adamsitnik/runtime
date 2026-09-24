@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Runtime.InteropServices;
 
 namespace System.Threading
@@ -68,6 +69,38 @@ namespace System.Threading
         public static unsafe bool TrySubmitConnect(SafeHandle handle, byte* sockAddr, int* sockAddrLen, Action<int> onCompleted) =>
             TrySubmitCore(handle, Interop.Sys.IoRingOp.Connect, null, 0, 0, sockAddr, sockAddrLen, onCompleted);
 
+        /// <summary>
+        /// Attempts to submit a persistent, multishot <c>recv(2)</c>-like read on
+        /// <paramref name="handle"/>: a single submission that keeps producing completions - one per
+        /// datagram/read the kernel has data for - until cancelled (via <paramref name="operation"/>'s
+        /// <see cref="IIoUringOperation.RequestCancellation"/>), EOF, or an error occurs, instead of
+        /// completing exactly once like <see cref="TrySubmitRecv"/>. Received data is delivered via
+        /// kernel-provided buffers leased from a pool, rather than a caller-supplied buffer:
+        /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
+        /// completion, with the raw result (bytes received, <c>0</c> on graceful EOF, or <c>-errno</c> on
+        /// failure), the received data (dispose it to return the buffer to the pool;
+        /// <see langword="null"/> when no data accompanies this completion), and whether the operation is
+        /// still alive and will keep producing further completions. Native submissions can be rearmed
+        /// transparently; only the logical operation's last callback reports <see langword="false"/>.
+        /// <paramref name="handle"/> is ref-counted while each native submission is in flight.
+        /// Returns <see langword="false"/> if the
+        /// operation could not be submitted (in which case <paramref name="operation"/> is
+        /// <see langword="null"/> and no callback is invoked).
+        /// </summary>
+        public static bool TrySubmitRecvMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted, out IIoUringOperation? operation)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            ArgumentNullException.ThrowIfNull(onCompleted);
+
+            if (!IsSupported)
+            {
+                operation = null;
+                return false;
+            }
+
+            return PortableThreadPool.IoUringThreadPool.TrySubmitReceiveMultishot(handle, onCompleted, out operation);
+        }
+
         private static unsafe bool TrySubmitCore(
             SafeHandle handle,
             Interop.Sys.IoRingOp opCode,
@@ -120,16 +153,15 @@ namespace System.Threading
         }
 
         /// <summary>
-        /// Adapts a plain <see cref="Action{Int32}"/> completion callback to the internal
-        /// <see cref="PortableThreadPool.IIoUringOperation"/> contract, so callers of this public
-        /// API never need to know about (or implement) that internal-only interface. Unlike a
-        /// per-thread-ring design, the shared-ring driver never runs continuations inline: this
-        /// type also implements <see cref="IThreadPoolWorkItem"/> so it can be returned from
-        /// <see cref="PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int)"/> and queued
-        /// (possibly batched together with other completions drained in the same pass) instead of
-        /// being invoked directly on the driver thread.
+        /// Adapts a plain <see cref="Action{Int32}"/> completion callback to the
+        /// <see cref="IIoUringOperation"/> contract, so callers of this public API never need to know
+        /// about (or implement) that interface. Unlike a per-thread-ring design, the shared-ring driver
+        /// never runs continuations inline: this type also implements <see cref="IThreadPoolWorkItem"/>
+        /// so it can be returned from <see cref="IIoUringOperation.CompleteFromIoUring(int, uint, long)"/>
+        /// and queued (possibly batched together with other completions drained in the same pass)
+        /// instead of being invoked directly on the driver thread.
         /// </summary>
-        private sealed class ActionIoUringOperation : IThreadPoolWorkItem, PortableThreadPool.IIoUringOperation
+        private sealed class ActionIoUringOperation : IThreadPoolWorkItem, IIoUringOperation
         {
             [ThreadStatic]
             private static ActionIoUringOperation? t_cachedOperation;
@@ -154,12 +186,17 @@ namespace System.Threading
                 t_cachedOperation ??= this;
             }
 
-            IThreadPoolWorkItem? PortableThreadPool.IIoUringOperation.CompleteFromIoUring(int result)
+            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
             {
                 // Legacy dispatch resolves completions on the issuer, so defer the user callback.
                 _result = result;
                 return this;
             }
+
+            // This type's operations (recv/send/accept/connect) complete exactly once and are not
+            // (yet) cancellable once submitted in this prototype - see IIoUringOperation.RequestCancellation's
+            // own doc comment.
+            void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
 
             void IThreadPoolWorkItem.Execute()
             {

@@ -206,6 +206,14 @@
              Link="Common\Interop\Unix\System.Native\Interop.SocketEvent.cs" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix'">
+    <Compile Include="System\Net\Sockets\Socket.Multishot.Linux.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'windows' or '$(TargetPlatformIdentifier)' == 'osx' or '$(TargetPlatformIdentifier)' == 'ios' or '$(TargetPlatformIdentifier)' == 'tvos' or '$(TargetPlatformIdentifier)' == 'wasi'">
+    <Compile Include="System\Net\Sockets\Socket.Multishot.cs" />
+  </ItemGroup>
+
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix' or '$(TargetPlatformIdentifier)' == 'wasi' or '$(TargetPlatformIdentifier)' == 'osx' or '$(TargetPlatformIdentifier)' == 'ios' or '$(TargetPlatformIdentifier)' == 'tvos'">
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Unix.cs" />
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Unix.OptionTracking.cs" />
@@ -323,6 +331,7 @@
     <ProjectReference Include="$(LibrariesProjectRoot)System.Runtime\src\System.Runtime.csproj" />
     <ProjectReference Include="$(LibrariesProjectRoot)System.Runtime.InteropServices\src\System.Runtime.InteropServices.csproj" />
     <ProjectReference Include="$(LibrariesProjectRoot)System.Threading\src\System.Threading.csproj" />
+    <ProjectReference Include="$(LibrariesProjectRoot)System.Threading.Channels\src\System.Threading.Channels.csproj" />
     <ProjectReference Include="$(LibrariesProjectRoot)System.Threading.Overlapped\src\System.Threading.Overlapped.csproj" />
     <ProjectReference Include="$(LibrariesProjectRoot)System.Threading.ThreadPool\src\System.Threading.ThreadPool.csproj" />
   </ItemGroup>

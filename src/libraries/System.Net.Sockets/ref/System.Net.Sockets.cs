@@ -400,6 +400,8 @@ namespace System.Net.Sockets
         public System.Threading.Tasks.ValueTask<int> ReceiveAsync(System.Memory<byte> buffer, System.Net.Sockets.SocketFlags socketFlags, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public System.Threading.Tasks.ValueTask<int> ReceiveAsync(System.Memory<byte> buffer, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public bool ReceiveAsync(System.Net.Sockets.SocketAsyncEventArgs e) { throw null; }
+        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
+        public System.Collections.Generic.IAsyncEnumerable<System.Buffers.IMemoryOwner<byte>> ReceiveMultishotAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public int ReceiveFrom(byte[] buffer, int offset, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, ref System.Net.EndPoint remoteEP) { throw null; }

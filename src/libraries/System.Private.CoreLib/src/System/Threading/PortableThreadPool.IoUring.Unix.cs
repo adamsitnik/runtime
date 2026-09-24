@@ -53,10 +53,13 @@ namespace System.Threading
         /// (see this file's git history / design notes) showed a single ring's issuer thread executes
         /// every socket's actual recv/poll syscall work inline as part of <c>io_uring_enter</c>, so its
         /// absolute throughput is capped regardless of how many cores are otherwise available. Every
-        /// calling thread is assigned to exactly one ring for its lifetime (see
-        /// <see cref="t_assignedRing"/>) rather than picking a ring per call, so that a given caller's
-        /// requests always land on the same ring/issuer thread instead of being scattered arbitrarily
-        /// across all of them.
+        /// request is routed to a ring by its own <c>fd</c> (see <see cref="GetRing"/>) - not by which
+        /// thread happens to be calling <see cref="TrySubmit"/> - so a given fd's requests always land
+        /// on the same ring/issuer thread regardless of which thread submits them, instead of being
+        /// scattered arbitrarily across all of them. This also makes single-fd cancellation simple: the
+        /// same <c>fd -&gt; ring</c> mapping used to submit an operation is used to find the one ring
+        /// that could possibly have it in flight, without needing to track which ring a given fd's
+        /// operation actually landed on.
         ///
         /// A second, related gotcha (also confirmed empirically via a standalone native repro, not
         /// documented in the man page): a IORING_SETUP_SINGLE_ISSUER ring's fixed "owning" thread is
@@ -77,7 +80,7 @@ namespace System.Threading
         /// (the constructor's own) thread publish <see cref="s_isEnabled"/>/<see cref="s_rings"/> itself,
         /// before returning. Only after that does each new thread go on to call <see cref="IssuerLoop"/>.
         /// </summary>
-        internal static class IoUringThreadPool
+        internal static partial class IoUringThreadPool
         {
             // Depth of the shared submission/completion queues. Not currently configurable; may become
             // adaptive in a future iteration.
@@ -133,22 +136,43 @@ namespace System.Threading
             // doc comment. Null (and unused) if s_isEnabled is false.
             private static Ring[]? s_rings;
 
-            // Round-robin counter used to assign each *calling* thread (not each call) to one of s_rings
-            // the first time it calls TrySubmit - see t_assignedRing and GetAssignedRing.
-            private static int s_nextRingIndex;
-
-            // Sticky per-calling-thread ring assignment: assigned once, on that thread's first TrySubmit
-            // call (see GetAssignedRing), and reused for that thread's entire lifetime afterwards. This
-            // keeps a given caller's requests/completions concentrated on one ring/issuer thread instead
-            // of being scattered round-robin per call, for better cache/data affinity and to keep the
-            // sharding behavior simple to reason about.
-            [ThreadStatic]
-            private static Ring? t_assignedRing;
-
-            private struct OperationSlot
+            internal struct OperationSlot
             {
                 public IIoUringOperation? Operation;
                 public uint Generation;
+
+                // Reference count protecting against out-of-order completion processing: a multishot
+                // operation (e.g. Interop.Sys.IoRingOp.RecvMultishot) can have several of its completions
+                // dequeued (in order) but then *processed* concurrently, in any order, by independent
+                // Thread Pool workers - so the slot cannot simply be freed the instant a completion
+                // without the "More" flag is seen, since an earlier (non-final) completion for the same
+                // operation might still be mid-flight on another worker at that moment. See
+                // RetainOperationToken/ReleaseOperationToken.
+                public int RefCount;
+
+                // Next 0-based delivery sequence number to hand out for this operation's completions -
+                // assigned once per completion, by the single issuer thread, strictly in the order
+                // completions were dequeued off the ring (see RetainOperationToken). Since the completions
+                // themselves may go on to be *processed* out of order by independent workers, this value
+                // lets a multishot operation (see MultishotReceiveOperation) recover the correct delivery
+                // order without a lock, by having each worker wait for its own sequence number to become
+                // "next" before actually invoking the caller's callback.
+                public long NextSequence;
+            }
+
+            /// <summary>
+            /// GCHandle target used when a ring's bounded <see cref="OperationSlot"/> array is exhausted
+            /// (see <see cref="TrySubmit"/>) - carries the same reference-counting fields as
+            /// <see cref="OperationSlot"/>, for the same reason (see its doc comment), since a raw
+            /// <see cref="GCHandle"/> has no room for auxiliary per-token state of its own.
+            /// </summary>
+            private sealed class GCHandleToken
+            {
+                public readonly IIoUringOperation Operation;
+                public int RefCount = 1;
+                public long NextSequence;
+
+                public GCHandleToken(IIoUringOperation operation) => Operation = operation;
             }
 
             /// <summary>
@@ -157,7 +181,7 @@ namespace System.Threading
             /// own doc comment (on <see cref="IoUringThreadPool"/>) for why sharding across multiple
             /// rings/issuer threads exists and how callers are assigned to one.
             /// </summary>
-            private sealed class Ring
+            internal sealed class Ring
             {
                 // The index this ring was created at (0-based) - used only for the issuer thread's name,
                 // to make multiple issuer threads distinguishable in a debugger/process list.
@@ -172,8 +196,8 @@ namespace System.Threading
                 // been reaped. Managed callbacks need not finish before the issuer can park.
                 public int InFlightCount;
 
-                // MPSC hand-off from any thread calling TrySubmit (and assigned to this ring - see
-                // GetAssignedRing) to this ring's single dedicated issuer thread (see IssuerLoop). This
+                // MPSC hand-off from any thread calling TrySubmit (for a request whose fd routes to this
+                // ring - see GetRing) to this ring's single dedicated issuer thread (see IssuerLoop). This
                 // ring was created with IORING_SETUP_SINGLE_ISSUER, so only that one thread is permitted
                 // to ever call Interop.Sys.IoRingSubmit/IoRingKick/IoRingWaitForCompletions for it - every
                 // other thread must go through this queue instead. Unbounded: TrySubmit never blocks or
@@ -201,13 +225,22 @@ namespace System.Threading
                 // TrySubmit and IssuerLoop for the reset-then-recheck protocol that makes this safe.
                 public int WakeSignaled;
 
-                // One issuer produces completions; multiple workers may consume them.
-                public readonly ConcurrentQueue<Interop.Sys.IoRingCompletion> CompletionQueue = new();
+                // One issuer produces completions; multiple workers may consume them. Each entry also
+                // carries the delivery sequence number RetainOperationToken assigned it, since
+                // ConcurrentQueue's own FIFO dequeue order does not guarantee the *processing* of two
+                // dequeued completions happens in that same order once handed to independent workers -
+                // see MultishotReceiveOperation, the only current consumer that cares.
+                public readonly ConcurrentQueue<(Interop.Sys.IoRingCompletion Completion, long Sequence)> CompletionQueue = new();
                 // Running processors may overlap, but at most one additional processor is queued.
                 public int CompletionProcessingRequested;
                 public readonly IThreadPoolWorkItem CompletionProcessor;
                 public readonly OperationSlot[] OperationSlots = new OperationSlot[QueueDepth];
                 public readonly ConcurrentQueue<int> FreeOperationSlots = new();
+
+                // This ring's provided-buffer group zero (see SystemNative_IoRingRegisterBufferRing),
+                // used by IoRingOp_RecvMultishot; null until registered by the static constructor's
+                // handshake, alongside RingHandle/WakeEventFd.
+                public ReceiveBufferPool? ReceiveBuffers;
 
                 public Ring(int index)
                 {
@@ -231,6 +264,8 @@ namespace System.Threading
                 }
 
                 int ringCount = GetRingCount();
+                int receiveBufferSize = GetReceiveBufferSize();
+                int receiveBufferCount = GetReceiveBufferCount();
                 var rings = new Ring[ringCount];
                 bool allCreated = true;
 
@@ -276,6 +311,27 @@ namespace System.Threading
                         {
                             ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
                             created = ring.WakeEventFd >= 0;
+                        }
+
+                        if (created)
+                        {
+                            // Registers this ring's provided-buffer group zero for RecvMultishot. Per
+                            // the mandatory HAVE_LINUX_IO_URING_H check (see configure.cmake), a kernel
+                            // that supports io_uring at all also supports this - so a failure here is
+                            // treated exactly like a failure to create the ring or register its eventfd:
+                            // this ring (and, transitively, the whole io_uring integration - see
+                            // s_isEnabled below) is abandoned in favor of the non-io_uring fallback path.
+                            unsafe
+                            {
+                                byte* bufferStorage = null;
+                                int registerResult = Interop.Sys.IoRingRegisterBufferRing(
+                                    ring.RingHandle, receiveBufferSize, receiveBufferCount, &bufferStorage);
+                                created = registerResult == 0;
+                                if (created)
+                                {
+                                    ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, bufferStorage);
+                                }
+                            }
                         }
 
                         readyToRun.Set();
@@ -364,43 +420,65 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Returns the <see cref="Ring"/> the current thread is assigned to, assigning it (via
-            /// round-robin over <see cref="s_rings"/>) on this thread's first call. See
-            /// <see cref="t_assignedRing"/>'s doc comment for why this assignment is sticky rather than
-            /// picked per call.
+            /// Size, in bytes, of each provided buffer in a ring's RecvMultishot buffer pool. Set
+            /// DOTNET_IORING_RECV_BUFFER_SIZE to override; defaults to 16 KiB. Read once per ring, from
+            /// the static constructor.
+            /// </summary>
+            private static int GetReceiveBufferSize() =>
+                AppContextConfigHelper.GetInt32Config(
+                    "System.Threading.ThreadPool.IoUringReceiveBufferSize", "DOTNET_IORING_RECV_BUFFER_SIZE",
+                    defaultValue: 16 * 1024, allowNegative: false);
+
+            /// <summary>
+            /// Number of provided buffers in a ring's RecvMultishot buffer pool (must be a power of two -
+            /// see SystemNative_IoRingRegisterBufferRing). Set DOTNET_IORING_RECV_BUFFER_COUNT to
+            /// override; defaults to 128. Read once per ring, from the static constructor.
+            /// </summary>
+            private static int GetReceiveBufferCount() =>
+                AppContextConfigHelper.GetInt32Config(
+                    "System.Threading.ThreadPool.IoUringReceiveBufferCount", "DOTNET_IORING_RECV_BUFFER_COUNT",
+                    defaultValue: 128, allowNegative: false);
+
+            /// <summary>
+            /// Routes all operations on a descriptor to the same ring/issuer, even when async continuations
+            /// move between ThreadPool workers. Keep this descriptor-based: it improved TechEmpower JSON
+            /// throughput by ~7% compared with thread-static routing.
+            /// The stable mapping also lets cancellation find in-flight operations without a separate registry.
             /// </summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            private static Ring GetAssignedRing()
+            private static Ring GetRing(IntPtr fd)
             {
-                Ring? ring = t_assignedRing;
-                if (ring is null)
-                {
-                    Ring[] rings = s_rings!;
-                    int index = (int)((uint)Interlocked.Increment(ref s_nextRingIndex) % (uint)rings.Length);
-                    ring = rings[index];
-                    t_assignedRing = ring;
-                }
-
-                return ring;
+                Ring[] rings = s_rings!;
+                int index = (int)((uint)(nuint)(nint)fd % (uint)rings.Length);
+                return rings[index];
             }
 
             /// <summary>
-            /// Attempts to submit a single request to this thread's assigned ring (see
-            /// <see cref="GetAssignedRing"/>). Unlike the other io_uring architectures in this codebase,
+            /// Attempts to submit a single request to the ring <paramref name="request"/>'s fd is routed
+            /// to (see <see cref="GetRing"/>). Unlike the other io_uring architectures in this codebase,
             /// this never actually fails once <see cref="IsEnabled"/> is true: the request is simply
             /// enqueued for that ring's dedicated issuer thread to submit, and this method returns
             /// immediately. The operation is now considered in flight; its completion will eventually be
-            /// delivered via <see cref="IIoUringOperation.CompleteFromIoUring(int)"/>, invoked on a Thread
-            /// Pool work item. The queue backing this hand-off is unbounded - under sustained overload
-            /// (submissions arriving faster than the kernel/NIC can drain them), memory usage here could
-            /// grow without bound; this is a known, accepted limitation of this experimental
+            /// delivered via <see cref="IIoUringOperation.CompleteFromIoUring(int, uint, long)"/>, invoked on a
+            /// Thread Pool work item. The queue backing this hand-off is unbounded - under sustained
+            /// overload (submissions arriving faster than the kernel/NIC can drain them), memory usage
+            /// here could grow without bound; this is a known, accepted limitation of this experimental
             /// architecture, not an oversight.
             /// </summary>
-            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request)
+            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request) =>
+                TrySubmit(operation, in request, out _);
+
+            /// <summary>
+            /// Same as <see cref="TrySubmit(IIoUringOperation, in Interop.Sys.IoRingRequest)"/>, but also
+            /// reports the <c>UserData</c> token this request was actually assigned - needed by callers
+            /// (e.g. <see cref="TrySubmitReceiveMultishot"/>) that must later be able to target this
+            /// exact request for cancellation (<see cref="Interop.Sys.IoRingOp.Cancel"/>'s Offset).
+            /// </summary>
+            public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request, out ulong userData)
             {
                 Debug.Assert(s_isEnabled);
 
-                Ring ring = GetAssignedRing();
+                Ring ring = GetRing(request.Fd);
 
                 Interop.Sys.IoRingRequest localRequest = request;
                 if (ring.FreeOperationSlots.TryDequeue(out int slotIndex))
@@ -408,6 +486,10 @@ namespace System.Threading
                     ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
                     uint generation = unchecked(slot.Generation + 1);
                     Volatile.Write(ref slot.Generation, generation);
+                    // 1 is a bias representing "no completion has retired this slot yet" - see
+                    // RetainOperationToken/ReleaseOperationToken.
+                    Volatile.Write(ref slot.RefCount, 1);
+                    Volatile.Write(ref slot.NextSequence, 0);
                     Volatile.Write(ref slot.Operation, operation);
                     localRequest.UserData = ((ulong)generation << OperationSlotGenerationShift) |
                         ((uint)slotIndex << 1) | OperationSlotTag;
@@ -416,10 +498,12 @@ namespace System.Threading
                 {
                     // Normal GCHandles have bit zero clear; tagged slot tokens instead refer to
                     // the ring's bounded array, which roots their operations until completion.
-                    GCHandle handle = GCHandle.Alloc(operation);
+                    GCHandle handle = GCHandle.Alloc(new GCHandleToken(operation));
                     localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
                     Debug.Assert((localRequest.UserData & OperationSlotTag) == 0);
                 }
+
+                userData = localRequest.UserData;
 
                 try
                 {
@@ -427,7 +511,9 @@ namespace System.Threading
                 }
                 catch
                 {
-                    ReleaseOperationToken(ring, localRequest.UserData);
+                    // Nothing was ever submitted for this token, so no completion will ever arrive -
+                    // free it unconditionally rather than going through the completion-counted release.
+                    AbortOperationToken(ring, localRequest.UserData);
                     throw;
                 }
 
@@ -464,12 +550,20 @@ namespace System.Threading
                 // no synchronization is needed for these arrays.
                 var submitBatch = new Interop.Sys.IoRingRequest[MaxRequestsPerSubmitBatch];
                 var completionsBatch = new Interop.Sys.IoRingCompletion[MaxCompletionsPerWait];
+                var sequenceBatch = new long[MaxCompletionsPerWait];
                 var workItemBatch = new IThreadPoolWorkItem[MaxCompletionsPerWait];
+                var bufferReturnBatch = new ushort[MaxCompletionsPerWait];
 
                 while (true)
                 {
-                    DrainAndSubmit(ring, submitBatch, completionsBatch, workItemBatch);
-                    bool moreCompletions = DrainCompletions(ring, completionsBatch, workItemBatch);
+                    DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch, workItemBatch);
+                    bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
+
+                    // Opportunistic only: a ReceiveBufferLease.Dispose() on any other thread never wakes
+                    // this issuer just to return one buffer - return bits remain set until this thread
+                    // is next awake anyway (e.g. for a completion or submission),
+                    // at which point republishing them costs no syscall (see IoRingReturnBuffers).
+                    ring.ReceiveBuffers!.DrainReturns(bufferReturnBatch);
 
                     if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
                     {
@@ -485,7 +579,7 @@ namespace System.Threading
                     // cycle, so skipped its own EventFdWrite, right before we set it back to 0) - the
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
-                    Volatile.Write(ref ring.WakeSignaled, 0);
+                    Interlocked.Exchange(ref ring.WakeSignaled, 0);
                     if (!ring.PendingSubmissions.IsEmpty)
                     {
                         continue;
@@ -504,7 +598,7 @@ namespace System.Threading
             /// completion wait submits these SQEs and processes deferred work in the same enter.
             /// </summary>
             private static unsafe void DrainAndSubmit(Ring ring, Interop.Sys.IoRingRequest[] batch,
-                Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
+                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int count = 0;
                 while (count < batch.Length && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
@@ -520,7 +614,7 @@ namespace System.Threading
                 ring.InFlightCount += count;
                 fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
                 {
-                    SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, workItemBatch);
+                    SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, sequenceBatch, workItemBatch);
                 }
             }
 
@@ -534,7 +628,7 @@ namespace System.Threading
             /// thread is the only one that will ever process this ring's queue anyway.
             /// </summary>
             private static unsafe void SubmitBatchWithRetry(Ring ring, Interop.Sys.IoRingRequest* requestsPtr, int count,
-                Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
+                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int remaining = count;
                 Interop.Sys.IoRingRequest* remainingPtr = requestsPtr;
@@ -556,7 +650,7 @@ namespace System.Threading
                     remaining -= submittedCount;
 
                     // This issuer must enter the kernel to consume SQEs; spinning alone cannot make room.
-                    DrainCompletions(ring, completionsBatch, workItemBatch);
+                    DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
                 }
             }
 
@@ -564,7 +658,7 @@ namespace System.Threading
             /// Drains a bounded number of completions without waiting. Returns true when the budget
             /// was exhausted, so the issuer alternates with submissions rather than parking.
             /// </summary>
-            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, IThreadPoolWorkItem[] workItemBatch)
+            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int processed = 0;
                 while (processed < MaxCompletionsPerTurn)
@@ -593,17 +687,70 @@ namespace System.Threading
                         }
                     }
 
-                    ring.InFlightCount -= completedCount;
-                    Debug.Assert(ring.InFlightCount >= 0);
                     processed += completedCount;
                     ReadOnlySpan<Interop.Sys.IoRingCompletion> completions = completionsBatch.AsSpan(0, completedCount);
+
+                    // InFlightCount tracks requests submitted but not yet finally completed - not raw
+                    // completion count: a still-active multishot operation (More flag set) produces many
+                    // completions from a single submission, so only its last one (More flag absent)
+                    // actually retires the in-flight slot it was submitted with.
+                    int finalCompletions = 0;
+                    int keepCount = 0;
+                    for (int i = 0; i < completions.Length; i++)
+                    {
+                        ref readonly Interop.Sys.IoRingCompletion completion = ref completions[i];
+                        bool isFinal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                        if (isFinal)
+                        {
+                            finalCompletions++;
+                        }
+
+                        // A still-active multishot receive is delivered entirely inline here instead of
+                        // going through the generic completion queue below: every fd - and so every one
+                        // of its operations - is permanently bound to exactly one ring (see GetRing),
+                        // which in turn has exactly one owning issuer thread: this one. That means this
+                        // is the *only* thread that will ever act as a producer for this operation's own
+                        // pending-completion queue (see MultishotReceiveOperation.EnqueueFromIssuer), so
+                        // its completions are naturally delivered in true arrival order with no
+                        // per-completion sequence bookkeeping needed at all - unlike the generic path
+                        // below (see EnqueueCompletions/CompletionProcessorWorkItem), whose own dispatch
+                        // can otherwise process two completions of the very same operation concurrently,
+                        // out of order, across two different worker threads.
+                        if (PeekOperationToken(ring, completion.UserData) is MultishotReceiveOperation multishotReceive)
+                        {
+                            multishotReceive.EnqueueFromIssuer(completion.Result, completion.Flags);
+                            if (isFinal)
+                            {
+                                // Workers hold the operation directly, not its correlation token.
+                                RetainOperationToken(ring, completion.UserData);
+                                ReleaseOperationToken(ring, completion.UserData, isFinal: true);
+                            }
+                            continue;
+                        }
+
+                        long sequence = RetainOperationToken(ring, completion.UserData);
+                        completionsBatch[keepCount] = completion;
+                        sequenceBatch[keepCount] = sequence;
+                        keepCount++;
+                    }
+                    ring.InFlightCount -= finalCompletions;
+                    Debug.Assert(ring.InFlightCount >= 0);
+
+                    if (keepCount == 0)
+                    {
+                        continue;
+                    }
+
+                    completions = completionsBatch.AsSpan(0, keepCount);
+                    Span<long> sequences = sequenceBatch.AsSpan(0, keepCount);
+
                     if (s_useParallelizedEnqueue)
                     {
-                        EnqueueCompletions(ring, completions);
+                        EnqueueCompletions(ring, completions, sequences);
                     }
                     else
                     {
-                        DispatchBatch(ring, completions, workItemBatch);
+                        DispatchBatch(ring, completions, sequences, workItemBatch);
                     }
                 }
 
@@ -613,11 +760,11 @@ namespace System.Threading
             /// <summary>
             /// Hands raw completions to workers, which resolve operations and run their callbacks.
             /// </summary>
-            private static void EnqueueCompletions(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions)
+            private static void EnqueueCompletions(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions, ReadOnlySpan<long> sequences)
             {
-                foreach (ref readonly Interop.Sys.IoRingCompletion completion in completions)
+                for (int i = 0; i < completions.Length; i++)
                 {
-                    ring.CompletionQueue.Enqueue(completion);
+                    ring.CompletionQueue.Enqueue((completions[i], sequences[i]));
                 }
 
                 ScheduleCompletionProcessing(ring);
@@ -633,16 +780,39 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Resolves and releases a completion's correlation token before completing its operation.
-            /// This is the shared bookkeeping used by both
-            /// <see cref="DispatchBatch"/> and <see cref="CompletionProcessorWorkItem"/>.
+            /// Resolves a completion's correlation token, completes its operation, and releases the
+            /// token's reference taken for this specific completion (see
+            /// <see cref="RetainOperationToken"/>/<see cref="ReleaseOperationToken"/>). A multishot
+            /// operation (e.g. <see cref="Interop.Sys.IoRingOp.RecvMultishot"/>) keeps producing
+            /// completions - every one but the last carries
+            /// <see cref="Interop.Sys.IoRingCompletion.More"/> in its
+            /// <see cref="Interop.Sys.IoRingCompletion.Flags"/> - and since two of its completions can be
+            /// *processed* concurrently (in either order) by independent workers even though they were
+            /// *dequeued* in order, the token cannot simply be freed the instant the final (no-More)
+            /// completion is seen: it is only actually freed once every completion that could ever
+            /// reference it - including that final one - has finished being processed here, regardless of
+            /// the order in which that happens. <paramref name="sequence"/> is this same completion's
+            /// 0-based delivery sequence number (see <see cref="RetainOperationToken"/>), passed through to
+            /// the operation so a multishot one can recover correct delivery order despite the above. This
+            /// is the shared bookkeeping used by both <see cref="DispatchBatch"/> and
+            /// <see cref="CompletionProcessorWorkItem"/>.
             /// </summary>
-            private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion)
-                => ReleaseOperationToken(ring, completion.UserData).CompleteFromIoUring(completion.Result);
-
-            private static IIoUringOperation ReleaseOperationToken(Ring ring, ulong userData)
+            private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion, long sequence)
             {
-                IIoUringOperation operation;
+                IIoUringOperation operation = PeekOperationToken(ring, completion.UserData);
+                IThreadPoolWorkItem? workItem = operation.CompleteFromIoUring(completion.Result, completion.Flags, sequence);
+                bool isFinal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                ReleaseOperationToken(ring, completion.UserData, isFinal);
+                return workItem;
+            }
+
+            /// <summary>
+            /// Resolves a completion's correlation token to its operation, without affecting its
+            /// reference count - safe to call as long as the caller already holds (or is about to take,
+            /// see <see cref="RetainOperationToken"/>) at least one outstanding reference to this token.
+            /// </summary>
+            private static IIoUringOperation PeekOperationToken(Ring ring, ulong userData)
+            {
                 if ((userData & OperationSlotTag) != 0)
                 {
                     int slotIndex = (int)((uint)userData >> 1);
@@ -659,18 +829,100 @@ namespace System.Threading
                         Environment.FailFast("Stale io_uring operation slot.");
                     }
 
-                    operation = cachedOperation;
-                    Volatile.Write(ref slot.Operation, null);
-                    ring.FreeOperationSlots.Enqueue(slotIndex);
+                    return cachedOperation;
+                }
+
+                GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
+                return ((GCHandleToken)handle.Target!).Operation;
+            }
+
+            /// <summary>
+            /// Takes one reference on <paramref name="userData"/>'s token, on behalf of a completion
+            /// about to be handed off to a worker for processing (see <see cref="ReleaseOperationToken"/>
+            /// for the matching release), and assigns that completion its 0-based delivery sequence
+            /// number (see <see cref="OperationSlot.NextSequence"/>). Must be called by the single issuer
+            /// thread that drains completions off the ring, strictly before that completion becomes
+            /// visible to any worker (i.e. before it is enqueued/dispatched) - this ordering, not the
+            /// reference count's atomic increment alone, is what makes the corresponding release always
+            /// observe a fully-retained token, and the sequence numbers always reflect true arrival order,
+            /// no matter which worker thread processes which completion first.
+            /// </summary>
+            private static long RetainOperationToken(Ring ring, ulong userData)
+            {
+                if ((userData & OperationSlotTag) != 0)
+                {
+                    int slotIndex = (int)((uint)userData >> 1);
+                    if ((uint)slotIndex >= (uint)ring.OperationSlots.Length)
+                    {
+                        Environment.FailFast("Invalid io_uring operation slot.");
+                    }
+
+                    ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
+                    Interlocked.Increment(ref slot.RefCount);
+                    return slot.NextSequence++;
                 }
                 else
                 {
                     GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
-                    operation = (IIoUringOperation)handle.Target!;
-                    handle.Free();
+                    GCHandleToken token = (GCHandleToken)handle.Target!;
+                    Interlocked.Increment(ref token.RefCount);
+                    return token.NextSequence++;
                 }
+            }
 
-                return operation;
+            /// <summary>
+            /// Releases the reference <see cref="RetainOperationToken"/> took for one completion,
+            /// actually freeing the token once every reference has been released this way - i.e. once
+            /// every completion this token could ever receive (including its final one, see
+            /// <paramref name="isFinal"/>) has been fully processed, in any order. A final completion
+            /// releases two references at once: its own (like every other completion) plus the "at least
+            /// one completion is still outstanding" bias <see cref="TrySubmit"/> establishes when the
+            /// token is first created - so the token is freed by whichever single release call happens to
+            /// observe the count reach zero, regardless of processing order.
+            /// </summary>
+            private static void ReleaseOperationToken(Ring ring, ulong userData, bool isFinal)
+            {
+                int decrement = isFinal ? 2 : 1;
+                if ((userData & OperationSlotTag) != 0)
+                {
+                    int slotIndex = (int)((uint)userData >> 1);
+                    ref OperationSlot slot = ref ring.OperationSlots[slotIndex];
+                    if (Interlocked.Add(ref slot.RefCount, -decrement) == 0)
+                    {
+                        Volatile.Write(ref slot.Operation, null);
+                        ring.FreeOperationSlots.Enqueue(slotIndex);
+                    }
+                }
+                else
+                {
+                    GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
+                    GCHandleToken token = (GCHandleToken)handle.Target!;
+                    if (Interlocked.Add(ref token.RefCount, -decrement) == 0)
+                    {
+                        handle.Free();
+                    }
+                }
+            }
+
+            /// <summary>
+            /// Frees <paramref name="userData"/>'s token unconditionally, bypassing the reference-counted
+            /// protocol above - used only when a token is abandoned before it was ever actually submitted
+            /// to the ring (see <see cref="TrySubmit"/>'s catch block), so no completion (and therefore no
+            /// call to <see cref="RetainOperationToken"/>/<see cref="ReleaseOperationToken"/>) will ever
+            /// reference it.
+            /// </summary>
+            private static void AbortOperationToken(Ring ring, ulong userData)
+            {
+                if ((userData & OperationSlotTag) != 0)
+                {
+                    int slotIndex = (int)((uint)userData >> 1);
+                    Volatile.Write(ref ring.OperationSlots[slotIndex].Operation, null);
+                    ring.FreeOperationSlots.Enqueue(slotIndex);
+                }
+                else
+                {
+                    GCHandle.FromIntPtr((IntPtr)userData).Free();
+                }
             }
 
             /// <summary>
@@ -681,15 +933,15 @@ namespace System.Threading
             /// returned work items and queuing them all via a single batched
             /// <see cref="ThreadPool.UnsafeQueueUserWorkItems"/> call instead of once per completion.
             /// </summary>
-            private static void DispatchBatch(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions, IThreadPoolWorkItem[] workItemBatch)
+            private static void DispatchBatch(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions, ReadOnlySpan<long> sequences, IThreadPoolWorkItem[] workItemBatch)
             {
                 int batchCount = 0;
-                foreach (ref readonly Interop.Sys.IoRingCompletion completion in completions)
+                for (int i = 0; i < completions.Length; i++)
                 {
                     // The issuer thread must not run the continuation inline; CompleteOperation only does
                     // minimal bookkeeping and returns the work item (if any) to be queued, so it can be
                     // batched together with the other completions drained in this pass.
-                    IThreadPoolWorkItem? workItem = CompleteOperation(ring, in completion);
+                    IThreadPoolWorkItem? workItem = CompleteOperation(ring, in completions[i], sequences[i]);
                     if (workItem is not null)
                     {
                         workItemBatch[batchCount++] = workItem;
@@ -720,7 +972,7 @@ namespace System.Threading
 
                     // Reset before checking the queue so racing producers cannot miss scheduling work.
                     Interlocked.Exchange(ref ring.CompletionProcessingRequested, 0);
-                    if (!ring.CompletionQueue.TryDequeue(out Interop.Sys.IoRingCompletion completion))
+                    if (!ring.CompletionQueue.TryDequeue(out (Interop.Sys.IoRingCompletion Completion, long Sequence) item))
                     {
                         return;
                     }
@@ -728,7 +980,7 @@ namespace System.Threading
                     ScheduleCompletionProcessing(ring);
                     while (true)
                     {
-                        CompleteOperation(ring, in completion)?.Execute();
+                        CompleteOperation(ring, in item.Completion, item.Sequence)?.Execute();
                         // Each completion is a separate callback, even when dispatched in one work item.
                         ExecutionContext.ResetThreadPoolThread(currentThread);
                         currentThread.ResetThreadPoolThread();
@@ -736,7 +988,7 @@ namespace System.Threading
                         {
                             break;
                         }
-                        if (!ring.CompletionQueue.TryDequeue(out completion))
+                        if (!ring.CompletionQueue.TryDequeue(out item))
                         {
                             return;
                         }
@@ -749,19 +1001,50 @@ namespace System.Threading
             }
         }
 
+    }
+
+    /// <summary>
+    /// Implemented by types that can be submitted to <see cref="PortableThreadPool.IoUringThreadPool"/>
+    /// and receive their completion result back. Public (rather than nested/internal to
+    /// <see cref="PortableThreadPool"/>) so a caller across an assembly boundary - e.g.
+    /// <see cref="System.Threading.IoUring.TrySubmitRecvMultishot"/>'s caller - can hold onto the
+    /// operation instance it gets back and later request its cancellation directly, without a
+    /// separate registry keyed by some other identity (like a file descriptor) to find it again.
+    /// This is still an experimental, deliberately minimal surface - e.g. <see cref="RequestCancellation"/>
+    /// is only actually implemented by <see cref="PortableThreadPool"/>'s multishot receive operation
+    /// today - not a finished public contract.
+    /// </summary>
+    [CLSCompliant(false)]
+    public interface IIoUringOperation
+    {
         /// <summary>
-        /// Implemented by types that can be submitted to <see cref="IoUringThreadPool"/> and receive
-        /// their completion result back.
+        /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>,
+        /// together with the completion's raw CQE flags (e.g. <see cref="Interop.Sys.IoRingCompletion.More"/>
+        /// for a still-active multishot operation, or <see cref="Interop.Sys.IoRingCompletion.Buffer"/>/
+        /// <see cref="Interop.Sys.IoRingCompletion.BufferShift"/> for a selected provided-buffer id),
+        /// and this completion's 0-based delivery sequence number (assigned once per completion, in
+        /// true arrival order, regardless of the order in which completions of the same operation are
+        /// actually *processed* by independent workers - see
+        /// <see cref="PortableThreadPool.IoUringThreadPool.RetainOperationToken"/>). Operations that
+        /// can only ever receive one completion (i.e. every one except a still-active multishot
+        /// operation) can safely ignore <paramref name="sequence"/>, since it is always 0 for them.
+        /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
+        /// user continuations. Return the work item for the dispatcher to execute on a worker,
+        /// or <see langword="null"/> when a partial operation has been resubmitted.
         /// </summary>
-        internal interface IIoUringOperation
-        {
-            /// <summary>
-            /// Receives the raw completion result: bytes transferred on success, or <c>-errno</c>.
-            /// This may run on the issuer in legacy dispatch mode, so implementations must not invoke
-            /// user continuations. Return the work item for the dispatcher to execute on a worker,
-            /// or <see langword="null"/> when a partial operation has been resubmitted.
-            /// </summary>
-            IThreadPoolWorkItem? CompleteFromIoUring(int result);
-        }
+        IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
+
+        /// <summary>
+        /// Requests best-effort cancellation of this operation's still-in-flight submission, if any.
+        /// Deliberately named <c>Request</c>Cancellation, not <c>Cancel</c>: calling this does not
+        /// itself guarantee the operation has stopped by the time it returns - the operation's own
+        /// completion (delivered the normal way, via its original callback) is what actually reports
+        /// the outcome (typically <c>-ECANCELED</c>) to the caller. A no-op if this operation has
+        /// already finished on its own. Only <see cref="PortableThreadPool"/>'s multishot receive
+        /// operation implements this today; every other <see cref="IIoUringOperation"/> in this
+        /// prototype only ever completes exactly once and is not (yet) cancellable once submitted, so
+        /// they throw <see cref="NotImplementedException"/>.
+        /// </summary>
+        void RequestCancellation();
     }
 }
