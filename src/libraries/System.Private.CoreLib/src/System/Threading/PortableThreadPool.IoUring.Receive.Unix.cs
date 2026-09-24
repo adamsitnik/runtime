@@ -23,7 +23,7 @@ namespace System.Threading
             /// completion, with the raw result (bytes received, 0 on graceful EOF, or <c>-errno</c> on
             /// failure), the received data (as a buffer leased from the pool - dispose it to return it),
             /// and whether the operation is still alive and will keep producing further completions.
-            /// <paramref name="handle"/> is ref-counted for as long as the operation remains alive.
+            /// <paramref name="handle"/> is ref-counted while each native submission is outstanding.
             /// Returns <see langword="false"/> only if this fd's ring's buffer pool could not be
             /// initialized (extremely unlikely - see the ring-creation handshake in the static
             /// constructor of <see cref="IoUringThreadPool"/>, which requires it to succeed at all); in
@@ -59,7 +59,7 @@ namespace System.Threading
                     // Recorded on the operation itself so a later RequestCancellation call (against this
                     // very instance, held onto directly by the original caller) knows which exact
                     // request to target - see MultishotReceiveOperation.RequestCancellation.
-                    multishotOperation.SetUserData(userData);
+                    multishotOperation.SetInitialUserData(userData);
                     operation = multishotOperation;
                     return true;
                 }
@@ -202,8 +202,8 @@ namespace System.Threading
 
                 // The current submission's raw io_uring userData token, read by RequestCancellation
                 // (called from an arbitrary external thread) and written by TryResubmit (called from this
-                // operation's own drainer - see Execute/Deliver) - Volatile-accessed since those two sides
-                // run on different threads with no other synchronization between them.
+                // operation's own drainer - see Execute/Deliver). Both token and cancellation publication
+                // use full fences so their subsequent reads cannot both miss the other publication.
                 private ulong _userData;
 
                 // Set just before this operation's truly final delivery to _onCompleted (see Deliver) -
@@ -217,7 +217,7 @@ namespace System.Threading
                 // by Deliver so an ENOBUFS auto-rearm (see TryResubmit) can never race ahead of an
                 // already-requested cancellation and keep this receive silently alive behind the caller's
                 // back.
-                private volatile bool _cancelRequested;
+                private int _cancelRequested;
 
                 public MultishotReceiveOperation(Ring ring, SafeHandle handle, IntPtr fd, Action<int, IMemoryOwner<byte>?, bool> onCompleted)
                 {
@@ -228,11 +228,10 @@ namespace System.Threading
                 }
 
                 /// <summary>
-                /// Records this submission's userData token - called once right after a successful
-                /// <see cref="TrySubmit(IIoUringOperation, in Interop.Sys.IoRingRequest, out ulong)"/>
-                /// (including a transparent re-arm - see <see cref="TryResubmit"/>).
+                /// Records the initial token without overwriting a replacement if the worker
+                /// already rearmed before the submitting thread returned.
                 /// </summary>
-                public void SetUserData(ulong userData) => Volatile.Write(ref _userData, userData);
+                public void SetInitialUserData(ulong userData) => Interlocked.CompareExchange(ref _userData, userData, 0);
 
                 /// <summary>
                 /// Requests best-effort cancellation of this operation's current submission (see
@@ -246,7 +245,7 @@ namespace System.Threading
                 /// </summary>
                 public void RequestCancellation()
                 {
-                    _cancelRequested = true;
+                    Interlocked.Exchange(ref _cancelRequested, 1);
 
                     if (_finished)
                     {
@@ -279,6 +278,13 @@ namespace System.Threading
                 internal void EnqueueFromIssuer(int result, uint flags)
                 {
                     bool hasMore = (flags & Interop.Sys.IoRingCompletion.More) != 0;
+
+                    if (!hasMore)
+                    {
+                        // Socket disposal can run inline in an earlier receive continuation and
+                        // wait for this reference. It must not depend on that worker draining again.
+                        _handle.DangerousRelease();
+                    }
 
                     IMemoryOwner<byte>? buffer = null;
                     if (result > 0 && (flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
@@ -327,24 +333,51 @@ namespace System.Threading
                 /// <summary>
                 /// Transparently resubmits this same still-alive operation after its previous submission
                 /// was terminated by the kernel due to buffer-pool exhaustion (see <see cref="Deliver"/>).
-                /// Reuses this instance (and its still-held reference on <see cref="_handle"/>) rather
-                /// than allocating a new one - the caller never observes any interruption, aside from a
+                /// Reuses this instance and acquires a handle reference for the new native submission.
+                /// The caller never observes any interruption, aside from a
                 /// pause in received data until the pool has room again.
                 /// </summary>
                 private bool TryResubmit()
                 {
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.RecvMultishot;
-                    request.Fd = _fd;
-                    request.Offset = -1;
-
-                    if (!TrySubmit(this, in request, out ulong userData))
+                    bool refAdded = false;
+                    bool submitted = false;
+                    try
                     {
-                        return false;
-                    }
+                        try
+                        {
+                            _handle.DangerousAddRef(ref refAdded);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            return false;
+                        }
 
-                    SetUserData(userData);
-                    return true;
+                        Interop.Sys.IoRingRequest request = default;
+                        request.OpCode = Interop.Sys.IoRingOp.RecvMultishot;
+                        request.Fd = _fd;
+                        request.Offset = -1;
+
+                        submitted = TrySubmit(this, in request, out ulong userData);
+                        if (submitted)
+                        {
+                            Interlocked.Exchange(ref _userData, userData);
+                            // A concurrent cancellation may have targeted the previous token.
+                            // After publication it must also cover this replacement submission.
+                            if (Volatile.Read(ref _cancelRequested) != 0)
+                            {
+                                RequestCancellation();
+                            }
+                        }
+
+                        return submitted;
+                    }
+                    finally
+                    {
+                        if (refAdded && !submitted)
+                        {
+                            _handle.DangerousRelease();
+                        }
+                    }
                 }
 
                 /// <summary>
@@ -365,7 +398,7 @@ namespace System.Threading
                     // DrainReceiveBufferReturns) independently of whether this particular receive is
                     // currently submitted, so the retry only needs to wait for the pool to have room
                     // again, not for anything specific to this fd.
-                    if (!hasMore && result < 0 && !_cancelRequested &&
+                    if (!hasMore && result < 0 && Volatile.Read(ref _cancelRequested) == 0 &&
                         new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS &&
                         TryResubmit())
                     {
@@ -378,11 +411,6 @@ namespace System.Threading
                     }
 
                     _onCompleted(result, buffer, hasMore);
-
-                    if (!hasMore)
-                    {
-                        _handle.DangerousRelease();
-                    }
                 }
 
                 private readonly struct PendingCompletion

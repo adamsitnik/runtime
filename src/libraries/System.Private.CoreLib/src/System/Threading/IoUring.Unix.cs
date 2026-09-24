@@ -80,9 +80,10 @@ namespace System.Threading
         /// completion, with the raw result (bytes received, <c>0</c> on graceful EOF, or <c>-errno</c> on
         /// failure), the received data (dispose it to return the buffer to the pool;
         /// <see langword="null"/> when no data accompanies this completion), and whether the operation is
-        /// still alive and will keep producing further completions - the last completion for a given
-        /// submission always reports <see langword="false"/> here. <paramref name="handle"/> is
-        /// ref-counted for as long as the operation remains alive. Returns <see langword="false"/> if the
+        /// still alive and will keep producing further completions. Native submissions can be rearmed
+        /// transparently; only the logical operation's last callback reports <see langword="false"/>.
+        /// <paramref name="handle"/> is ref-counted while each native submission is in flight.
+        /// Returns <see langword="false"/> if the
         /// operation could not be submitted (in which case <paramref name="operation"/> is
         /// <see langword="null"/> and no callback is invoked).
         /// </summary>
