@@ -4,6 +4,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.InteropServices;
 
 namespace System.Threading
@@ -86,17 +87,21 @@ namespace System.Threading
             /// </summary>
             internal sealed unsafe class ReceiveBufferPool
             {
+                private const int BitsPerReturnWord = 64;
+
                 public readonly int BufferSize;
                 public readonly int BufferCount;
 
                 private readonly Ring _ring;
                 private readonly ReceiveBufferLease[] _leases;
+                private readonly long[] _returnedBuffers;
 
                 internal ReceiveBufferPool(Ring ring, int bufferSize, int bufferCount, byte* storage)
                 {
                     _ring = ring;
                     BufferSize = bufferSize;
                     BufferCount = bufferCount;
+                    _returnedBuffers = new long[checked((bufferCount + BitsPerReturnWord - 1) / BitsPerReturnWord)];
 
                     var leases = new ReceiveBufferLease[bufferCount];
                     for (int i = 0; i < bufferCount; i++)
@@ -115,11 +120,54 @@ namespace System.Threading
 
                 /// <summary>
                 /// Queues <paramref name="bufferId"/> to be republished to the kernel - see
-                /// <see cref="Ring.PendingBufferReturns"/> and <see cref="DrainReceiveBufferReturns"/>.
+                /// <see cref="DrainReturns"/>. Each id has at most one outstanding return, so a
+                /// bit per buffer replaces queue nodes without imposing an ordering on returns.
                 /// May be called from any thread (whichever one disposes the corresponding
                 /// <see cref="ReceiveBufferLease"/>).
                 /// </summary>
-                internal void Return(int bufferId) => _ring.PendingBufferReturns.Enqueue((ushort)bufferId);
+                internal void Return(int bufferId) =>
+                    Interlocked.Or(ref _returnedBuffers[bufferId / BitsPerReturnWord], 1L << (bufferId % BitsPerReturnWord));
+
+                internal void DrainReturns(ushort[] batch)
+                {
+                    int count = 0;
+                    for (int word = 0; word < _returnedBuffers.Length; word++)
+                    {
+                        if (Volatile.Read(ref _returnedBuffers[word]) == 0)
+                        {
+                            continue;
+                        }
+
+                        ulong returned = (ulong)Interlocked.Exchange(ref _returnedBuffers[word], 0);
+                        while (returned != 0)
+                        {
+                            int bit = BitOperations.TrailingZeroCount(returned);
+                            returned &= returned - 1;
+                            batch[count++] = (ushort)(word * BitsPerReturnWord + bit);
+                            if (count == batch.Length)
+                            {
+                                PublishReturns(batch, count);
+                                count = 0;
+                            }
+                        }
+                    }
+
+                    if (count != 0)
+                    {
+                        PublishReturns(batch, count);
+                    }
+                }
+
+                private void PublishReturns(ushort[] batch, int count)
+                {
+                    fixed (ushort* batchPtr = batch)
+                    {
+                        if (Interop.Sys.IoRingReturnBuffers(_ring.RingHandle, batchPtr, count) != 0)
+                        {
+                            Environment.FailFast($"io_uring provided-buffer return failed: {Marshal.GetLastPInvokeError()}.");
+                        }
+                    }
+                }
             }
 
             /// <summary>

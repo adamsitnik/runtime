@@ -242,13 +242,6 @@ namespace System.Threading
                 // handshake, alongside RingHandle/WakeEventFd.
                 public ReceiveBufferPool? ReceiveBuffers;
 
-                // Consumed buffer ids a ReceiveBufferLease.Dispose() (on any thread) wants returned to
-                // the kernel. MPSC, mirroring PendingSubmissions: any thread may enqueue, only the issuer
-                // dequeues (see IssuerLoop) - draining opportunistically each loop iteration rather than
-                // waking the issuer just to return a single buffer (a receive-heavy ring is already
-                // waking up on its own on essentially every loop iteration to reap new completions).
-                public readonly ConcurrentQueue<ushort> PendingBufferReturns = new();
-
                 public Ring(int index)
                 {
                     Index = index;
@@ -571,10 +564,10 @@ namespace System.Threading
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
 
                     // Opportunistic only: a ReceiveBufferLease.Dispose() on any other thread never wakes
-                    // this issuer just to return one buffer (see Ring.PendingBufferReturns) - buffers sit
-                    // there until this thread is next awake anyway (e.g. for a completion or submission),
+                    // this issuer just to return one buffer - return bits remain set until this thread
+                    // is next awake anyway (e.g. for a completion or submission),
                     // at which point republishing them costs no syscall (see IoRingReturnBuffers).
-                    DrainReceiveBufferReturns(ring, bufferReturnBatch);
+                    ring.ReceiveBuffers!.DrainReturns(bufferReturnBatch);
 
                     if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
                     {
@@ -602,42 +595,6 @@ namespace System.Threading
                         Environment.FailFast($"io_uring eventfd wait failed: {Marshal.GetLastPInvokeError()}.");
                     }
                 }
-            }
-
-            /// <summary>
-            /// Republishes every buffer id currently queued in <see cref="Ring.PendingBufferReturns"/> to
-            /// the kernel, in batches of at most <paramref name="batch"/>'s length. No syscall is needed
-            /// (see <see cref="Interop.Sys.IoRingReturnBuffers"/>); this only runs on the issuer thread.
-            /// </summary>
-            private static unsafe void DrainReceiveBufferReturns(Ring ring, ushort[] batch)
-            {
-                if (ring.PendingBufferReturns.IsEmpty)
-                {
-                    return;
-                }
-
-                int count;
-                while ((count = DequeueBufferReturnBatch(ring, batch)) > 0)
-                {
-                    fixed (ushort* batchPtr = batch)
-                    {
-                        if (Interop.Sys.IoRingReturnBuffers(ring.RingHandle, batchPtr, count) != 0)
-                        {
-                            Environment.FailFast($"io_uring provided-buffer return failed: {Marshal.GetLastPInvokeError()}.");
-                        }
-                    }
-                }
-            }
-
-            private static int DequeueBufferReturnBatch(Ring ring, ushort[] batch)
-            {
-                int count = 0;
-                while (count < batch.Length && ring.PendingBufferReturns.TryDequeue(out ushort bufferId))
-                {
-                    batch[count++] = bufferId;
-                }
-
-                return count;
             }
 
             /// <summary>
