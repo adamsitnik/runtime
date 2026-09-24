@@ -52,6 +52,149 @@ namespace System.Net.Sockets.Tests
             }, options).Dispose();
         }
 
+        [ConditionalFact(nameof(IsSupported))]
+        public void MultishotReceive_CompletionQueuePressure_PreservesEveryByte()
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_SIZE"] = "1";
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "4096";
+            RemoteExecutor.Invoke(async () =>
+            {
+                const int ConnectionCount = 256;
+                const int PayloadLength = 256;
+                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(ConnectionCount);
+                List<Socket> sockets = new List<Socket>();
+                Socket[] receivers = new Socket[ConnectionCount];
+                byte[] payload = new byte[PayloadLength];
+                Array.Fill(payload, (byte)0x5A);
+                try
+                {
+                    for (int index = 0; index < ConnectionCount; index++)
+                    {
+                        Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                        sockets.Add(sender);
+                        sender.Connect(listener.LocalEndPoint!);
+                        Socket receiver = listener.Accept();
+                        sockets.Add(receiver);
+                        receivers[index] = receiver;
+                        Assert.Equal(payload.Length, sender.Send(payload));
+                        sender.Shutdown(SocketShutdown.Send);
+                    }
+
+                    Task[] reads = new Task[ConnectionCount];
+                    for (int index = 0; index < reads.Length; index++)
+                    {
+                        Socket receiver = receivers[index];
+                        reads[index] = Task.Run(async () =>
+                        {
+                            int received = 0;
+                            await foreach (IMemoryOwner<byte> owner in receiver.ReceiveMultishotAsync())
+                            {
+                                using (owner)
+                                {
+                                    Assert.Equal(1, owner.Memory.Length);
+                                    Assert.Equal(0x5A, owner.Memory.Span[0]);
+                                    received += owner.Memory.Length;
+                                }
+                            }
+                            Assert.Equal(PayloadLength, received);
+                        });
+                    }
+
+                    await Task.WhenAll(reads).WaitAsync(TestSettings.PassingTestTimeout);
+                }
+                finally
+                {
+                    foreach (Socket socket in sockets)
+                    {
+                        socket.Dispose();
+                    }
+                }
+            }, options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void MultishotReceive_PositiveTerminalDelivery_StopsAfterCallback(bool closeHandle)
+        {
+            RemoteExecutor.Invoke(async closeText =>
+            {
+                bool close = bool.Parse(closeText);
+                const int BadFileDescriptor = 9;
+                const int OperationCanceled = 125;
+                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                TaskCompletionSource drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                AsyncLocal<int> context = new AsyncLocal<int>();
+                TrackingMemoryManager owner = new TrackingMemoryManager();
+                IIoUringOperation? operation = null;
+                bool testing = false;
+                int callbacks = 0;
+                Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                {
+                    if (!testing)
+                    {
+                        buffer?.Dispose();
+                        if (!more)
+                        {
+                            drained.SetResult();
+                        }
+                        return;
+                    }
+
+                    Assert.Equal(0, context.Value);
+                    Assert.Null(SynchronizationContext.Current);
+                    if (++callbacks == 1)
+                    {
+                        Assert.Equal(1, result);
+                        Assert.Same(owner, buffer);
+                        Assert.True(more);
+                        buffer!.Dispose();
+                        context.Value = 42;
+                        SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
+                        if (close)
+                        {
+                            receiver.Dispose();
+                        }
+                        else
+                        {
+                            operation!.RequestCancellation();
+                        }
+                    }
+                    else
+                    {
+                        Assert.Equal(2, callbacks);
+                        Assert.Equal(close ? -BadFileDescriptor : -OperationCanceled, result);
+                        Assert.Null(buffer);
+                        Assert.False(more);
+                    }
+                }, out operation));
+                operation!.RequestCancellation();
+                await drained.Task.WaitAsync(TestSettings.PassingTestTimeout);
+
+                // Model terminal-data delivery with no native request still holding the handle.
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                Type operationType = operation.GetType();
+                const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+                operationType.GetField("_finished", Flags)!.SetValue(operation, false);
+                operationType.GetField("_cancelRequested", Flags)!.SetValue(operation, 0);
+                System.Reflection.MethodInfo deliver = operationType.GetMethod("Deliver", Flags)!;
+#pragma warning restore IL2075
+                testing = true;
+                await Task.Run(() => deliver.Invoke(operation, new object[] { 1, owner, false, Thread.CurrentThread }))
+                    .WaitAsync(TestSettings.PassingTestTimeout);
+                Assert.Equal(2, callbacks);
+                Assert.Equal(1, owner.DisposeCount);
+            }, closeHandle.ToString(), CreateOptions(1)).Dispose();
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1, 1, false)]
         [InlineData(1, 2048, false)]
@@ -708,6 +851,7 @@ namespace System.Net.Sockets.Tests
             private readonly byte[] _buffer = new byte[1];
             public int PinCount;
             public int UnpinCount;
+            public int DisposeCount;
             public Action? OnUnpin;
 
             public override Span<byte> GetSpan() => _buffer;
@@ -726,7 +870,11 @@ namespace System.Net.Sockets.Tests
                 Interlocked.Exchange(ref OnUnpin, null)?.Invoke();
             }
 
-            protected override void Dispose(bool disposing) => Assert.Equal(PinCount, UnpinCount);
+            protected override void Dispose(bool disposing)
+            {
+                Assert.Equal(PinCount, UnpinCount);
+                DisposeCount++;
+            }
         }
 
         private static RemoteInvokeOptions CreateOptions(int ringCount)

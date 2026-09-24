@@ -14,12 +14,13 @@ namespace System.Net.Sockets
     {
         /// <summary>
         /// Streams received data as an <see cref="IAsyncEnumerable{T}"/>, backed by a single persistent
-        /// multishot io_uring receive submitted for the lifetime of the enumeration - see
+        /// multishot io_uring receive submitted for the enumeration - see
         /// <see cref="System.Threading.IoUring.TrySubmitRecvMultishot"/>. Unlike repeatedly calling
-        /// <see cref="ReceiveAsync(Memory{byte}, CancellationToken)"/> in a loop, there is only ever one
-        /// submission for as long as the caller keeps enumerating: the kernel keeps delivering data into
+        /// <see cref="ReceiveAsync(Memory{byte}, CancellationToken)"/> in a loop, there is normally one
+        /// submission for as long as the caller keeps enumerating: the kernel delivers data into
         /// its own pool of buffers as it arrives, without this socket needing to re-arm a new read after
-        /// each one. Each yielded <see cref="IMemoryOwner{Byte}"/> must be disposed once the caller is
+        /// each one. Native submissions terminated by buffer exhaustion or completion-queue pressure are rearmed.
+        /// Each yielded <see cref="IMemoryOwner{Byte}"/> must be disposed once the caller is
         /// done with it - this returns its buffer to the pool so the kernel can reuse it. Enumeration
         /// ends (without an exception) on graceful peer shutdown; stopping enumeration early (e.g.
         /// <c>break</c>, or disposing the enumerator) or triggering <paramref name="cancellationToken"/>

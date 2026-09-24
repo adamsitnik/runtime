@@ -319,9 +319,7 @@ namespace System.Threading
                     {
                         while (_pending.TryDequeue(out PendingCompletion completion))
                         {
-                            Deliver(completion.Result, completion.Buffer, completion.HasMore);
-                            ExecutionContext.ResetThreadPoolThread(currentThread);
-                            currentThread.ResetThreadPoolThread();
+                            Deliver(completion.Result, completion.Buffer, completion.HasMore, currentThread);
                         }
 
                         // Publish the reset before checking for work so neither side can miss
@@ -337,7 +335,8 @@ namespace System.Threading
 
                 /// <summary>
                 /// Transparently resubmits this same still-alive operation after its previous submission
-                /// was terminated by the kernel due to buffer-pool exhaustion (see <see cref="Deliver"/>).
+                /// was terminated by the kernel after delivering data or exhausting its buffer pool
+                /// (see <see cref="Deliver"/>).
                 /// Reuses this instance and acquires a handle reference for the new native submission.
                 /// The caller never observes any interruption, aside from a
                 /// pause in received data until the pool has room again.
@@ -393,29 +392,47 @@ namespace System.Threading
                 /// unlike the generic <see cref="IIoUringOperation.CompleteFromIoUring"/> path, no
                 /// completion-sequence bookkeeping is needed here at all to guarantee true arrival order.
                 /// </summary>
-                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore)
+                private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore, Thread currentThread)
                 {
-                    // The kernel terminates (rather than pausing) a multishot receive once its ring's
-                    // shared provided-buffer pool (see Ring.ReceiveBuffers) is momentarily exhausted -
-                    // this is expected under enough concurrent long-lived receives sharing one pool, not
-                    // a real error/EOF the caller should ever observe. Buffers keep being returned to the
-                    // kernel as consumers dispose them (see ReceiveBufferPool.Return/
-                    // DrainReceiveBufferReturns) independently of whether this particular receive is
-                    // currently submitted, so the retry only needs to wait for the pool to have room
-                    // again, not for anything specific to this fd.
-                    if (!hasMore && result < 0 && Volatile.Read(ref _cancelRequested) == 0 &&
-                        new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS &&
-                        TryResubmit())
-                    {
-                        return;
-                    }
-
                     if (!hasMore)
                     {
+                        if (result > 0)
+                        {
+                            // CQ pressure can terminate a native submission without reaching EOF.
+                            // Transfer the final buffer before rearming, and observe cancellation
+                            // or socket disposal performed by that callback.
+                            InvokeCallback(result, buffer, hasMore: true, currentThread);
+                            buffer = null;
+                            if (Volatile.Read(ref _cancelRequested) == 0 && TryResubmit())
+                            {
+                                return;
+                            }
+
+                            Interop.Error error = Volatile.Read(ref _cancelRequested) != 0
+                                ? Interop.Error.ECANCELED
+                                : Interop.Error.EBADF;
+                            result = -Interop.Sys.ConvertErrorPalToPlatform(error);
+                        }
+                        else if (result < 0 && Volatile.Read(ref _cancelRequested) == 0 &&
+                            new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS &&
+                            TryResubmit())
+                        {
+                            // Exhaustion terminates the native submission, not the logical receive.
+                            // Consumers return buffers independently of this request's lifetime.
+                            return;
+                        }
+
                         _finished = true;
                     }
 
+                    InvokeCallback(result, buffer, hasMore, currentThread);
+                }
+
+                private void InvokeCallback(int result, IMemoryOwner<byte>? buffer, bool hasMore, Thread currentThread)
+                {
                     _onCompleted(result, buffer, hasMore);
+                    ExecutionContext.ResetThreadPoolThread(currentThread);
+                    currentThread.ResetThreadPoolThread();
                 }
 
                 private readonly struct PendingCompletion
