@@ -168,7 +168,7 @@ namespace System.Threading
             /// completions from <see cref="_pending"/> (rather than each completion carrying its own,
             /// separately-allocated work item, as every other <see cref="IIoUringOperation"/> does) is
             /// what lets this type guarantee it only ever has at most one active drainer running - see
-            /// <see cref="ScheduleDispatch"/> and <see cref="IThreadPoolWorkItem.Execute"/>.
+            /// <see cref="MultishotReceiveOperation.EnqueueFromIssuer"/> and <see cref="IThreadPoolWorkItem.Execute"/>.
             /// </summary>
             internal sealed class MultishotReceiveOperation : IIoUringOperation, IThreadPoolWorkItem
             {
@@ -183,11 +183,11 @@ namespace System.Threading
                 // bound to one fd - is routed to exactly one ring (see GetRing), which in turn has
                 // exactly one owning issuer thread. That single-producer guarantee, together with
                 // _dispatchRequested only ever allowing one active drainer at a time (see
-                // ScheduleDispatch), is what delivers every completion to _onCompleted in true arrival
+                // EnqueueFromIssuer), is what delivers every completion to _onCompleted in true arrival
                 // order with no per-completion sequence number needed anywhere in this type, unlike every
                 // other IIoUringOperation's completions, which flow through the generic, order-agnostic
                 // EnqueueCompletions/CompletionProcessorWorkItem path instead (see DrainCompletions).
-                private readonly ConcurrentQueue<PendingCompletion> _pending = new();
+                private readonly SingleProducerSingleConsumerQueue<PendingCompletion> _pending = new();
 
                 // 1 while some worker is already draining (or about to drain) _pending, 0 otherwise - the
                 // standard reset-then-recheck single-active-consumer coalescing flag: whoever wins the
@@ -294,11 +294,6 @@ namespace System.Threading
                     }
 
                     _pending.Enqueue(new PendingCompletion(result, buffer, hasMore));
-                    ScheduleDispatch();
-                }
-
-                private void ScheduleDispatch()
-                {
                     if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
                     {
                         ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);

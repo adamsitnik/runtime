@@ -676,6 +676,75 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalFact(nameof(IsSupported))]
+        public void Multishot_BufferedCompletionsCrossQueueSegments()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (ManualResetEventSlim firstCallback = new())
+                using (ManualResetEventSlim releaseCallback = new())
+                {
+                    TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    int callbacks = 0;
+                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    {
+                        try
+                        {
+                            if (buffer is not null)
+                            {
+                                Assert.True(buffer.Memory.Span.IndexOfAnyExcept((byte)0) < 0);
+                                if (callbacks++ == 0)
+                                {
+                                    firstCallback.Set();
+                                    Assert.True(releaseCallback.Wait(TestSettings.PassingTestTimeout));
+                                }
+                            }
+                            if (!more)
+                            {
+                                Assert.True(callbacks > 32);
+                                completed.TrySetResult();
+                            }
+                        }
+                        catch (Exception error)
+                        {
+                            completed.TrySetException(error);
+                        }
+                        finally
+                        {
+                            buffer?.Dispose();
+                        }
+                    }, out IIoUringOperation? operation));
+                    try
+                    {
+                        sender.Send(new byte[1]);
+                        Assert.True(firstCallback.Wait(TestSettings.PassingTestTimeout));
+                        byte[] bytes = new byte[40 * 16384];
+                        int sent = 0;
+                        while (sent < bytes.Length)
+                        {
+                            sent += sender.Send(bytes.AsSpan(sent));
+                        }
+
+                        object queue = operation!.GetType().GetField("_pending",
+                            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(operation)!;
+#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
+                        System.Reflection.PropertyInfo count = queue.GetType().GetProperty("Count")!;
+#pragma warning restore IL2075
+                        Assert.True(SpinWait.SpinUntil(() => (int)count.GetValue(queue)! > 32, TestSettings.PassingTestTimeout));
+                        operation.RequestCancellation();
+                    }
+                    finally
+                    {
+                        releaseCallback.Set();
+                    }
+                    completed.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
         [OuterLoop]
         public void Multishot_RepeatedPendingReceiveBursts_DoNotLoseWakeup()
         {
