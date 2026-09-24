@@ -121,7 +121,7 @@ namespace System.Threading
                 /// <summary>
                 /// Queues <paramref name="bufferId"/> to be republished to the kernel - see
                 /// <see cref="DrainReturns"/>. Each id has at most one outstanding return, so a
-                /// bit per buffer replaces queue nodes without imposing an ordering on returns.
+                /// bit per buffer tracks returns without preserving their order.
                 /// May be called from any thread (whichever one disposes the corresponding
                 /// <see cref="ReceiveBufferLease"/>).
                 /// </summary>
@@ -225,7 +225,7 @@ namespace System.Threading
                 private readonly IntPtr _fd;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
 
-                // Completions the issuer thread has decoded (see EnqueueFromIssuer) but this operation's
+                // Completions reaped by the issuer thread (see EnqueueFromIssuer) but this operation's
                 // own drainer (see Execute) has not yet delivered to _onCompleted. This queue has exactly
                 // one producer by construction: every fd - and so this operation, which is permanently
                 // bound to one fd - is routed to exactly one ring (see GetRing), which in turn has
@@ -262,7 +262,7 @@ namespace System.Threading
                 private volatile bool _finished;
 
                 // Set by RequestCancellation before it ever submits the actual cancel request - checked
-                // by Deliver so an ENOBUFS auto-rearm (see TryResubmit) can never race ahead of an
+                // by Deliver so an auto-rearm (see TryResubmit) can never race ahead of an
                 // already-requested cancellation and keep this receive silently alive behind the caller's
                 // back.
                 private int _cancelRequested;
@@ -285,7 +285,7 @@ namespace System.Threading
                 /// Requests best-effort cancellation of this operation's current submission (see
                 /// <see cref="IIoUringOperation.RequestCancellation"/>). Marked cancel-requested before the
                 /// actual cancel request is even submitted, so it can never lose a race against Deliver's
-                /// own ENOBUFS auto-rearm (see TryResubmit): once this is set, any in-flight or future
+                /// own auto-rearm (see TryResubmit): once this is set, any in-flight or future
                 /// completion for this operation observes it and will not silently keep the receive alive
                 /// behind the caller's back. Safe to call from any thread - unlike every other operation
                 /// this callback of this class touches, this one runs on whichever arbitrary thread the
@@ -318,7 +318,7 @@ namespace System.Threading
                     throw new UnreachableException();
 
                 /// <summary>
-                /// Decodes one raw completion and queues it for delivery. Called only by this ring's
+                /// Queues one raw completion for delivery. Called only by this ring's
                 /// single issuer thread, directly from <see cref="DrainCompletions"/> - see
                 /// <see cref="_pending"/>'s own doc comment for why that single-caller invariant is what
                 /// makes this operation's delivery order trivially correct.
@@ -334,14 +334,7 @@ namespace System.Threading
                         _handle.DangerousRelease();
                     }
 
-                    IMemoryOwner<byte>? buffer = null;
-                    if (result > 0 && (flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
-                    {
-                        int bufferId = (int)(flags >> Interop.Sys.IoRingCompletion.BufferShift);
-                        buffer = _ring.ReceiveBuffers!.Rent(bufferId, result);
-                    }
-
-                    _pending.Enqueue(new PendingCompletion(result, buffer, hasMore));
+                    _pending.Enqueue(new PendingCompletion(result, flags));
                     if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
                     {
                         ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
@@ -362,7 +355,15 @@ namespace System.Threading
                     {
                         while (_pending.TryDequeue(out PendingCompletion completion))
                         {
-                            Deliver(completion.Result, completion.Buffer, completion.HasMore, currentThread);
+                            IMemoryOwner<byte>? buffer = null;
+                            if (completion.Result > 0 && (completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
+                            {
+                                int bufferId = (int)(completion.Flags >> Interop.Sys.IoRingCompletion.BufferShift);
+                                buffer = _ring.ReceiveBuffers!.Rent(bufferId, completion.Result);
+                            }
+
+                            Deliver(completion.Result, buffer,
+                                (completion.Flags & Interop.Sys.IoRingCompletion.More) != 0, currentThread);
                         }
 
                         // Publish the reset before checking for work so neither side can miss
@@ -481,14 +482,12 @@ namespace System.Threading
                 private readonly struct PendingCompletion
                 {
                     public readonly int Result;
-                    public readonly IMemoryOwner<byte>? Buffer;
-                    public readonly bool HasMore;
+                    public readonly uint Flags;
 
-                    public PendingCompletion(int result, IMemoryOwner<byte>? buffer, bool hasMore)
+                    public PendingCompletion(int result, uint flags)
                     {
                         Result = result;
-                        Buffer = buffer;
-                        HasMore = hasMore;
+                        Flags = flags;
                     }
                 }
             }

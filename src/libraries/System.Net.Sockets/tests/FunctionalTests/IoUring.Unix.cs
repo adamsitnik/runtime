@@ -694,11 +694,19 @@ namespace System.Net.Sockets.Tests
                         {
                             if (buffer is not null)
                             {
-                                Assert.True(buffer.Memory.Span.IndexOfAnyExcept((byte)0) < 0);
+                                Assert.Equal(result, buffer.Memory.Length);
                                 if (callbacks++ == 0)
                                 {
+                                    Assert.Equal(1, buffer.Memory.Length);
+                                    Assert.Equal(0x5A, buffer.Memory.Span[0]);
                                     firstCallback.Set();
                                     Assert.True(releaseCallback.Wait(TestSettings.PassingTestTimeout));
+                                    Assert.Equal(1, buffer.Memory.Length);
+                                    Assert.Equal(0x5A, buffer.Memory.Span[0]);
+                                }
+                                else
+                                {
+                                    Assert.True(buffer.Memory.Span.IndexOfAnyExcept((byte)0) < 0);
                                 }
                             }
                             if (!more)
@@ -718,7 +726,7 @@ namespace System.Net.Sockets.Tests
                     }, out IIoUringOperation? operation));
                     try
                     {
-                        sender.Send(new byte[1]);
+                        Assert.Equal(1, sender.Send(new byte[] { 0x5A }));
                         Assert.True(firstCallback.Wait(TestSettings.PassingTestTimeout));
                         byte[] bytes = new byte[40 * 16384];
                         int sent = 0;
@@ -742,6 +750,45 @@ namespace System.Net.Sockets.Tests
                     completed.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
                 }
             }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Multishot_RetainedBufferDoesNotChangeWhenOtherBuffersCycle()
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "4";
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_SIZE"] = "128";
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout))
+                {
+                    await using IAsyncEnumerator<IMemoryOwner<byte>> reader =
+                        receiver.ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                    byte[] first = new byte[] { 1, 2, 3, 4, 5, 6, 7 };
+                    Assert.Equal(first.Length, sender.Send(first));
+                    Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                    using IMemoryOwner<byte> retained = reader.Current;
+                    byte[] next = new byte[1];
+                    for (int index = 0; index < 128; index++)
+                    {
+                        next[0] = (byte)index;
+                        Assert.Equal(1, sender.Send(next));
+                        Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                        using (IMemoryOwner<byte> current = reader.Current)
+                        {
+                            Assert.Equal(1, current.Memory.Length);
+                            Assert.Equal(next[0], current.Memory.Span[0]);
+                        }
+                        Assert.Equal(first, retained.Memory.ToArray());
+                    }
+                    await reader.DisposeAsync();
+                    receiver.Dispose();
+                    Assert.Equal(first, retained.Memory.ToArray());
+                }
+            }, options).Dispose();
         }
 
         [ConditionalFact(nameof(IsSupported))]
