@@ -752,10 +752,6 @@ namespace System.Threading
                             finalCompletions++;
                         }
 
-                        // Must happen on this single issuer thread, strictly before this completion is
-                        // handed off to a worker (below) - see RetainOperationToken's doc comment.
-                        long sequence = RetainOperationToken(ring, completion.UserData);
-
                         // A still-active multishot receive is delivered entirely inline here instead of
                         // going through the generic completion queue below: every fd - and so every one
                         // of its operations - is permanently bound to exactly one ring (see GetRing),
@@ -770,10 +766,16 @@ namespace System.Threading
                         if (PeekOperationToken(ring, completion.UserData) is MultishotReceiveOperation multishotReceive)
                         {
                             multishotReceive.EnqueueFromIssuer(completion.Result, completion.Flags);
-                            ReleaseOperationToken(ring, completion.UserData, isFinal);
+                            if (isFinal)
+                            {
+                                // Workers hold the operation directly, not its correlation token.
+                                RetainOperationToken(ring, completion.UserData);
+                                ReleaseOperationToken(ring, completion.UserData, isFinal: true);
+                            }
                             continue;
                         }
 
+                        long sequence = RetainOperationToken(ring, completion.UserData);
                         completionsBatch[keepCount] = completion;
                         sequenceBatch[keepCount] = sequence;
                         keepCount++;
