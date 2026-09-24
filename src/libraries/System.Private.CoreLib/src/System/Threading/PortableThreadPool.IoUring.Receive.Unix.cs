@@ -314,11 +314,14 @@ namespace System.Threading
                 /// </summary>
                 void IThreadPoolWorkItem.Execute()
                 {
+                    Thread currentThread = Thread.CurrentThread;
                     while (true)
                     {
                         while (_pending.TryDequeue(out PendingCompletion completion))
                         {
                             Deliver(completion.Result, completion.Buffer, completion.HasMore);
+                            ExecutionContext.ResetThreadPoolThread(currentThread);
+                            currentThread.ResetThreadPoolThread();
                         }
 
                         Volatile.Write(ref _dispatchRequested, 0);

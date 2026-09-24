@@ -532,6 +532,68 @@ namespace System.Net.Sockets.Tests
             }, new RemoteInvokeOptions { StartInfo = { Environment = { ["DOTNET_USE_IO_URING"] = "0" } } }).Dispose();
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void Multishot_CallbacksIsolateThreadState(int ringCount)
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                LimitThreadPoolToOneWorker();
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (ManualResetEventSlim firstCallback = new())
+                using (ManualResetEventSlim releaseCallback = new())
+                {
+                    AsyncLocal<int> context = new();
+                    TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    int callbacks = 0;
+                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    {
+                        try
+                        {
+                            Assert.True(Thread.CurrentThread.IsThreadPoolThread);
+                            Assert.Equal(0, context.Value);
+                            Assert.Null(SynchronizationContext.Current);
+                            context.Value = 99;
+                            SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
+                            if (callbacks++ == 0)
+                            {
+                                firstCallback.Set();
+                                Assert.True(releaseCallback.Wait(TestSettings.PassingTestTimeout));
+                            }
+                            if (!more)
+                            {
+                                Assert.Equal(0, result);
+                                Assert.True(callbacks >= 2);
+                                completed.TrySetResult();
+                            }
+                        }
+                        catch (Exception error)
+                        {
+                            completed.TrySetException(error);
+                        }
+                        finally
+                        {
+                            buffer?.Dispose();
+                        }
+                    }, out IIoUringOperation? operation));
+                    try
+                    {
+                        sender.Send(new byte[] { 42 });
+                        Assert.True(firstCallback.Wait(TestSettings.PassingTestTimeout));
+                        sender.Shutdown(SocketShutdown.Send);
+                    }
+                    finally
+                    {
+                        releaseCallback.Set();
+                    }
+                    completed.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                }
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
         private static void LimitThreadPoolToOneWorker()
         {
             ThreadPool.GetMinThreads(out _, out int completionPortThreads);
