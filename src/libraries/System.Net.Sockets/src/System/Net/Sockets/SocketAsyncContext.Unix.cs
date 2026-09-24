@@ -2089,7 +2089,7 @@ namespace System.Net.Sockets
             }
 
             if (ready && socketAddress.Length == 0 &&
-                TrySendViaIoUring(buffer, offset, count, flags, callback))
+                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback))
             {
                 return SocketError.IOPending;
             }
