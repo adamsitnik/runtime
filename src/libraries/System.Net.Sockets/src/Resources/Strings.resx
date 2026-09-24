@@ -174,6 +174,9 @@
   <data name="net_sockets_zerolist" xml:space="preserve">
     <value>The parameter {0} must contain one or more elements.</value>
   </data>
+  <data name="net_sockets_io_uring_epoll_fallback" xml:space="preserve">
+    <value>Unexpected epoll fallback while io_uring is enabled.</value>
+  </data>
   <data name="net_sockets_multishot_not_supported" xml:space="preserve">
     <value>Multishot receive is not supported because the io_uring Thread Pool integration is unavailable on this system.</value>
   </data>

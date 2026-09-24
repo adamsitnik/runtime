@@ -84,6 +84,11 @@ namespace System.Net.Sockets
 
         private static SocketAsyncEngine[] CreateEngines()
         {
+            if (IoUring.IsSupported)
+            {
+                return [];
+            }
+
             int engineCount = GetEngineCount();
 
             var engines = new SocketAsyncEngine[engineCount];
@@ -123,6 +128,11 @@ namespace System.Net.Sockets
         //
         public static bool TryRegisterSocket(IntPtr socketHandle, SocketAsyncContext context, out SocketAsyncEngine? engine, out Interop.Error error)
         {
+            if (IoUring.IsSupported)
+            {
+                throw new InvalidOperationException(SR.net_sockets_io_uring_epoll_fallback);
+            }
+
             int engineIndex = Math.Abs(Interlocked.Increment(ref s_allocateFromEngine) % s_engines.Length);
             SocketAsyncEngine nextEngine = s_engines[engineIndex];
             bool registered = nextEngine.TryRegisterCore(socketHandle, context, out error);

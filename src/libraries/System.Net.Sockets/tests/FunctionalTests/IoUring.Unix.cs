@@ -17,6 +17,65 @@ namespace System.Net.Sockets.Tests
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
         [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void SocketAsyncEngine_CreationDependsOnIoUring(bool useIoUring)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_USE_IO_URING"] = useIoUring ? "1" : "0";
+            options.StartInfo.Environment["DOTNET_SYSTEM_NET_SOCKETS_THREAD_COUNT"] = "1";
+            RemoteExecutor.Invoke(enabledText =>
+            {
+                bool enabled = bool.Parse(enabledText);
+                using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                Assert.Equal(enabled, IoUring.IsSupported);
+
+                Type engineType = typeof(Socket).Assembly.GetType("System.Net.Sockets.SocketAsyncEngine", throwOnError: true)!;
+#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
+                Array engines = (Array)engineType.GetField("s_engines",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null)!;
+#pragma warning restore IL2075
+                Assert.Equal(enabled ? 0 : 1, engines.Length);
+            }, useIoUring.ToString(), options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void SocketAsyncEngine_FallbackRejectedWhenIoUringEnabled(bool useIoUring)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_USE_IO_URING"] = useIoUring ? "1" : "0";
+            RemoteExecutor.Invoke(async enabledText =>
+            {
+                bool enabled = bool.Parse(enabledText);
+                Assert.Equal(enabled, IoUring.IsSupported);
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    if (enabled)
+                    {
+                        await Assert.ThrowsAsync<InvalidOperationException>(ReceiveWithPeek);
+                    }
+                    else
+                    {
+                        await ReceiveWithPeek();
+                    }
+
+                    async Task ReceiveWithPeek()
+                    {
+                        byte[] buffer = new byte[1];
+                        Task<int> pending = receiver.ReceiveAsync(buffer.AsMemory(), SocketFlags.Peek).AsTask();
+                        Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                        Assert.Equal(1, await pending.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(42, buffer[0]);
+                    }
+                }
+            }, useIoUring.ToString(), options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1)]
         [InlineData(3)]
         public void PendingAccept_CompletesOnWorker(int ringCount)
