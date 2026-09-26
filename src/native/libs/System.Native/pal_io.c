@@ -2357,10 +2357,8 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
             sqe->len = (uint32_t)request->BufferLength;
             sqe->msg_flags = (uint32_t)request->Flags;
-            // Sends are submitted only after an optimistic userspace send returned EWOULDBLOCK.
-#if defined(IORING_RECVSEND_POLL_FIRST)
-            sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
-#endif
+            // Paired submissions have not attempted a userspace send. Try sending before
+            // arming a poll; the kernel still polls if the socket cannot accept the data.
             break;
         case IoRingOp_Cancel:
             // Targets a still-pending request by its own user_data (addr), looked up within this

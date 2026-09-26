@@ -52,6 +52,7 @@ namespace Microsoft.Win32.SafeHandles
             // the operation using _ioUringResult instead of performing a blocking syscall.
             private bool _completedViaIoUring;
             private int _ioUringResult;
+            private Interop.Sys.IoRingRequest _ioUringRequest;
 
             // io_uring in-flight pinning/ref-counting state. These are populated only while an io_uring
             // submission for this instance is outstanding, and are always fully cleaned up (pins
@@ -201,79 +202,46 @@ namespace Microsoft.Win32.SafeHandles
                 }
             }
 
-            /// <summary>
-            /// Performs completion bookkeeping and returns the continuation for worker dispatch.
-            /// This can run on the issuer in legacy dispatch mode, so it must not invoke user code.
-            /// </summary>
-            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+            IoUringRequest IIoUringOperation.Request => new IoUringRequest(_ioUringRequest);
+
+            IoUringOperationStatus IIoUringOperation.IssuerThread(int result, uint flags, long sequence)
             {
-                if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
-                    && TryContinuePartialWrite(result, out IThreadPoolWorkItem? fallbackWorkItem))
+                if (result > 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
+                    && TryContinuePartialWrite(result))
                 {
-                    // The write completed for fewer bytes than requested. Either we've already
-                    // resubmitted an io_uring request for the remainder (fallbackWorkItem is null, this
-                    // instance is still in flight, nothing to queue yet), or resubmission itself failed
-                    // and fallbackWorkItem is this instance, to be finalized via the ordinary blocking
-                    // path instead.
-                    return fallbackWorkItem;
+                    return IoUringOperationStatus.ReSubmit;
+                }
+                if (result == 0 &&
+                    ((_operation == Operation.Write && _ioUringRequest.BufferLength != 0) ||
+                     (_operation == Operation.WriteGather && _remainingBytesToWrite != 0)))
+                {
+                    result = -Interop.Sys.ConvertErrorPalToPlatform(Interop.Error.EIO);
                 }
 
                 _ioUringResult = result;
                 _completedViaIoUring = true;
-                return this;
+                return IoUringOperationStatus.Schedule;
             }
 
             // This type's operations complete exactly once and are not (yet) cancellable once submitted
             // in this prototype - see IIoUringOperation.RequestCancellation's own doc comment.
             void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
 
-            /// <summary>
-            /// If <paramref name="bytesWritten"/> represents a partial write (fewer bytes than were
-            /// requested by the most recent submission), advances the write state and attempts to
-            /// resubmit an io_uring request for the remainder. Returns true if a resubmission was made
-            /// (regardless of whether it itself succeeded). On success, <paramref name="fallbackWorkItem"/>
-            /// is <see langword="null"/> (this instance is still in flight). On resubmission failure,
-            /// <paramref name="fallbackWorkItem"/> is <see langword="this"/>, meaning the caller should
-            /// still queue it (falling back to completing the remainder via the ordinary blocking path).
-            /// Returns false if the write was already complete (or this isn't a write operation), in which
-            /// case <paramref name="fallbackWorkItem"/> is <see langword="null"/> and the caller should
-            /// finalize the operation as usual.
-            /// </summary>
-            private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? fallbackWorkItem)
+            private unsafe bool TryContinuePartialWrite(int bytesWritten)
             {
-                fallbackWorkItem = null;
-
                 if (_operation == Operation.Write)
                 {
-                    if (bytesWritten >= _singleSegment.Length)
+                    if (bytesWritten >= _ioUringRequest.BufferLength)
                     {
                         return false;
                     }
 
-                    // The old pin is no longer valid once we reslice; TrySubmitWrite re-pins the
-                    // remainder. _context was already captured when the operation was originally queued.
-                    _singleSegmentPin.Dispose();
-                    _singleSegmentPin = default;
-                    if (_fileHandleRefAdded)
-                    {
-                        _fileHandle.DangerousRelease();
-                        _fileHandleRefAdded = false;
-                    }
-
+                    _ioUringRequest.Buffer += bytesWritten;
+                    _ioUringRequest.BufferLength -= bytesWritten;
+                    // Preserve FileStream's remaining-byte error accounting without releasing the original pin.
                     _singleSegment = _singleSegment.Slice(bytesWritten);
-                    _fileOffset += bytesWritten;
-
-                    if (!TrySubmitWrite())
-                    {
-                        // Fall back to the ordinary blocking path for just the remainder: _singleSegment
-                        // and _fileOffset already reflect only the not-yet-written data.
-                        fallbackWorkItem = this;
-                    }
-
-                    return true;
                 }
-
-                if (_operation == Operation.WriteGather)
+                else
                 {
                     _remainingBytesToWrite -= bytesWritten;
                     if (_remainingBytesToWrite <= 0)
@@ -281,61 +249,16 @@ namespace Microsoft.Win32.SafeHandles
                         return false;
                     }
 
-                    _fileOffset += bytesWritten;
                     AdvanceVectorsAfterPartialWrite(bytesWritten);
-
-                    // Release just the file-handle ref added for the previous submission; the vector
-                    // pins/array remain valid and are reused (with an adjusted window) for the resubmit.
-                    if (_fileHandleRefAdded)
-                    {
-                        _fileHandle.DangerousRelease();
-                        _fileHandleRefAdded = false;
-                    }
-
-                    if (!TrySubmitWriteGatherRemainder())
-                    {
-                        // Rare: the resubmission itself could not be queued (e.g., the submission queue
-                        // is momentarily full). Fall back to the ordinary blocking path, but only for the
-                        // remaining (not-yet-written) data.
-                        SwapToRemainingWriteGatherBuffers();
-                        ReleaseIoUringState();
-                        fallbackWorkItem = this;
-                    }
-
-                    return true;
+                    _ioUringRequest.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
+                    _ioUringRequest.VectorCount = _vectors!.Length - _vectorsOffset;
                 }
 
-                return false;
-            }
-
-            /// <summary>
-            /// Replaces <see cref="_writeGatherBuffers"/> with just the not-yet-written remainder (based
-            /// on <see cref="_vectorsOffset"/> and the current, possibly-adjusted, first remaining
-            /// vector's length), so that the ordinary blocking <see cref="RandomAccess.WriteGatherAtOffset"/>
-            /// fallback path writes only what's left, not the original buffers from the start.
-            /// </summary>
-            private void SwapToRemainingWriteGatherBuffers()
-            {
-                Debug.Assert(_writeGatherBuffers != null && _vectors != null);
-                IReadOnlyList<ReadOnlyMemory<byte>> original = _writeGatherBuffers;
-                Interop.Sys.IOVector[] vectors = _vectors;
-                int offset = _vectorsOffset;
-                int remainingCount = original.Count - offset;
-
-                var remaining = new ReadOnlyMemory<byte>[remainingCount];
-                for (int i = 0; i < remainingCount; i++)
+                if (_ioUringRequest.Offset != -1)
                 {
-                    int srcIndex = offset + i;
-                    ReadOnlyMemory<byte> buffer = original[srcIndex];
-                    if (i == 0)
-                    {
-                        int consumed = buffer.Length - (int)vectors[srcIndex].Count;
-                        buffer = buffer.Slice(consumed);
-                    }
-                    remaining[i] = buffer;
+                    _ioUringRequest.Offset += bytesWritten;
                 }
-
-                _writeGatherBuffers = remaining;
+                return true;
             }
 
             /// <summary>
@@ -475,6 +398,7 @@ namespace Microsoft.Win32.SafeHandles
 
                     // Completion may run as soon as the request is published.
                     _fileHandleRefAdded = refAdded;
+                    _ioUringRequest = request;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
                         return true;
@@ -516,6 +440,7 @@ namespace Microsoft.Win32.SafeHandles
                     request.BufferLength = _singleSegment.Length;
 
                     _fileHandleRefAdded = refAdded;
+                    _ioUringRequest = request;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
                         return true;
@@ -579,6 +504,7 @@ namespace Microsoft.Win32.SafeHandles
                     _vectors = vectors;
                     _vectorsHandle = vectorsHandle;
                     _fileHandleRefAdded = refAdded;
+                    _ioUringRequest = request;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
                         return true;
@@ -656,6 +582,7 @@ namespace Microsoft.Win32.SafeHandles
                     _vectorsOffset = 0;
                     _remainingBytesToWrite = totalBytesToWrite;
                     _fileHandleRefAdded = refAdded;
+                    _ioUringRequest = request;
                     if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
                     {
                         return true;
@@ -679,53 +606,6 @@ namespace Microsoft.Win32.SafeHandles
                 {
                     pins[i].Dispose();
                 }
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
-            }
-
-            /// <summary>
-            /// Resubmits the remaining (not-yet-written) portion of a WriteGather operation. Reuses the
-            /// already-pinned <see cref="_vectorsHandle"/>/<see cref="_vectorPins"/> from the original
-            /// submission (never freed/re-pinned between partial-write retries - only the request's
-            /// window into the same pinned array changes), advanced by
-            /// <see cref="AdvanceVectorsAfterPartialWrite"/>.
-            /// </summary>
-            private unsafe bool TrySubmitWriteGatherRemainder()
-            {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
-
-                Debug.Assert(_vectors != null && _vectorPins != null && _vectorsHandle.IsAllocated);
-                int remainingCount = _vectors.Length - _vectorsOffset;
-
-                bool refAdded = false;
-                try
-                {
-                    _fileHandle.DangerousAddRef(ref refAdded);
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.WriteV;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
-                    request.VectorCount = remainingCount;
-
-                    _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
-                    {
-                        return true;
-                    }
-                }
-                catch
-                {
-                }
-
-                _fileHandleRefAdded = false;
                 if (refAdded)
                 {
                     _fileHandle.DangerousRelease();

@@ -82,10 +82,33 @@ namespace System.Threading
     // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
     // src/libraries/System.Private.CoreLib/src/System/Threading/PortableThreadPool.IoUring.Unix.cs for details.
     [System.CLSCompliantAttribute(false)]
-    public interface IIoUringOperation
+    public interface IIoUringOperation : System.Threading.IThreadPoolWorkItem
     {
-        System.Threading.IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
+        System.Threading.IoUringRequest Request { get; }
+        System.Threading.IoUringOperationStatus IssuerThread(int result, uint flags, long sequence);
         void RequestCancellation();
+    }
+    [System.CLSCompliantAttribute(false)]
+    public abstract class IoUringOperation : System.Threading.IIoUringOperation
+    {
+        protected IoUringOperation() { }
+        public bool IsCancellationRequested { get { throw null; } }
+        public bool IsPending { get { throw null; } }
+        public abstract System.Threading.IoUringRequest Request { get; }
+        public abstract void Execute();
+        public abstract System.Threading.IoUringOperationStatus IssuerThread(int result, uint flags, long sequence);
+        public void RequestCancellation() { }
+    }
+    public enum IoUringOperationStatus
+    {
+        Done = 0,
+        ReSubmit = 1,
+        Schedule = 2,
+    }
+    public readonly partial struct IoUringRequest
+    {
+        public static System.Threading.IoUringRequest Receive(System.IntPtr buffer, int length, int flags = 0) { throw null; }
+        public static System.Threading.IoUringRequest Send(System.IntPtr buffer, int length, int flags = 0) { throw null; }
     }
     // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
     // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.Unix.cs for details.
@@ -93,6 +116,8 @@ namespace System.Threading
     public static class IoUring
     {
         public static bool IsSupported { get { throw null; } }
+        public static bool TrySubmit(System.Runtime.InteropServices.SafeHandle handle, System.Threading.IIoUringOperation operation) { throw null; }
+        public static bool TrySubmit(System.Runtime.InteropServices.SafeHandle handle, System.Threading.IIoUringOperation first, System.Threading.IIoUringOperation second) { throw null; }
         public static unsafe bool TrySubmitRecv(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitSend(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitAccept(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, int flags, System.Action<int> onCompleted) { throw null; }

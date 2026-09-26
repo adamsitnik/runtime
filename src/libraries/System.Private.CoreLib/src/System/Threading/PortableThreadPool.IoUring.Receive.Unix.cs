@@ -310,7 +310,9 @@ namespace System.Threading
                     TrySubmit(CancelSentinelOperation.Instance, in request);
                 }
 
-                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) =>
+                IoUringRequest IIoUringOperation.Request => throw new UnreachableException();
+
+                IoUringOperationStatus IIoUringOperation.IssuerThread(int result, uint flags, long sequence) =>
                     // Never actually reached: this operation's completions are always intercepted and
                     // delivered inline by the issuer thread itself (see DrainCompletions/EnqueueFromIssuer),
                     // never handed to the generic EnqueueCompletions/CompletionProcessorWorkItem path that
@@ -433,7 +435,7 @@ namespace System.Threading
                 /// drainer (see <see cref="IThreadPoolWorkItem.Execute"/>), which guarantees at most one
                 /// active caller of this method at a time, dequeuing completions in the exact order this
                 /// ring's single issuer thread enqueued them (see <see cref="EnqueueFromIssuer"/>) - so,
-                /// unlike the generic <see cref="IIoUringOperation.CompleteFromIoUring"/> path, no
+                /// unlike the generic <see cref="IIoUringOperation.IssuerThread"/> path, no
                 /// completion-sequence bookkeeping is needed here at all to guarantee true arrival order.
                 /// </summary>
                 private void Deliver(int result, IMemoryOwner<byte>? buffer, bool hasMore, Thread currentThread)
@@ -508,7 +510,11 @@ namespace System.Threading
                 {
                 }
 
-                IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) => null;
+                IoUringRequest IIoUringOperation.Request => throw new UnreachableException();
+
+                IoUringOperationStatus IIoUringOperation.IssuerThread(int result, uint flags, long sequence) => IoUringOperationStatus.Done;
+
+                void IThreadPoolWorkItem.Execute() => throw new UnreachableException();
 
                 void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
             }

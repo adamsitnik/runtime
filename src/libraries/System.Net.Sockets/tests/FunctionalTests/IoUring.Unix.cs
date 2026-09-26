@@ -16,6 +16,221 @@ namespace System.Net.Sockets.Tests
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
+        [ConditionalFact(nameof(IsSupported))]
+        public void PairedSubmission_RejectsMovingOperationAcrossRings()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket server, Socket client) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (server)
+                using (client)
+                using (TestOperation operation = new TestOperation(send: false, new byte[1], schedule: true))
+                {
+                    Assert.True(IoUring.TrySubmit(server.SafeHandle, operation));
+                    Assert.Equal(1, client.Send(new byte[] { 1 }));
+                    Assert.Equal(1, await operation.Completed.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                    List<Socket> sockets = new List<Socket>();
+                    try
+                    {
+                        Socket other;
+                        do
+                        {
+                            other = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                            sockets.Add(other);
+                        }
+                        while ((long)other.SafeHandle.DangerousGetHandle() % 3 == (long)server.SafeHandle.DangerousGetHandle() % 3);
+                        Assert.Throws<InvalidOperationException>(() => IoUring.TrySubmit(other.SafeHandle, operation));
+                        Assert.False(operation.IsPending);
+                    }
+                    finally
+                    {
+                        foreach (Socket socket in sockets)
+                        {
+                            socket.Dispose();
+                        }
+                    }
+                }
+            }, CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(3)]
+        public void PairedSubmission_PartialSendsStayOnIssuer(int ringCount)
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket server, Socket client) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (server)
+                using (client)
+                using (TestOperation send = new TestOperation(send: true, new byte[2 * 1024 * 1024], schedule: false))
+                using (TestOperation receive = new TestOperation(send: false, new byte[1], schedule: true))
+                {
+                    Array.Fill(send.Buffer, (byte)0x5A);
+                    server.SendBufferSize = 1024;
+                    Assert.True(IoUring.TrySubmit(server.SafeHandle, send, receive));
+                    Assert.Equal(1, client.Send(new byte[] { 42 }));
+                    Assert.Equal(1, await receive.Completed.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(42, receive.Buffer[0]);
+                    Assert.True(send.IsPending);
+                    byte[] buffer = new byte[8192];
+                    int total = 0;
+                    while (total < send.Buffer.Length)
+                    {
+                        int read = client.Receive(buffer);
+                        Assert.True(read > 0);
+                        Assert.All(buffer.AsSpan(0, read).ToArray(), value => Assert.Equal(0x5A, value));
+                        total += read;
+                    }
+                    Assert.True(SpinWait.SpinUntil(() => !send.IsPending, TestSettings.PassingTestTimeout));
+                    Assert.Equal(send.Buffer.Length, send.Offset);
+                    Assert.True(send.CompletionCount > 1);
+                    Assert.Equal(0, send.WorkerCount);
+                    Assert.Equal(1, receive.WorkerCount);
+                    Assert.False(send.IssuerWasWorker);
+                    Assert.False(receive.IssuerWasWorker);
+                    Assert.True(receive.WorkerWasWorker);
+                }
+            }, CreateOptions(ringCount)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void PairedSubmission_CancelAndRollback(bool pair)
+        {
+            RemoteExecutor.Invoke(async pairText =>
+            {
+                (Socket server, Socket client) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (server)
+                using (client)
+                using (TestOperation first = new TestOperation(send: false, new byte[1], schedule: true))
+                using (TestOperation second = new TestOperation(send: false, new byte[1], schedule: true))
+                {
+                    if (bool.Parse(pairText))
+                    {
+                        Assert.True(IoUring.TrySubmit(server.SafeHandle, first, second));
+                    }
+                    else
+                    {
+                        Assert.True(IoUring.TrySubmit(server.SafeHandle, second));
+                        Assert.Throws<InvalidOperationException>(() => IoUring.TrySubmit(server.SafeHandle, first, second));
+                        Assert.False(first.IsPending);
+                        Assert.True(IoUring.TrySubmit(server.SafeHandle, first));
+                    }
+                    first.RequestCancellation();
+                    second.RequestCancellation();
+                    Assert.True(await first.Completed.Task.WaitAsync(TestSettings.PassingTestTimeout) < 0);
+                    Assert.True(await second.Completed.Task.WaitAsync(TestSettings.PassingTestTimeout) < 0);
+                    Assert.False(first.IsPending);
+                    Assert.False(second.IsPending);
+                    Assert.Throws<OperationCanceledException>(() => IoUring.TrySubmit(server.SafeHandle, first));
+                }
+            }, pair.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void PairedSubmission_PressurePreservesEveryOperation()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket server, Socket client) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (server)
+                using (client)
+                {
+                    List<TestOperation> operations = new List<TestOperation>();
+                    try
+                    {
+                        // Exceeds both the submission batch and the bounded operation-token table.
+                        for (int index = 0; index < 1100; index += 2)
+                        {
+                            TestOperation first = new TestOperation(send: false, new byte[1], schedule: true);
+                            TestOperation second = new TestOperation(send: false, new byte[1], schedule: true);
+                            operations.Add(first);
+                            operations.Add(second);
+                            Assert.True(IoUring.TrySubmit(server.SafeHandle, first, second));
+                        }
+                        foreach (TestOperation operation in operations)
+                        {
+                            operation.RequestCancellation();
+                        }
+                        foreach (TestOperation operation in operations)
+                        {
+                            Assert.True(await operation.Completed.Task.WaitAsync(TestSettings.PassingTestTimeout) < 0);
+                            Assert.Equal(1, operation.WorkerCount);
+                        }
+                    }
+                    finally
+                    {
+                        foreach (TestOperation operation in operations)
+                        {
+                            operation.Dispose();
+                        }
+                    }
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        private sealed class TestOperation : IoUringOperation, IDisposable
+        {
+            private readonly bool _send;
+            private readonly bool _schedule;
+            private GCHandle _pin;
+            private int _result;
+            public readonly byte[] Buffer;
+            public readonly TaskCompletionSource<int> Completed = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public int Offset;
+            public int CompletionCount;
+            public int WorkerCount;
+            public bool IssuerWasWorker;
+            public bool WorkerWasWorker;
+
+            internal TestOperation(bool send, byte[] buffer, bool schedule)
+            {
+                _send = send;
+                _schedule = schedule;
+                Buffer = buffer;
+                _pin = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            }
+
+            public override IoUringRequest Request => _send
+                ? IoUringRequest.Send(_pin.AddrOfPinnedObject() + Offset, Buffer.Length - Offset)
+                : IoUringRequest.Receive(_pin.AddrOfPinnedObject(), Buffer.Length);
+
+            public override IoUringOperationStatus IssuerThread(int result, uint flags, long sequence)
+            {
+                IssuerWasWorker |= Thread.CurrentThread.IsThreadPoolThread;
+                CompletionCount++;
+                _result = result;
+                if (_send && result > 0)
+                {
+                    Offset += result;
+                    if (Offset != Buffer.Length)
+                    {
+                        return IoUringOperationStatus.ReSubmit;
+                    }
+                }
+                return _schedule || result < 0 ? IoUringOperationStatus.Schedule : IoUringOperationStatus.Done;
+            }
+
+            public override void Execute()
+            {
+                WorkerWasWorker = Thread.CurrentThread.IsThreadPoolThread;
+                WorkerCount++;
+                Completed.TrySetResult(_result);
+            }
+
+            public void Dispose()
+            {
+                RequestCancellation();
+                Assert.True(SpinWait.SpinUntil(() => !IsPending, TestSettings.PassingTestTimeout));
+                if (_pin.IsAllocated)
+                {
+                    _pin.Free();
+                }
+            }
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(false)]
         [InlineData(true)]

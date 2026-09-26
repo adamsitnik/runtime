@@ -13,6 +13,37 @@ namespace System.IO.Tests
     [PlatformSpecific(TestPlatforms.AnyUnix)]
     public partial class SafeFileHandle_GetFileType_Unix : FileSystemTest
     {
+        public static bool SupportsIoUring => RemoteExecutor.IsSupported && OperatingSystem.IsLinux() && System.Threading.IoUring.IsSupported;
+
+        [ConditionalFact(nameof(SupportsIoUring))]
+        public void AsyncWritePreservesPositionAfterPartialFailure()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                const int LinuxSignalFileSizeExceeded = 25;
+                const ulong FileSizeLimit = 4096;
+                string path = Path.GetTempFileName();
+                Assert.Equal(0, Interop.Sys.GetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, out Interop.Sys.RLimit original));
+                Interop.Sys.RLimit limited = original;
+                limited.CurrentLimit = FileSizeLimit;
+                using PosixSignalRegistration registration = PosixSignalRegistration.Create(
+                    (PosixSignal)LinuxSignalFileSizeExceeded, context => context.Cancel = true);
+                try
+                {
+                    using FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite, 1, useAsync: true);
+                    Assert.Equal(0, Interop.Sys.SetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, ref limited));
+                    await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => stream.WriteAsync(new byte[8192]).AsTask());
+                    Assert.Equal((long)FileSizeLimit, stream.Length);
+                    Assert.Equal((long)FileSizeLimit, stream.Position);
+                }
+                finally
+                {
+                    Assert.Equal(0, Interop.Sys.SetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, ref original));
+                    File.Delete(path);
+                }
+            }).Dispose();
+        }
+
         [Fact]
         public void GetFileType_Directory()
         {

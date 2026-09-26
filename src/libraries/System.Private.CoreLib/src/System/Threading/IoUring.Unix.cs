@@ -11,7 +11,7 @@ namespace System.Threading
     /// </summary>
     /// <remarks>
     /// This prototype shares sharded rings with <see cref="System.IO.RandomAccess"/> on Linux.
-    /// Each ring has one dedicated issuer; completion callbacks run on Thread Pool workers.
+    /// Each ring has one dedicated issuer for completion decisions; application callbacks run on Thread Pool workers.
     /// The API may change incompatibly or be removed without notice.
     /// </remarks>
     [CLSCompliant(false)]
@@ -23,6 +23,43 @@ namespace System.Threading
         /// <see langword="false"/> and callers should use their normal (non-io_uring) code path.
         /// </summary>
         public static bool IsSupported => PortableThreadPool.IoUringThreadPool.IsEnabled;
+
+        /// <summary>Queues a reusable single-shot operation without entering the kernel.</summary>
+        /// <param name="handle">The handle retained until terminal completion.</param>
+        /// <param name="operation">An operation derived from <see cref="IoUringOperation"/>.</param>
+        /// <returns><see langword="true"/> if accepted; otherwise, <see langword="false"/> if unavailable.</returns>
+        public static bool TrySubmit(SafeHandle handle, IIoUringOperation operation)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            ArgumentNullException.ThrowIfNull(operation);
+            if (operation is not IoUringOperation reusable)
+            {
+                throw new ArgumentException(SR.IoUring_ReusableOperationRequired, nameof(operation));
+            }
+            return PortableThreadPool.IoUringThreadPool.TrySubmit(handle, reusable, null);
+        }
+
+        /// <summary>Queues two reusable operations atomically on one ring, with one coalesced wake.</summary>
+        /// <param name="handle">The shared handle retained until both operations finish.</param>
+        /// <param name="first">The first operation, derived from <see cref="IoUringOperation"/>.</param>
+        /// <param name="second">The distinct second operation, derived from <see cref="IoUringOperation"/>.</param>
+        /// <returns><see langword="true"/> if both were accepted; otherwise, <see langword="false"/> if unavailable.</returns>
+        /// <remarks>Acceptance does not imply ordered completion or exactly one kernel enter under SQ pressure.</remarks>
+        public static bool TrySubmit(SafeHandle handle, IIoUringOperation first, IIoUringOperation second)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            ArgumentNullException.ThrowIfNull(first);
+            ArgumentNullException.ThrowIfNull(second);
+            if (first is not IoUringOperation reusableFirst)
+            {
+                throw new ArgumentException(SR.IoUring_ReusableOperationRequired, nameof(first));
+            }
+            if (second is not IoUringOperation reusableSecond || ReferenceEquals(first, second))
+            {
+                throw new ArgumentException(SR.IoUring_ReusableOperationRequired, nameof(second));
+            }
+            return PortableThreadPool.IoUringThreadPool.TrySubmit(handle, reusableFirst, reusableSecond);
+        }
 
         /// <summary>
         /// Attempts to submit a <c>recv(2)</c>-like read of up to <paramref name="length"/> bytes
@@ -157,8 +194,8 @@ namespace System.Threading
         /// <see cref="IIoUringOperation"/> contract, so callers of this public API never need to know
         /// about (or implement) that interface. Unlike a per-thread-ring design, the shared-ring driver
         /// never runs continuations inline: this type also implements <see cref="IThreadPoolWorkItem"/>
-        /// so it can be returned from <see cref="IIoUringOperation.CompleteFromIoUring(int, uint, long)"/>
-        /// and queued (possibly batched together with other completions drained in the same pass)
+        /// so <see cref="IIoUringOperation.IssuerThread"/> can request worker dispatch
+        /// (possibly batched together with other completions drained in the same pass)
         /// instead of being invoked directly on the driver thread.
         /// </summary>
         private sealed class ActionIoUringOperation : IThreadPoolWorkItem, IIoUringOperation
@@ -186,11 +223,13 @@ namespace System.Threading
                 t_cachedOperation ??= this;
             }
 
-            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+            IoUringRequest IIoUringOperation.Request => throw new System.Diagnostics.UnreachableException();
+
+            IoUringOperationStatus IIoUringOperation.IssuerThread(int result, uint flags, long sequence)
             {
                 // Legacy dispatch resolves completions on the issuer, so defer the user callback.
                 _result = result;
-                return this;
+                return IoUringOperationStatus.Schedule;
             }
 
             // This type's operations (recv/send/accept/connect) complete exactly once and are not
@@ -208,5 +247,147 @@ namespace System.Threading
                 onCompleted(result);
             }
         }
+    }
+
+        /// <summary>Specifies how the issuer proceeds after processing a completion.</summary>
+        public enum IoUringOperationStatus
+        {
+            /// <summary>The operation is finished and needs no worker.</summary>
+            Done,
+            /// <summary>The issuer should submit the updated request again.</summary>
+            ReSubmit,
+            /// <summary>The operation's worker phase should be scheduled.</summary>
+            Schedule
+        }
+
+        /// <summary>Describes a pinned-buffer request without exposing its fd or correlation identity.</summary>
+        public readonly unsafe struct IoUringRequest
+        {
+            internal readonly Interop.Sys.IoRingRequest NativeRequest;
+
+            internal IoUringRequest(Interop.Sys.IoRingRequest request) => NativeRequest = request;
+
+            /// <summary>Creates a single-shot receive request.</summary>
+            /// <param name="buffer">The pinned buffer address.</param>
+            /// <param name="length">The available byte count.</param>
+            /// <param name="flags">The native receive flags.</param>
+            /// <returns>The receive request.</returns>
+            public static IoUringRequest Receive(IntPtr buffer, int length, int flags = 0) =>
+                Create(Interop.Sys.IoRingOp.Recv, buffer, length, flags);
+
+            /// <summary>Creates a single-shot send request.</summary>
+            /// <param name="buffer">The pinned buffer address.</param>
+            /// <param name="length">The byte count to send.</param>
+            /// <param name="flags">The native send flags.</param>
+            /// <returns>The send request.</returns>
+            public static IoUringRequest Send(IntPtr buffer, int length, int flags = 0) =>
+                Create(Interop.Sys.IoRingOp.Send, buffer, length, flags);
+
+            private static IoUringRequest Create(Interop.Sys.IoRingOp opCode, IntPtr buffer, int length, int flags)
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(length);
+                if (buffer == IntPtr.Zero && length != 0)
+                {
+                    throw new ArgumentNullException(nameof(buffer));
+                }
+                return new IoUringRequest(new Interop.Sys.IoRingRequest
+                {
+                    OpCode = opCode,
+                    Buffer = (byte*)buffer,
+                    BufferLength = length,
+                    Flags = flags,
+                    Offset = -1
+                });
+            }
+        }
+
+        /// <summary>Owns the reusable submission lifetime and cancellation identity of a single-shot operation.</summary>
+        /// <remarks>
+        /// Configure buffers only while idle. After Schedule, reuse only from the worker phase or later.
+        /// Cancellation permanently stops further submissions of this instance. Buffers must stay pinned
+        /// until IsPending becomes false; requesting cancellation is not a drain barrier.
+        /// Each instance stays bound to its first ring and cannot be reused on a handle routed to another ring.
+        /// </remarks>
+        [CLSCompliant(false)]
+        public abstract class IoUringOperation : IIoUringOperation
+        {
+            private SafeHandle? _handle;
+            private PortableThreadPool.IoUringThreadPool.Ring? _ring;
+            private int _pending;
+            private int _cancelRequested;
+            internal ulong UserData;
+            internal IntPtr FileDescriptor;
+
+            /// <summary>Initializes a new instance of the <see cref="IoUringOperation"/> class.</summary>
+            protected IoUringOperation() { }
+
+            /// <summary>Gets a value indicating whether the operation still owns a submission.</summary>
+            public bool IsPending => Volatile.Read(ref _pending) != 0;
+
+            /// <summary>Gets a value indicating whether cancellation has been requested.</summary>
+            public bool IsCancellationRequested => Volatile.Read(ref _cancelRequested) != 0;
+
+            /// <inheritdoc/>
+            public abstract IoUringRequest Request { get; }
+            /// <inheritdoc/>
+            public abstract IoUringOperationStatus IssuerThread(int result, uint flags, long sequence);
+            /// <inheritdoc/>
+            public abstract void Execute();
+
+            /// <inheritdoc/>
+            public void RequestCancellation()
+            {
+                if (Interlocked.Exchange(ref _cancelRequested, 1) == 0 &&
+                    Volatile.Read(ref _ring) is PortableThreadPool.IoUringThreadPool.Ring ring)
+                {
+                    PortableThreadPool.IoUringThreadPool.RequestCancellation(ring, this);
+                }
+            }
+
+            internal void BeginSubmission(SafeHandle handle)
+            {
+                if (IsCancellationRequested)
+                {
+                    throw new OperationCanceledException();
+                }
+                if (Interlocked.CompareExchange(ref _pending, 1, 0) != 0)
+                {
+                    throw new InvalidOperationException(SR.IoUring_OperationPending);
+                }
+                bool added = false;
+                try
+                {
+                    handle.DangerousAddRef(ref added);
+                    _handle = handle;
+                }
+                catch
+                {
+                    if (added)
+                    {
+                        handle.DangerousRelease();
+                    }
+                    Volatile.Write(ref _pending, 0);
+                    throw;
+                }
+            }
+
+            internal void SetSubmission(PortableThreadPool.IoUringThreadPool.Ring ring, Interop.Sys.IoRingRequest request)
+            {
+                if (_ring is not null && !ReferenceEquals(_ring, ring))
+                {
+                    throw new InvalidOperationException(SR.IoUring_DifferentRing);
+                }
+                FileDescriptor = request.Fd;
+                Volatile.Write(ref _ring, ring);
+            }
+
+            internal void EndSubmission()
+            {
+                UserData = 0;
+                SafeHandle? handle = _handle;
+                _handle = null;
+                handle?.DangerousRelease();
+                Volatile.Write(ref _pending, 0);
+            }
     }
 }
