@@ -402,6 +402,8 @@ namespace System.Net.Sockets
         public bool ReceiveAsync(System.Net.Sockets.SocketAsyncEventArgs e) { throw null; }
         [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
         public System.Collections.Generic.IAsyncEnumerable<System.Buffers.IMemoryOwner<byte>> ReceiveMultishotAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
+        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
+        public System.Threading.Tasks.Task ReceiveMultishotAsync(System.Action<System.Buffers.IMemoryOwner<byte>> onReceived, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public int ReceiveFrom(byte[] buffer, int offset, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, ref System.Net.EndPoint remoteEP) { throw null; }

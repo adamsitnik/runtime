@@ -539,6 +539,116 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalTheory(nameof(IsSupported))]
+        [InlineData("eof")]
+        [InlineData("cancel")]
+        [InlineData("throw")]
+        [InlineData("reset")]
+        public void ReceiveMultishotCallbacks_DrainBeforeCompleting(string ending)
+        {
+            RemoteExecutor.Invoke(ending =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (CancellationTokenSource cancellation = new CancellationTokenSource(TestSettings.PassingTestTimeout))
+                {
+                    TaskCompletionSource received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    InvalidOperationException failure = new("Callback failed");
+                    IMemoryOwner<byte>? retained = null;
+                    Task receiving = receiver.ReceiveMultishotAsync(buffer =>
+                    {
+                        Assert.True(Thread.CurrentThread.IsThreadPoolThread);
+                        Assert.Null(retained);
+                        retained = buffer;
+                        received.TrySetResult();
+                        if (ending == "throw")
+                        {
+                            throw failure;
+                        }
+                    }, cancellation.Token);
+
+                    byte[] bytes = [1, 2, 3, 4];
+                    Assert.Equal(bytes.Length, sender.Send(bytes));
+                    received.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    if (ending == "eof")
+                    {
+                        sender.Shutdown(SocketShutdown.Send);
+                        receiving.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                    }
+                    else if (ending == "cancel")
+                    {
+                        cancellation.Cancel();
+                        OperationCanceledException error = Assert.ThrowsAny<OperationCanceledException>(
+                            () => receiving.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult());
+                        Assert.Equal(cancellation.Token, error.CancellationToken);
+                    }
+                    else if (ending == "throw")
+                    {
+                        Assert.Same(failure, Assert.Throws<InvalidOperationException>(
+                            () => receiving.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult()));
+                    }
+                    else
+                    {
+                        sender.LingerState = new LingerOption(true, 0);
+                        sender.Dispose();
+                        SocketException error = Assert.Throws<SocketException>(
+                            () => receiving.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult());
+                        Assert.Equal(SocketError.ConnectionReset, error.SocketErrorCode);
+                    }
+
+                    Assert.NotNull(retained);
+                    Assert.Equal(bytes, retained.Memory.ToArray());
+                    retained.Dispose();
+                }
+            }, ending, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void ReceiveMultishotCallbacks_AlreadyReadyFailure_CancelsWithoutExternalToken()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                for (int iteration = 0; iteration < 64; iteration++)
+                {
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    {
+                        Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                        InvalidOperationException failure = new("Already-ready callback failed");
+                        Task receiving = receiver.ReceiveMultishotAsync(buffer =>
+                        {
+                            buffer.Dispose();
+                            throw failure;
+                        });
+                        Assert.Same(failure, Assert.Throws<InvalidOperationException>(
+                            () => receiving.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult()));
+                    }
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void ReceiveMultishotCallbacks_PreCanceled_DoesNotDeliver()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (CancellationTokenSource cancellation = new())
+                {
+                    Assert.Throws<ArgumentNullException>(() => { _ = receiver.ReceiveMultishotAsync(null!, cancellation.Token); });
+                    cancellation.Cancel();
+                    Task receiving = receiver.ReceiveMultishotAsync(_ => Assert.Fail("Unexpected callback"), cancellation.Token);
+                    OperationCanceledException error = Assert.ThrowsAny<OperationCanceledException>(
+                        () => receiving.GetAwaiter().GetResult());
+                    Assert.Equal(cancellation.Token, error.CancellationToken);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1)]
         [InlineData(3)]
         public void ReceiveMultishotAsync_StreamsMultipleSends_InOrder(int ringCount)
