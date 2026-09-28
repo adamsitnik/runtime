@@ -432,12 +432,12 @@ namespace System.Threading
             /// <summary>
             /// Number of provided buffers in a ring's RecvMultishot buffer pool (must be a power of two -
             /// see SystemNative_IoRingRegisterBufferRing). Set DOTNET_IORING_RECV_BUFFER_COUNT to
-            /// override; defaults to 128. Read once per ring, from the static constructor.
+            /// override; defaults to 512. Read once per ring, from the static constructor.
             /// </summary>
             private static int GetReceiveBufferCount() =>
                 AppContextConfigHelper.GetInt32Config(
                     "System.Threading.ThreadPool.IoUringReceiveBufferCount", "DOTNET_IORING_RECV_BUFFER_COUNT",
-                    defaultValue: 128, allowNegative: false);
+                    defaultValue: 512, allowNegative: false);
 
             /// <summary>
             /// Routes all operations on a descriptor to the same ring/issuer, even when async continuations

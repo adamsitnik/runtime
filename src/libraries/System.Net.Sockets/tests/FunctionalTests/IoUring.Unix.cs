@@ -17,6 +17,30 @@ namespace System.Net.Sockets.Tests
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
         [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(null, 512)]
+        [InlineData("128", 128)]
+        [InlineData("256", 256)]
+        [InlineData("512", 512)]
+        public void MultishotReceive_BufferCount_DefaultAndOverride(string? configuredCount, int expectedCount)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = configuredCount;
+            RemoteExecutor.Invoke(expectedText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type ioUringType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
+                Array rings = (Array)ioUringType.GetField("s_rings",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null)!;
+                Assert.Equal(1, rings.Length);
+                object ring = rings.GetValue(0)!;
+                object pool = ring.GetType().GetField("ReceiveBuffers")!.GetValue(ring)!;
+                Assert.Equal(int.Parse(expectedText), (int)pool.GetType().GetField("BufferCount")!.GetValue(pool)!);
+#pragma warning restore IL2075
+            }, expectedCount.ToString(), options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
         [InlineData(false)]
         [InlineData(true)]
         public void SocketAsyncEngine_CreationDependsOnIoUring(bool useIoUring)
