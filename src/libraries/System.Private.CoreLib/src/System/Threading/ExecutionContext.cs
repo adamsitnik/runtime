@@ -341,7 +341,6 @@ namespace System.Threading
             }
         }
 
-        // Inline as only called in one place and always called
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static void ResetThreadPoolThread(Thread currentThread)
         {

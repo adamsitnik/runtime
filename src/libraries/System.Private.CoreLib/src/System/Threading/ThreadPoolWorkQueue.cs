@@ -640,6 +640,65 @@ namespace System.Threading
             ThreadPool.EnsureWorkerRequested();
         }
 
+        /// <summary>
+        /// Enqueues multiple callbacks at once, consolidating the per-item logging/prioritization checks
+        /// and (most importantly) the <see cref="ThreadPool.EnsureWorkerRequested"/> call to a single
+        /// call for the whole batch, rather than once per item as repeated <see cref="Enqueue"/> calls
+        /// would do. Each of the underlying per-item local-push/global-enqueue operations still happens
+        /// individually (there is no batched API on the underlying queues), so this does not eliminate
+        /// contention on the global queue for forced-global batches, but it does remove the redundant
+        /// per-item overhead around that.
+        /// </summary>
+        public void EnqueueBatch(ReadOnlySpan<IThreadPoolWorkItem> callbacks, bool forceGlobal)
+        {
+            if (callbacks.IsEmpty)
+            {
+                return;
+            }
+
+            if (_loggingEnabled && FrameworkEventSource.Log.IsEnabled())
+            {
+                foreach (IThreadPoolWorkItem callback in callbacks)
+                {
+                    FrameworkEventSource.Log.ThreadPoolEnqueueWorkObject(callback);
+                }
+            }
+
+#if CORECLR
+            if (s_prioritizationExperiment)
+            {
+                foreach (IThreadPoolWorkItem callback in callbacks)
+                {
+                    EnqueueForPrioritizationExperiment(callback, forceGlobal);
+                }
+            }
+            else
+#endif
+            {
+                ThreadPoolWorkQueueThreadLocals? tl;
+                if (!forceGlobal && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null)
+                {
+                    foreach (IThreadPoolWorkItem callback in callbacks)
+                    {
+                        tl.workStealingQueue.LocalPush(callback);
+                    }
+                }
+                else
+                {
+                    WorkQueue queue =
+                        s_assignableWorkItemQueueCount > 0 && (tl = ThreadPoolWorkQueueThreadLocals.threadLocals) != null
+                            ? tl.assignedGlobalWorkItemQueue
+                            : workItems;
+                    foreach (IThreadPoolWorkItem callback in callbacks)
+                    {
+                        queue.Enqueue(callback);
+                    }
+                }
+            }
+
+            ThreadPool.EnsureWorkerRequested();
+        }
+
 #if CORECLR
         [MethodImpl(MethodImplOptions.NoInlining)]
         private void EnqueueForPrioritizationExperiment(object callback, bool forceGlobal)
@@ -1650,6 +1709,18 @@ namespace System.Threading
 
         internal static void UnsafeQueueUserWorkItemInternal(object callBack, bool preferLocal) =>
             s_workQueue.Enqueue(callBack, forceGlobal: !preferLocal);
+
+        /// <summary>
+        /// Queues multiple work items at once, as if by calling
+        /// <see cref="UnsafeQueueUserWorkItem(IThreadPoolWorkItem, bool)"/> for each one, but consolidating
+        /// the underlying bookkeeping (worker-request accounting, logging checks) to a single pass over
+        /// the batch rather than one pass per item. Intended for callers - such as the io_uring driver in
+        /// <see cref="PortableThreadPool.IoUringThreadPool"/> - that naturally produce several ready
+        /// continuations at once and would otherwise call the single-item overload in a loop.
+        /// </summary>
+        internal static void UnsafeQueueUserWorkItems(ReadOnlySpan<IThreadPoolWorkItem> callBacks, bool preferLocal) =>
+            s_workQueue.EnqueueBatch(callBacks, forceGlobal: !preferLocal);
+
         internal static void UnsafeQueueHighPriorityWorkItemInternal(IThreadPoolWorkItem callBack) =>
             s_workQueue.EnqueueAtHighPriority(callBack);
 

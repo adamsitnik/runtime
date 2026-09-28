@@ -490,6 +490,57 @@ check_symbol_exists(
     sys/epoll.h
     HAVE_EPOLL)
 
+# io_uring is accessed via raw syscalls (no liburing dependency), but we still need the uapi
+# header for the IORING_OP_*/IORING_SETUP_*/struct io_uring_* definitions, and we need the
+# kernel to actually expose the io_uring_setup/enter/register syscall numbers.
+check_include_files(
+    "linux/io_uring.h"
+    HAVE_LINUX_IO_URING_H)
+
+if (HAVE_LINUX_IO_URING_H)
+    check_c_source_compiles(
+        "
+        #include <sys/syscall.h>
+        int main(void)
+        {
+            long numbers = __NR_io_uring_setup + __NR_io_uring_enter + __NR_io_uring_register;
+            return (int)numbers;
+        }
+        "
+        HAVE_IO_URING_SYSCALL_NUMBERS)
+
+    if (NOT HAVE_IO_URING_SYSCALL_NUMBERS)
+        set(HAVE_LINUX_IO_URING_H 0)
+    endif()
+endif()
+
+# Multishot receive with ring-mapped provided buffers (IORING_RECV_MULTISHOT,
+# IORING_REGISTER_PBUF_RING, struct io_uring_buf_ring, IOSQE_BUFFER_SELECT) is mandatory for
+# io_uring support overall, not merely an optional feature layered on top of it: headers/kernels
+# too old to have it fall back to the pre-existing (non-io_uring) code paths entirely, the same
+# as if linux/io_uring.h or the io_uring_setup/enter/register syscalls were unavailable above.
+if (HAVE_LINUX_IO_URING_H)
+    check_c_source_compiles(
+        "
+        #include <linux/io_uring.h>
+        #include <stddef.h>
+        int main(void)
+        {
+            struct io_uring_buf_ring ring;
+            struct io_uring_buf buf;
+            unsigned int recvMultishot = IORING_RECV_MULTISHOT;
+            unsigned int registerPbufRing = IORING_REGISTER_PBUF_RING;
+            unsigned int bufferSelect = IOSQE_BUFFER_SELECT;
+            return (int)(recvMultishot + registerPbufRing + bufferSelect) + (int)sizeof(ring) + (int)sizeof(buf);
+        }
+        "
+        HAVE_IO_URING_RECV_MULTISHOT)
+
+    if (NOT HAVE_IO_URING_RECV_MULTISHOT)
+        set(HAVE_LINUX_IO_URING_H 0)
+    endif()
+endif()
+
 check_symbol_exists(
     gethostname
     unistd.h

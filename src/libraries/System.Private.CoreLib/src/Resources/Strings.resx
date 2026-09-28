@@ -4501,4 +4501,16 @@
   <data name="InvalidOperation_NoElements" xml:space="preserve">
     <value>Sequence contains no elements.</value>
   </data>
+  <data name="IoUring_ReusableOperationRequired" xml:space="preserve">
+    <value>Submission requires distinct operations derived from IoUringOperation.</value>
+  </data>
+  <data name="IoUring_OperationPending" xml:space="preserve">
+    <value>The io_uring operation already has an outstanding submission.</value>
+  </data>
+  <data name="IoUring_InvalidRequest" xml:space="preserve">
+    <value>A reusable io_uring operation must supply a send or receive request.</value>
+  </data>
+  <data name="IoUring_DifferentRing" xml:space="preserve">
+    <value>A reusable io_uring operation cannot move to a different ring.</value>
+  </data>
 </root>
