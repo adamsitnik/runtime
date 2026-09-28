@@ -283,6 +283,24 @@ namespace System.Threading
             public static IoUringRequest Send(IntPtr buffer, int length, int flags = 0) =>
                 Create(Interop.Sys.IoRingOp.Send, buffer, length, flags);
 
+            /// <summary>Creates a single-shot native sendmsg request.</summary>
+            /// <param name="message">The address of a native Linux msghdr structure.</param>
+            /// <param name="flags">The native send flags.</param>
+            /// <returns>The send request.</returns>
+            /// <remarks>
+            /// The message header, iovec array, and all referenced buffers must remain valid and pinned
+            /// until the request completes. The caller must respect the kernel's iovec count limit.
+            /// </remarks>
+            /// <exception cref="ArgumentNullException"><paramref name="message"/> is zero.</exception>
+            public static IoUringRequest SendMessage(IntPtr message, int flags = 0)
+            {
+                if (message == IntPtr.Zero)
+                {
+                    throw new ArgumentNullException(nameof(message));
+                }
+                return Create(Interop.Sys.IoRingOp.SendMsg, message, 0, flags);
+            }
+
             private static IoUringRequest Create(Interop.Sys.IoRingOp opCode, IntPtr buffer, int length, int flags)
             {
                 ArgumentOutOfRangeException.ThrowIfNegative(length);
@@ -305,7 +323,8 @@ namespace System.Threading
         /// <remarks>
         /// Configure buffers only while idle. After Schedule, reuse only from the worker phase or later.
         /// Cancellation permanently stops further submissions of this instance. Buffers must stay pinned
-        /// until IsPending becomes false; requesting cancellation is not a drain barrier.
+        /// until IsPending becomes false, or until their terminal issuer callback consumes the CQE.
+        /// Requesting cancellation is not a drain barrier.
         /// Each instance stays bound to its first ring and cannot be reused on a handle routed to another ring.
         /// </remarks>
         [CLSCompliant(false)]

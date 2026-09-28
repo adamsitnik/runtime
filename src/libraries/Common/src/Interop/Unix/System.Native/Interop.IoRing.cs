@@ -21,6 +21,7 @@ internal static partial class Interop
             Send = 7,
             Cancel = 8,
             RecvMultishot = 9,
+            SendMsg = 10,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -32,7 +33,7 @@ internal static partial class Interop
             public IoRingOp OpCode;
             public IntPtr Fd;
             public long Offset; // -1 for non-positional ops
-            public byte* Buffer; // used by Read/Write/Recv/Send
+            public byte* Buffer; // used by Read/Write/Recv/Send; native msghdr for SendMsg
             public int BufferLength;
             public IOVector* Vectors; // used by ReadV/WriteV
             public int VectorCount;

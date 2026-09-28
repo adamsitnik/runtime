@@ -927,6 +927,7 @@ typedef enum
                                   // (see SystemNative_IoRingRegisterBufferRing); keeps producing completions,
                                   // each selecting one buffer, until cancelled, EOF, or an error occurs; every
                                   // completion but the last one carries IORING_CQE_F_MORE in its Flags
+    IoRingOp_SendMsg = 10,       // sendmsg(2)-like send; Buffer points to a native struct msghdr
 } IoRingOp;
 
 /**
@@ -943,7 +944,7 @@ typedef struct
     intptr_t Fd;
     int64_t Offset;      // file offset for positional ops; -1 for non-positional ops; for
                           // IoRingOp_Cancel, the target request's UserData instead
-    uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write / IoRingOp_Recv / IoRingOp_Send
+    uint8_t* Buffer;     // used by Read / Write / Recv / Send; native msghdr for SendMsg
     int32_t BufferLength;
     IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
     int32_t VectorCount;

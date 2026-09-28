@@ -16,6 +16,12 @@ namespace System.Net.Sockets.Tests
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
+        [Fact]
+        public void SendMessage_RejectsNullHeader()
+        {
+            Assert.Throws<ArgumentNullException>("message", () => IoUringRequest.SendMessage(IntPtr.Zero));
+        }
+
         [ConditionalFact(nameof(IsSupported))]
         public void PairedSubmission_RejectsMovingOperationAcrossRings()
         {

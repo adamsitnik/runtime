@@ -109,6 +109,7 @@ namespace System.Threading
     {
         public static System.Threading.IoUringRequest Receive(System.IntPtr buffer, int length, int flags = 0) { throw null; }
         public static System.Threading.IoUringRequest Send(System.IntPtr buffer, int length, int flags = 0) { throw null; }
+        public static System.Threading.IoUringRequest SendMessage(System.IntPtr message, int flags = 0) { throw null; }
     }
     // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
     // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.Unix.cs for details.

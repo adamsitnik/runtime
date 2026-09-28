@@ -2360,6 +2360,12 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             // Paired submissions have not attempted a userspace send. Try sending before
             // arming a poll; the kernel still polls if the socket cannot accept the data.
             break;
+        case IoRingOp_SendMsg:
+            sqe->opcode = IORING_OP_SENDMSG;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = 1;
+            sqe->msg_flags = (uint32_t)request->Flags;
+            break;
         case IoRingOp_Cancel:
             // Targets a still-pending request by its own user_data (addr), looked up within this
             // same ring - the target request must have been submitted to the very ring this

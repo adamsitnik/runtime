@@ -575,8 +575,8 @@ namespace System.Threading
                     Ring ring = GetRing(handle.DangerousGetHandle());
                     Interop.Sys.IoRingRequest firstRequest = first.Request.NativeRequest;
                     Interop.Sys.IoRingRequest secondRequest = second is null ? default : second.Request.NativeRequest;
-                    if (firstRequest.OpCode is not (Interop.Sys.IoRingOp.Recv or Interop.Sys.IoRingOp.Send) ||
-                        (second is not null && secondRequest.OpCode is not (Interop.Sys.IoRingOp.Recv or Interop.Sys.IoRingOp.Send)))
+                    if (firstRequest.OpCode is not (Interop.Sys.IoRingOp.Recv or Interop.Sys.IoRingOp.Send or Interop.Sys.IoRingOp.SendMsg) ||
+                        (second is not null && secondRequest.OpCode is not (Interop.Sys.IoRingOp.Recv or Interop.Sys.IoRingOp.Send or Interop.Sys.IoRingOp.SendMsg)))
                     {
                         throw new ArgumentException(SR.IoUring_InvalidRequest);
                     }
