@@ -53,13 +53,16 @@ namespace System.Threading
         /// (see this file's git history / design notes) showed a single ring's issuer thread executes
         /// every socket's actual recv/poll syscall work inline as part of <c>io_uring_enter</c>, so its
         /// absolute throughput is capped regardless of how many cores are otherwise available. Every
-        /// request is routed to a ring by its own <c>fd</c> (see <see cref="GetRing"/>) - not by which
+        /// generic request is routed to a ring by its own <c>fd</c> (see <see cref="GetRing"/>) - not by which
         /// thread happens to be calling <see cref="TrySubmit"/> - so a given fd's requests always land
         /// on the same ring/issuer thread regardless of which thread submits them, instead of being
         /// scattered arbitrarily across all of them. This also makes single-fd cancellation simple: the
         /// same <c>fd -&gt; ring</c> mapping used to submit an operation is used to find the one ring
         /// that could possibly have it in flight, without needing to track which ring a given fd's
-        /// operation actually landed on.
+        /// operation actually landed on. Multishot receives instead use an adaptive receive-ring set.
+        /// Each receive tracks its submission's ring explicitly for cancellation and can migrate only
+        /// after the old submission's terminal completion has been delivered. Rings themselves never
+        /// change owners, and their provided-buffer storage survives migration and scale-down.
         ///
         /// A second, related gotcha (also confirmed empirically via a standalone native repro, not
         /// documented in the man page): a IORING_SETUP_SINGLE_ISSUER ring's fixed "owning" thread is
@@ -161,18 +164,17 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// GCHandle target used when a ring's bounded <see cref="OperationSlot"/> array is exhausted
-            /// (see <see cref="TrySubmit"/>) - carries the same reference-counting fields as
-            /// <see cref="OperationSlot"/>, for the same reason (see its doc comment), since a raw
-            /// <see cref="GCHandle"/> has no room for auxiliary per-token state of its own.
+            /// State used when a ring's bounded <see cref="OperationSlot"/> array is exhausted.
+            /// Dictionary keys are monotonically increasing identities, not recyclable GCHandle
+            /// addresses: a cancellation can still be queued after its target's terminal CQE.
             /// </summary>
-            private sealed class GCHandleToken
+            internal sealed class OverflowToken
             {
                 public readonly IIoUringOperation Operation;
                 public int RefCount = 1;
                 public long NextSequence;
 
-                public GCHandleToken(IIoUringOperation operation) => Operation = operation;
+                public OverflowToken(IIoUringOperation operation) => Operation = operation;
             }
 
             /// <summary>
@@ -183,8 +185,7 @@ namespace System.Threading
             /// </summary>
             internal sealed class Ring
             {
-                // The index this ring was created at (0-based) - used only for the issuer thread's name,
-                // to make multiple issuer threads distinguishable in a debugger/process list.
+                // The index this ring was created at (0-based), also used in the issuer thread's name.
                 public readonly int Index;
 
                 // This ring's handle, or IntPtr.Zero if unavailable/disabled. Assigned at most once, by
@@ -236,11 +237,18 @@ namespace System.Threading
                 public readonly IThreadPoolWorkItem CompletionProcessor;
                 public readonly OperationSlot[] OperationSlots = new OperationSlot[QueueDepth];
                 public readonly ConcurrentQueue<int> FreeOperationSlots = new();
+                public readonly ConcurrentDictionary<ulong, OverflowToken> OverflowTokens = new();
+                public long NextOverflowToken;
 
                 // This ring's provided-buffer group zero (see SystemNative_IoRingRegisterBufferRing),
                 // used by IoRingOp_RecvMultishot; null until registered by the static constructor's
                 // handshake, alongside RingHandle/WakeEventFd.
                 public ReceiveBufferPool? ReceiveBuffers;
+
+                public int SampleRequested;
+                public int CpuUtilization;
+                public long LastCpuTime;
+                public long LastSampleTimestamp;
 
                 public Ring(int index)
                 {
@@ -263,105 +271,17 @@ namespace System.Threading
                     return;
                 }
 
-                int ringCount = GetRingCount();
+                int ringCount = GetRingCount(out bool adaptive);
+                s_isAdaptive = adaptive;
                 int receiveBufferSize = GetReceiveBufferSize();
                 int receiveBufferCount = GetReceiveBufferCount();
-                var rings = new Ring[ringCount];
+                Ring[] rings = new Ring[ringCount];
                 bool allCreated = true;
 
                 for (int i = 0; i < ringCount; i++)
                 {
-                    // The ring itself cannot be created here (on this, the static constructor's own
-                    // thread): IORING_SETUP_SINGLE_ISSUER binds a ring's single fixed owning thread to
-                    // whichever thread calls io_uring_setup(2) - *not* to whichever thread happens to make
-                    // the first io_uring_enter(2) call, as originally (incorrectly) assumed. This was
-                    // confirmed empirically with a standalone native repro: a second thread's very first
-                    // io_uring_enter call on a ring created by another thread fails with -EEXIST
-                    // immediately, even though it is that second thread's first-ever call on the ring. So
-                    // each ring must be created by the same dedicated thread that will go on to be the one
-                    // and only thread ever calling IoRingSubmit/IoRingKick/IoRingWaitForCompletions for it
-                    // - i.e., by a new, dedicated issuer thread, as the very first thing it does.
-                    //
-                    // The handshake below is deliberately written to avoid touching any static member of
-                    // IoUringThreadPool from the new thread: the CLR only allows the thread that is
-                    // currently running a type's static constructor to freely access that type's own
-                    // static members while doing so; any *other* thread's attempt to access them
-                    // (including merely calling one of the type's other static methods, such as
-                    // IssuerLoop) blocks until the constructor completes. The new thread is instead only
-                    // ever given a reference to its own (non-static) Ring instance - assigning that
-                    // object's own instance fields (RingHandle, WakeEventFd) from the new thread is safe,
-                    // since those are not static members of IoUringThreadPool. Only this thread - which is
-                    // allowed to, since it is the one actually running the static constructor - assigns
-                    // s_isEnabled/s_rings themselves, once every ring's handshake completes.
-                    using ManualResetEventSlim readyToRun = new(initialState: false);
-                    var ring = new Ring(i);
-                    bool created = false;
-
-                    var issuerThread = new Thread(() =>
-                    {
-                        // singleIssuer: true - the whole point of this architecture is that only this
-                        // thread (which just called io_uring_setup(2) here, and will be the only thread
-                        // that ever touches this ring from now on) ever touches it, so the kernel can skip
-                        // its internal ring-wide lock.
-                        int result = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, out IntPtr ringHandle);
-                        created = result == 0;
-                        ring.RingHandle = ringHandle;
-
-                        if (created)
-                        {
-                            ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
-                            created = ring.WakeEventFd >= 0;
-                        }
-
-                        if (created)
-                        {
-                            // Registers this ring's provided-buffer group zero for RecvMultishot. Per
-                            // the mandatory HAVE_LINUX_IO_URING_H check (see configure.cmake), a kernel
-                            // that supports io_uring at all also supports this - so a failure here is
-                            // treated exactly like a failure to create the ring or register its eventfd:
-                            // this ring (and, transitively, the whole io_uring integration - see
-                            // s_isEnabled below) is abandoned in favor of the non-io_uring fallback path.
-                            unsafe
-                            {
-                                byte* bufferStorage = null;
-                                int registerResult = Interop.Sys.IoRingRegisterBufferRing(
-                                    ring.RingHandle, receiveBufferSize, receiveBufferCount, &bufferStorage);
-                                created = registerResult == 0;
-                                if (created)
-                                {
-                                    ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, bufferStorage);
-                                }
-                            }
-                        }
-
-                        readyToRun.Set();
-
-                        if (created)
-                        {
-                            // IssuerLoop is a member of IoUringThreadPool, so entering it may briefly
-                            // block this thread here until the static constructor - which is waiting on
-                            // readyToRun.Wait() right after starting this thread - observes the Set()
-                            // above and moves on. That is expected, bounded, and not a deadlock: by this
-                            // point the constructor no longer depends on this thread for anything, so it
-                            // (and every other ring's handshake still pending) will finish and return
-                            // almost immediately, unblocking this call.
-                            IssuerLoop(ring);
-                        }
-                    })
-                    {
-                        IsBackground = true,
-                        Name = $".NET IoUring Issuer #{i}",
-                    };
-                    issuerThread.Start();
-
-                    // Block until this ring's issuer thread has created it (or failed to) before moving
-                    // on to the next ring. This keeps the external contract identical to every other
-                    // io_uring architecture in this codebase: once the static constructor returns,
-                    // IsEnabled/TrySubmit are immediately usable with their final, fully-initialized
-                    // values, regardless of which thread(s) actually performed ring creation.
-                    readyToRun.Wait();
-
-                    if (!created)
+                    Ring? ring = CreateRing(i, receiveBufferSize, receiveBufferCount, out _);
+                    if (ring is null)
                     {
                         allCreated = false;
                         break;
@@ -374,6 +294,16 @@ namespace System.Threading
                 if (allCreated)
                 {
                     s_rings = rings;
+                    s_receiveRings = rings;
+                    s_allRings = rings;
+                    if (adaptive)
+                    {
+                        new Thread(AdjustIssuerCount)
+                        {
+                            IsBackground = true,
+                            Name = ".NET IoUring Controller",
+                        }.UnsafeStart();
+                    }
                 }
             }
 #pragma warning restore CA1810
@@ -401,11 +331,10 @@ namespace System.Threading
             /// <summary>
             /// Number of independent single-issuer rings (and dedicated issuer threads) to create. Set
             /// DOTNET_IORING_THREAD_COUNT (or the equivalent AppContext switch) to an explicit positive
-            /// value to override; otherwise defaults to one ring per 8 cores (rounded down), with a
-            /// minimum of 1. This is only ever read once, from the static constructor - changing it after
-            /// startup has no effect.
+            /// value for a fixed count. Otherwise starts with a power-of-two count near one ring per
+            /// eight cores, and adapts the receive issuer count to sustained issuer CPU utilization.
             /// </summary>
-            private static int GetRingCount()
+            private static int GetRingCount(out bool adaptive)
             {
                 const int DefaultCoresPerRing = 8;
 
@@ -413,16 +342,18 @@ namespace System.Threading
                     "System.Threading.ThreadPool.IoUringThreadCount", "DOTNET_IORING_THREAD_COUNT", defaultValue: 0, allowNegative: false);
                 if (configured > 0)
                 {
+                    adaptive = false;
                     return configured;
                 }
 
-                return Math.Max(1, Environment.ProcessorCount / DefaultCoresPerRing);
+                adaptive = true;
+                return (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(1, Environment.ProcessorCount / DefaultCoresPerRing));
             }
 
             /// <summary>
             /// Size, in bytes, of each provided buffer in a ring's RecvMultishot buffer pool. Set
             /// DOTNET_IORING_RECV_BUFFER_SIZE to override; defaults to 16 KiB. Read once per ring, from
-            /// the static constructor.
+            /// the ring-creation handshake.
             /// </summary>
             private static int GetReceiveBufferSize() =>
                 AppContextConfigHelper.GetInt32Config(
@@ -432,7 +363,7 @@ namespace System.Threading
             /// <summary>
             /// Number of provided buffers in a ring's RecvMultishot buffer pool (must be a power of two -
             /// see SystemNative_IoRingRegisterBufferRing). Set DOTNET_IORING_RECV_BUFFER_COUNT to
-            /// override; defaults to 512. Read once per ring, from the static constructor.
+            /// override; defaults to 512. Read once per ring, during its creation.
             /// </summary>
             private static int GetReceiveBufferCount() =>
                 AppContextConfigHelper.GetInt32Config(
@@ -440,7 +371,7 @@ namespace System.Threading
                     defaultValue: 512, allowNegative: false);
 
             /// <summary>
-            /// Routes all operations on a descriptor to the same ring/issuer, even when async continuations
+            /// Routes generic operations on a descriptor to the same ring/issuer, even when async continuations
             /// move between ThreadPool workers. Keep this descriptor-based: it improved TechEmpower JSON
             /// throughput by ~7% compared with thread-static routing.
             /// The stable mapping also lets cancellation find in-flight operations without a separate registry.
@@ -475,10 +406,11 @@ namespace System.Threading
             /// exact request for cancellation (<see cref="Interop.Sys.IoRingOp.Cancel"/>'s Offset).
             /// </summary>
             public static bool TrySubmit(IIoUringOperation operation, in Interop.Sys.IoRingRequest request, out ulong userData)
+                => TrySubmit(GetRing(request.Fd), operation, in request, out userData);
+
+            private static bool TrySubmit(Ring ring, IIoUringOperation operation, in Interop.Sys.IoRingRequest request, out ulong userData)
             {
                 Debug.Assert(s_isEnabled);
-
-                Ring ring = GetRing(request.Fd);
 
                 Interop.Sys.IoRingRequest localRequest = request;
                 if (ring.FreeOperationSlots.TryDequeue(out int slotIndex))
@@ -496,11 +428,13 @@ namespace System.Threading
                 }
                 else
                 {
-                    // Normal GCHandles have bit zero clear; tagged slot tokens instead refer to
-                    // the ring's bounded array, which roots their operations until completion.
-                    GCHandle handle = GCHandle.Alloc(new GCHandleToken(operation));
-                    localRequest.UserData = (ulong)GCHandle.ToIntPtr(handle);
-                    Debug.Assert((localRequest.UserData & OperationSlotTag) == 0);
+                    // Bit zero distinguishes overflow identities from generation-tagged array slots.
+                    localRequest.UserData = (ulong)Interlocked.Increment(ref ring.NextOverflowToken) << 1;
+                    if (localRequest.UserData == 0 ||
+                        !ring.OverflowTokens.TryAdd(localRequest.UserData, new OverflowToken(operation)))
+                    {
+                        Environment.FailFast("io_uring overflow token identities exhausted.");
+                    }
                 }
 
                 userData = localRequest.UserData;
@@ -556,6 +490,10 @@ namespace System.Threading
 
                 while (true)
                 {
+                    if (s_isAdaptive && Volatile.Read(ref ring.SampleRequested) != 0)
+                    {
+                        SampleIssuerCpu(ring);
+                    }
                     DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch, workItemBatch);
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
 
@@ -706,10 +644,9 @@ namespace System.Threading
                         }
 
                         // A still-active multishot receive is delivered entirely inline here instead of
-                        // going through the generic completion queue below: every fd - and so every one
-                        // of its operations - is permanently bound to exactly one ring (see GetRing),
-                        // which in turn has exactly one owning issuer thread: this one. That means this
-                        // is the *only* thread that will ever act as a producer for this operation's own
+                        // going through the generic completion queue below. Each native submission has
+                        // exactly one owning issuer. Migration waits for the terminal enqueue to finish
+                        // before submitting on another ring, preserving the single producer for the
                         // pending-completion queue (see MultishotReceiveOperation.EnqueueFromIssuer), so
                         // its completions are naturally delivered in true arrival order with no
                         // per-completion sequence bookkeeping needed at all - unlike the generic path
@@ -832,8 +769,7 @@ namespace System.Threading
                     return cachedOperation;
                 }
 
-                GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
-                return ((GCHandleToken)handle.Target!).Operation;
+                return ring.OverflowTokens[userData].Operation;
             }
 
             /// <summary>
@@ -863,8 +799,7 @@ namespace System.Threading
                 }
                 else
                 {
-                    GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
-                    GCHandleToken token = (GCHandleToken)handle.Target!;
+                    OverflowToken token = ring.OverflowTokens[userData];
                     Interlocked.Increment(ref token.RefCount);
                     return token.NextSequence++;
                 }
@@ -895,11 +830,11 @@ namespace System.Threading
                 }
                 else
                 {
-                    GCHandle handle = GCHandle.FromIntPtr((IntPtr)userData);
-                    GCHandleToken token = (GCHandleToken)handle.Target!;
+                    OverflowToken token = ring.OverflowTokens[userData];
                     if (Interlocked.Add(ref token.RefCount, -decrement) == 0)
                     {
-                        handle.Free();
+                        bool removed = ring.OverflowTokens.TryRemove(userData, out _);
+                        Debug.Assert(removed);
                     }
                 }
             }
@@ -921,7 +856,8 @@ namespace System.Threading
                 }
                 else
                 {
-                    GCHandle.FromIntPtr((IntPtr)userData).Free();
+                    bool removed = ring.OverflowTokens.TryRemove(userData, out _);
+                    Debug.Assert(removed);
                 }
             }
 

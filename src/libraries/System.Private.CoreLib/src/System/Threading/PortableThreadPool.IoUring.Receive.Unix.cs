@@ -40,7 +40,7 @@ namespace System.Threading
                 {
                     handle.DangerousAddRef(ref refAdded);
                     IntPtr fd = handle.DangerousGetHandle();
-                    Ring ring = GetRing(fd);
+                    Ring ring = GetReceiveRing(fd);
                     if (ring.ReceiveBuffers is null)
                     {
                         operation = null;
@@ -54,7 +54,7 @@ namespace System.Threading
                     request.Fd = fd;
                     request.Offset = -1;
 
-                    submitted = TrySubmit(multishotOperation, in request, out ulong userData);
+                    submitted = TrySubmit(ring, multishotOperation, in request, out ulong userData);
                     Debug.Assert(submitted);
 
                     // Recorded on the operation itself so a later RequestCancellation call (against this
@@ -220,16 +220,19 @@ namespace System.Threading
             /// </summary>
             internal sealed class MultishotReceiveOperation : IIoUringOperation, IThreadPoolWorkItem
             {
-                private readonly Ring _ring;
+                private Ring _ring;
+                private readonly Lock _submissionLock = new();
+                private Ring? _migrationTarget;
+                private int _terminalEnqueued;
                 private readonly SafeHandle _handle;
                 private readonly IntPtr _fd;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
 
                 // Completions reaped by the issuer thread (see EnqueueFromIssuer) but this operation's
                 // own drainer (see Execute) has not yet delivered to _onCompleted. This queue has exactly
-                // one producer by construction: every fd - and so this operation, which is permanently
-                // bound to one fd - is routed to exactly one ring (see GetRing), which in turn has
-                // exactly one owning issuer thread. That single-producer guarantee, together with
+                // one producer at a time: a native submission belongs to exactly one issuer. Migration
+                // waits until that issuer has finished enqueueing the terminal completion before
+                // submitting on another ring. That single-producer guarantee, together with
                 // _dispatchRequested only ever allowing one active drainer at a time (see
                 // EnqueueFromIssuer), is what delivers every completion to _onCompleted in true arrival
                 // order with no per-completion sequence number needed anywhere in this type, unlike every
@@ -279,7 +282,21 @@ namespace System.Threading
                 /// Records the initial token without overwriting a replacement if the worker
                 /// already rearmed before the submitting thread returned.
                 /// </summary>
-                public void SetInitialUserData(ulong userData) => Interlocked.CompareExchange(ref _userData, userData, 0);
+                public void SetInitialUserData(ulong userData)
+                {
+                    lock (_submissionLock)
+                    {
+                        Interlocked.CompareExchange(ref _userData, userData, 0);
+                        if (s_isAdaptive && !_finished)
+                        {
+                            s_activeReceives.TryAdd(this, 0);
+                        }
+                    }
+                    if (s_isAdaptive)
+                    {
+                        RequestMigration();
+                    }
+                }
 
                 /// <summary>
                 /// Requests best-effort cancellation of this operation's current submission (see
@@ -295,19 +312,39 @@ namespace System.Threading
                 {
                     Interlocked.Exchange(ref _cancelRequested, 1);
 
-                    if (_finished)
+                    lock (_submissionLock)
                     {
-                        return;
+                        if (!_finished)
+                        {
+                            CancelSubmission();
+                        }
                     }
+                }
 
+                private void CancelSubmission()
+                {
                     Interop.Sys.IoRingRequest request = default;
                     request.OpCode = Interop.Sys.IoRingOp.Cancel;
-                    // Routes to the same ring the target request itself was routed to (see GetRing); the
-                    // kernel does not otherwise use Fd for IORING_OP_ASYNC_CANCEL.
                     request.Fd = _fd;
                     request.Offset = (long)Volatile.Read(ref _userData);
+                    TrySubmit(_ring, CancelSentinelOperation.Instance, in request, out _);
+                }
 
-                    TrySubmit(CancelSentinelOperation.Instance, in request);
+                internal void RequestMigration()
+                {
+                    lock (_submissionLock)
+                    {
+                        if (_finished || Volatile.Read(ref _cancelRequested) != 0)
+                        {
+                            return;
+                        }
+                        Ring target = GetReceiveRing(_fd);
+                        if (target != _ring || _migrationTarget is not null)
+                        {
+                            _migrationTarget = target;
+                            CancelSubmission();
+                        }
+                    }
                 }
 
                 IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence) =>
@@ -329,12 +366,19 @@ namespace System.Threading
 
                     if (!hasMore)
                     {
+                        Volatile.Write(ref _terminalEnqueued, 0);
                         // Socket disposal can run inline in an earlier receive continuation and
                         // wait for this reference. It must not depend on that worker draining again.
                         _handle.DangerousRelease();
                     }
 
                     _pending.Enqueue(new PendingCompletion(result, flags));
+                    if (!hasMore)
+                    {
+                        // SPSC segment growth publishes the new segment before updating the producer's
+                        // tail. A new issuer must not enqueue until both writes have finished.
+                        Volatile.Write(ref _terminalEnqueued, 1);
+                    }
                     if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
                     {
                         ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
@@ -387,6 +431,26 @@ namespace System.Threading
                 /// </summary>
                 private bool TryResubmit()
                 {
+                    lock (_submissionLock)
+                    {
+                        if (Volatile.Read(ref _cancelRequested) != 0)
+                        {
+                            return false;
+                        }
+                        if (_migrationTarget is not null && _migrationTarget != _ring)
+                        {
+                            SpinWait spinner = default;
+                            while (Volatile.Read(ref _terminalEnqueued) == 0)
+                            {
+                                spinner.SpinOnce();
+                            }
+                        }
+                        return TryResubmitCore(_migrationTarget ?? _ring);
+                    }
+                }
+
+                private bool TryResubmitCore(Ring target)
+                {
                     bool refAdded = false;
                     bool submitted = false;
                     try
@@ -405,9 +469,11 @@ namespace System.Threading
                         request.Fd = _fd;
                         request.Offset = -1;
 
-                        submitted = TrySubmit(this, in request, out ulong userData);
+                        submitted = TrySubmit(target, this, in request, out ulong userData);
                         if (submitted)
                         {
+                            _ring = target;
+                            _migrationTarget = null;
                             Interlocked.Exchange(ref _userData, userData);
                             // A concurrent cancellation may have targeted the previous token.
                             // After publication it must also cover this replacement submission.
@@ -458,7 +524,8 @@ namespace System.Threading
                             result = -Interop.Sys.ConvertErrorPalToPlatform(error);
                         }
                         else if (result < 0 && Volatile.Read(ref _cancelRequested) == 0 &&
-                            new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS &&
+                            (new Interop.ErrorInfo(-result).Error == Interop.Error.ENOBUFS ||
+                             (new Interop.ErrorInfo(-result).Error == Interop.Error.ECANCELED && Volatile.Read(ref _migrationTarget) is not null)) &&
                             TryResubmit())
                         {
                             // Exhaustion terminates the native submission, not the logical receive.
@@ -466,7 +533,14 @@ namespace System.Threading
                             return;
                         }
 
-                        _finished = true;
+                        lock (_submissionLock)
+                        {
+                            _finished = true;
+                            if (s_isAdaptive)
+                            {
+                                s_activeReceives.TryRemove(this, out _);
+                            }
+                        }
                     }
 
                     InvokeCallback(result, buffer, hasMore, currentThread);
