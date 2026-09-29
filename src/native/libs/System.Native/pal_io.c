@@ -2696,7 +2696,7 @@ int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, int32_t buffe
     }
 
     size_t ringSize = (size_t)bufferCount * sizeof(struct io_uring_buf);
-    struct io_uring_buf_ring* bufferRing = mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct io_uring_buf_ring* bufferRing = (struct io_uring_buf_ring*)mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (bufferRing == MAP_FAILED)
     {
         int savedErrno = errno;
