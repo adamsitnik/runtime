@@ -1054,6 +1054,81 @@ namespace System.Net.Sockets.Tests
             }, CreateOptions(3)).Dispose();
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(1)]
+        [InlineData(4)]
+        public void Multishot_AllBuffersRetained_SubmissionsAndBufferReturnsMakeProgress(int bufferCount)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = bufferCount.ToString();
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_SIZE"] = "1";
+            RemoteExecutor.Invoke(async countText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                int count = int.Parse(countText);
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                (Socket otherSender, Socket otherReceiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (otherSender)
+                using (otherReceiver)
+                using (CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout))
+                {
+                    otherReceiver.Blocking = false;
+                    await using IAsyncEnumerator<IMemoryOwner<byte>> reader =
+                        receiver.ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                    List<IMemoryOwner<byte>> retained = new List<IMemoryOwner<byte>>();
+                    byte[] payload = new byte[] { 42 };
+                    byte[] received = GC.AllocateArray<byte>(1, pinned: true);
+                    try
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            Assert.Equal(1, sender.Send(payload));
+                            Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                            retained.Add(reader.Current);
+                        }
+
+                        // Wake reads cannot consume a provided buffer while all of them are held.
+                        for (int i = 0; i < 16; i++)
+                        {
+                            await Task.Delay(10);
+                            TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                            unsafe
+                            {
+                                fixed (byte* pointer = received)
+                                {
+                                    Assert.True(IoUring.TrySubmitRecv(otherReceiver.SafeHandle, pointer, 1, 0, completion.SetResult));
+                                }
+                            }
+                            Assert.Equal(1, otherSender.Send(payload));
+                            Assert.Equal(1, await completion.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.Equal(42, received[0]);
+                        }
+
+                        foreach (IMemoryOwner<byte> owner in retained)
+                        {
+                            Assert.Equal(payload, owner.Memory.ToArray());
+                        }
+                    }
+                    finally
+                    {
+                        foreach (IMemoryOwner<byte> owner in retained)
+                        {
+                            owner.Dispose();
+                        }
+                    }
+
+                    Assert.Equal(1, sender.Send(payload));
+                    Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                    using (IMemoryOwner<byte> owner = reader.Current)
+                    {
+                        Assert.Equal(payload, owner.Memory.ToArray());
+                    }
+                }
+            }, bufferCount.ToString(), options).Dispose();
+        }
+
         [ConditionalFact(nameof(IsSupported))]
         public void Multishot_EarlyBreakDrainsQueuedBuffers()
         {

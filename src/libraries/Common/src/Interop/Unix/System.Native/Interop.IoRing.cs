@@ -21,6 +21,7 @@ internal static partial class Interop
             Send = 7,
             Cancel = 8,
             RecvMultishot = 9,
+            ReadMultishot = 10,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -78,12 +79,13 @@ internal static partial class Interop
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingKick", SetLastError = true)]
         internal static partial int IoRingKick(IntPtr ringHandle);
 
-        // Creates an eventfd and registers it with the ring (IORING_REGISTER_EVENTFD): the kernel then
-        // bumps its counter whenever a CQE is posted. The returned fd is also safe for any other thread
-        // to write to directly via EventFdWrite, piggybacking its own wake-up onto the same fd a single
-        // waiter is blocked on in EventFdWait - see PortableThreadPool.IoUring.Unix.cs.
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterEventFd", SetLastError = true)]
-        internal static partial int IoRingRegisterEventFd(IntPtr ringHandle);
+        // The ring owns both pipe ends. Its multishot read shares provided-buffer group zero
+        // and produces CQEs with reserved UserData zero.
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingInitializeWakePipe", SetLastError = true)]
+        internal static partial int IoRingInitializeWakePipe(IntPtr ringHandle);
+
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingArmWakeRead", SetLastError = true)]
+        internal static partial int IoRingArmWakeRead(IntPtr ringHandle);
 
         // Allocates bufferCount page-aligned buffers of bufferSize bytes each, natively owned by
         // (and freed together with) the ring, registers them as provided-buffer group zero, and
@@ -95,14 +97,8 @@ internal static partial class Interop
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingReturnBuffers", SetLastError = true)]
         internal static unsafe partial int IoRingReturnBuffers(IntPtr ringHandle, ushort* bufferIds, int count);
 
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_EventFdWrite", SetLastError = true)]
-        internal static partial int EventFdWrite(int eventFd);
-
-        // Real kernel-blocking wait (poll(2)-based - no userland spin-before-blocking), unlike
-        // ManualResetEventSlim.Wait. Returns 1 if the fd became readable (and drains it), 0 on timeout.
-        // Pass -1 to block indefinitely.
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_EventFdWait", SetLastError = true)]
-        internal static partial int EventFdWait(int eventFd, int timeoutMilliseconds);
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingWake", SetLastError = true)]
+        internal static partial int IoRingWake(IntPtr ringHandle);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingWaitForCompletions", SetLastError = true)]
         internal static unsafe partial int IoRingWaitForCompletions(IntPtr ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, out int completedCount);

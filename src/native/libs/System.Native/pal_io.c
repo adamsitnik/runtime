@@ -108,7 +108,6 @@ extern int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
 // buffers) are available, so no fallback definitions are needed here.
 #include <linux/io_uring.h>
 #include <stdatomic.h>
-#include <sys/eventfd.h>
 #include <poll.h>
 #endif // HAVE_LINUX_IO_URING_H
 
@@ -2212,12 +2211,8 @@ typedef struct
 {
     int Fd;
 
-    // eventfd registered with this ring via IORING_REGISTER_EVENTFD (SystemNative_IoRingRegisterEventFd),
-    // or -1 if none has been registered. The kernel writes to it whenever a CQE is posted; unlike every
-    // other field/fd touched by this struct, callers other than the ring's owning thread are also allowed
-    // to write to it directly (see SystemNative_EventFdWrite) to piggyback their own wake-ups onto the
-    // same fd a waiter (see SystemNative_EventFdWait) is already blocked on.
-    int EventFd;
+    // Ring-owned pipe. Producers may write; only the issuer submits/reaps its multishot read.
+    int WakePipe[2];
 
     void* SqRingPtr;
     size_t SqRingSize;
@@ -2379,6 +2374,11 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->buf_group = 0;
             sqe->msg_flags = (uint32_t)request->Flags;
             break;
+        case IoRingOp_ReadMultishot:
+            sqe->opcode = IORING_OP_READ_MULTISHOT;
+            sqe->flags = IOSQE_BUFFER_SELECT;
+            sqe->buf_group = 0;
+            break;
     }
 }
 
@@ -2400,8 +2400,21 @@ int32_t SystemNative_IoRingIsAvailable(void)
         long result = IoUringSetup(2, &params);
         if (result >= 0)
         {
+            const unsigned int opCount = IORING_OP_READ_MULTISHOT + 1;
+            struct io_uring_probe* probe = (struct io_uring_probe*)calloc(
+                1, sizeof(struct io_uring_probe) + opCount * sizeof(struct io_uring_probe_op));
+            isAvailable = -1;
+            if (probe != NULL)
+            {
+                if (IoUringRegister((int)result, IORING_REGISTER_PROBE, probe, opCount) == 0 &&
+                    probe->ops_len > IORING_OP_READ_MULTISHOT &&
+                    (probe->ops[IORING_OP_READ_MULTISHOT].flags & IO_URING_OP_SUPPORTED) != 0)
+                {
+                    isAvailable = 1;
+                }
+                free(probe);
+            }
             close((int)result);
-            isAvailable = 1;
         }
         else
         {
@@ -2486,7 +2499,8 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     }
 
     ring->Fd = (int)fd;
-    ring->EventFd = -1;
+    ring->WakePipe[0] = -1;
+    ring->WakePipe[1] = -1;
 #if defined(IORING_SETUP_TASKRUN_FLAG)
     ring->HasTaskRunFlag = (params.flags & IORING_SETUP_TASKRUN_FLAG) != 0;
 #endif
@@ -2626,40 +2640,52 @@ int32_t SystemNative_IoRingKick(intptr_t ringHandle)
 #endif
 }
 
-int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle)
+int32_t SystemNative_IoRingInitializeWakePipe(intptr_t ringHandle)
 {
 #if HAVE_LINUX_IO_URING_H
     IoRing* ring = (IoRing*)ringHandle;
-    if (ring == NULL)
+    if (ring == NULL || ring->BufferRing == NULL || ring->WakePipe[0] >= 0)
     {
         errno = EINVAL;
         return -1;
     }
 
-    // EFD_NONBLOCK: SystemNative_EventFdWait always follows a successful poll() with a read(), so a
-    // blocking read is never actually needed, but non-blocking avoids any possibility of that read
-    // stalling if a spurious/racing drain already consumed the counter first (e.g. two threads' calls
-    // to SystemNative_EventFdWait overlapping - not expected given the single-issuer-thread contract,
-    // but harmless to guard against). EFD_CLOEXEC: standard hygiene, matches other fds created here.
-    int eventFd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (eventFd < 0)
+    if (pipe2(ring->WakePipe, O_NONBLOCK | O_CLOEXEC) != 0)
     {
         return -1;
     }
 
-    // Ask the kernel to bump this eventfd's counter (i.e. make it readable) every time a CQE is
-    // posted to this ring - see SystemNative_EventFdWait's doc comment for how the issuer thread
-    // uses this to actually block (rather than busy-poll) waiting for completions to reap.
-    if (IoUringRegister(ring->Fd, IORING_REGISTER_EVENTFD, &eventFd, 1) < 0)
+    return SystemNative_IoRingArmWakeRead(ringHandle);
+#else
+    (void)ringHandle;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingArmWakeRead(intptr_t ringHandle)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL || ring->WakePipe[0] < 0)
     {
-        int savedErrno = errno;
-        close(eventFd);
-        errno = savedErrno;
+        errno = EINVAL;
         return -1;
     }
 
-    ring->EventFd = eventFd;
-    return eventFd;
+    // UserData zero is reserved for wake completions; no managed operation token owns it.
+    IoRingRequest request = { .OpCode = IoRingOp_ReadMultishot, .Fd = ring->WakePipe[0] };
+    int32_t submitted;
+    if (SystemNative_IoRingSubmit(ringHandle, &request, 1, &submitted) != 0)
+    {
+        return -1;
+    }
+    if (submitted == 0)
+    {
+        errno = EAGAIN;
+        return -1;
+    }
+    return 0;
 #else
     (void)ringHandle;
     errno = ENOTSUP;
@@ -2780,67 +2806,17 @@ int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferId
 #endif
 }
 
-int32_t SystemNative_EventFdWrite(int32_t eventFd)
+int32_t SystemNative_IoRingWake(intptr_t ringHandle)
 {
 #if HAVE_LINUX_IO_URING_H
-    // Bumps the eventfd's 64-bit counter by 1, making it readable. Safe to call from any thread,
-    // concurrently with other writers and/or with a reader blocked in SystemNative_EventFdWait -
-    // this is the mechanism TrySubmit uses to wake the issuer thread when it enqueues a new
-    // request, sharing the same fd the kernel itself writes to on completion (see
-    // SystemNative_IoRingRegisterEventFd) so a single wait call responds to either kind of event.
-    static const uint64_t value = 1;
+    IoRing* ring = (IoRing*)ringHandle;
+    static const uint8_t value = 1;
     ssize_t result;
-    while ((result = write(eventFd, &value, sizeof(value))) < 0 && errno == EINTR);
-    return result == (ssize_t)sizeof(value) ? 0 : -1;
+    while ((result = write(ring->WakePipe[1], &value, sizeof(value))) < 0 && errno == EINTR);
+    // A full pipe already carries a wake signal. Never block a submitting worker on its issuer.
+    return result == sizeof(value) || (result < 0 && errno == EAGAIN) ? 0 : -1;
 #else
-    (void)eventFd;
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-
-int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilliseconds)
-{
-#if HAVE_LINUX_IO_URING_H
-    assert(timeoutMilliseconds >= -1);
-
-    // A real (kernel-blocking) wait, unlike a spin-then-block managed synchronization primitive:
-    // poll(2) parks this thread with no CPU cost until the eventfd becomes readable (from either a
-    // completion the kernel posted, or a TrySubmit-side SystemNative_EventFdWrite call) or the
-    // timeout elapses. -1 blocks indefinitely.
-    struct pollfd pfd;
-    pfd.fd = eventFd;
-    pfd.events = POLLIN;
-    pfd.revents = 0;
-
-    int result;
-    while ((result = poll(&pfd, 1, timeoutMilliseconds)) < 0 && errno == EINTR);
-
-    if (result < 0)
-    {
-        return -1;
-    }
-    if (result == 0)
-    {
-        return 0; // timed out, nothing to report
-    }
-
-    // Readable: drain the counter back to 0 (EFD_NONBLOCK means this never actually blocks) so the
-    // next wait call only returns once the fd becomes readable again from a *new* event, mirroring
-    // the "Reset before re-checking the queue" pattern the previous ManualResetEventSlim-based
-    // design relied on to avoid a missed-wakeup race with TrySubmit's enqueue-then-signal ordering.
-    uint64_t drained;
-    ssize_t readResult;
-    while ((readResult = read(eventFd, &drained, sizeof(drained))) < 0 && errno == EINTR);
-    // EAGAIN here would mean another thread's SystemNative_EventFdWait call already drained it
-    // between our poll() and our read() - not expected given the single-issuer-thread contract for
-    // this fd, but not an error condition worth surfacing either way: the caller still legitimately
-    // observed "signaled" from poll() and should proceed to check for work.
-    (void)readResult;
-
-    return 1;
-#else
-    (void)eventFd, (void)timeoutMilliseconds;
+    (void)ringHandle;
     errno = ENOTSUP;
     return -1;
 #endif
@@ -2877,7 +2853,8 @@ int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingComplet
         {
             // A short submission, request allocation failure, or CQ backpressure may skip GETEVENTS.
             // Pump deferred work before draining the CQ; SQ head still tracks the unconsumed SQEs.
-            if (IoUringEnter(ring->Fd, 0, (uint32_t)minComplete, IORING_ENTER_GETEVENTS) < 0)
+            // Do not block with unconsumed SQEs: one of them may be the wake read itself.
+            if (IoUringEnter(ring->Fd, 0, 0, IORING_ENTER_GETEVENTS) < 0)
             {
                 return -1;
             }
@@ -2954,7 +2931,11 @@ int32_t SystemNative_IoRingClose(intptr_t ringHandle)
     {
         result = -1;
     }
-    if (ring->EventFd >= 0 && close(ring->EventFd) != 0)
+    if (ring->WakePipe[0] >= 0 && close(ring->WakePipe[0]) != 0)
+    {
+        result = -1;
+    }
+    if (ring->WakePipe[1] >= 0 && close(ring->WakePipe[1]) != 0)
     {
         result = -1;
     }
