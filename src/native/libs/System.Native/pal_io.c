@@ -2417,6 +2417,21 @@ int32_t SystemNative_IoRingIsAvailable(void)
 #endif
 }
 
+int64_t SystemNative_IoRingGetThreadCpuTime(void)
+{
+#if HAVE_LINUX_IO_URING_H && defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec time;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0)
+    {
+        return -1;
+    }
+    return (int64_t)time.tv_sec * 1000000000 + time.tv_nsec;
+#else
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
 int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle)
 {
     assert(ringHandle != NULL);

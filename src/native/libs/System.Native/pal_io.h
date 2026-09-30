@@ -996,6 +996,9 @@ PALEXPORT int32_t SystemNative_IoRingIsAvailable(void);
  */
 PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle);
 
+// Current thread CPU time in nanoseconds, or -1 with errno set on failure.
+PALEXPORT int64_t SystemNative_IoRingGetThreadCpuTime(void);
+
 /**
  * Fills one SQE per request and publishes them to the ring's kernel-visible submission queue
  * tail, but does *not* call io_uring_enter(2) - see SystemNative_IoRingKick for that. Not

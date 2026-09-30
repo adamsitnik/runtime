@@ -63,6 +63,9 @@ internal static partial class Interop
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsAvailable")]
         internal static partial int IoRingIsAvailable();
 
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingGetThreadCpuTime", SetLastError = true)]
+        internal static partial long IoRingGetThreadCpuTime();
+
         // Pass singleIssuer: 1 to request IORING_SETUP_SINGLE_ISSUER + IORING_SETUP_DEFER_TASKRUN: every
         // subsequent IoRingSubmit/IoRingKick/IoRingWaitForCompletions call for the returned ring must then
         // come from the exact same OS thread that called this method (not merely the first thread to call

@@ -2,11 +2,15 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Microsoft.DotNet.RemoteExecutor;
+using Microsoft.Win32.SafeHandles;
 using Xunit;
 
 namespace System.Net.Sockets.Tests
@@ -15,6 +19,411 @@ namespace System.Net.Sockets.Tests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void OperationTokens_CompletedSubmissionIdentityIsNotReused(bool exhaustSlots)
+        {
+            RemoteExecutor.Invoke(exhaustText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type poolType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+#pragma warning disable IL2072, IL2075 // The RemoteExecutor process is untrimmed.
+                Type ringType = poolType.GetNestedType("Ring", System.Reflection.BindingFlags.NonPublic)!;
+                object ring = Activator.CreateInstance(ringType, new object[] { 0 })!;
+                ringType.GetField("WakeSignaled")!.SetValue(ring, 1);
+                if (bool.Parse(exhaustText))
+                {
+                    ((ConcurrentQueue<int>)ringType.GetField("FreeOperationSlots")!.GetValue(ring)!).Clear();
+                }
+                object operation = poolType.GetNestedType("CancelSentinelOperation", System.Reflection.BindingFlags.NonPublic)!
+                    .GetField("Instance")!.GetValue(null)!;
+                System.Reflection.MethodInfo submit = Array.Find(poolType.GetMethods(Flags),
+                    static method => method.Name == "TrySubmit" && method.GetParameters().Length == 4)!;
+                object request = Activator.CreateInstance(submit.GetParameters()[2].ParameterType.GetElementType()!)!;
+                System.Reflection.MethodInfo peek = poolType.GetMethod("PeekOperationToken", Flags)!;
+                System.Reflection.MethodInfo retain = poolType.GetMethod("RetainOperationToken", Flags)!;
+                System.Reflection.MethodInfo release = poolType.GetMethod("ReleaseOperationToken", Flags)!;
+#pragma warning restore IL2072, IL2075
+                HashSet<ulong> retired = new();
+                for (int i = 0; i < 2048; i++)
+                {
+                    object[] arguments = { ring, operation, request, 0UL };
+                    Assert.True((bool)submit.Invoke(null, arguments)!);
+                    ulong token = (ulong)arguments[3];
+                    Assert.True(retired.Add(token), "A late cancellation must not match a subsequent submission.");
+                    Assert.Same(operation, peek.Invoke(null, new object[] { ring, token }));
+                    Assert.Equal(0L, (long)retain.Invoke(null, new object[] { ring, token })!);
+                    release.Invoke(null, new object[] { ring, token, true });
+                }
+            }, exhaustSlots.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void IssuerCountPolicy_RequiresSustainedPressureAndPreservesBounds()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Type policyType = typeof(object).Assembly.GetType(
+                    "System.Threading.PortableThreadPool+IoUringThreadPool+IssuerCountPolicy", throwOnError: true)!;
+#pragma warning disable IL2072, IL2075 // The RemoteExecutor process is untrimmed.
+                object policy = Activator.CreateInstance(policyType, new object[] { 1, 28, 8 })!;
+                System.Reflection.MethodInfo next = policyType.GetMethod("GetNextCount")!;
+#pragma warning restore IL2072, IL2075
+                int count = 1;
+                int Sample(int utilization, bool ready = true) =>
+                    count = (int)next.Invoke(policy, new object[] { count, utilization, ready })!;
+
+                Assert.Equal(1, Sample(100));
+                Assert.Equal(1, Sample(100, ready: false));
+                foreach (int expected in new[] { 2, 4, 8, 16, 28 })
+                {
+                    int previous = count;
+                    Assert.Equal(previous, Sample(100));
+                    Assert.Equal(previous, Sample(100));
+                    Assert.Equal(expected, Sample(100));
+                }
+                for (int i = 0; i < 8; i++)
+                {
+                    Assert.Equal(28, Sample(100));
+                }
+                for (int i = 0; i < 9; i++)
+                {
+                    Assert.Equal(28, Sample(0));
+                }
+                Assert.Equal(28, Sample(60));
+                for (int i = 0; i < 9; i++)
+                {
+                    Assert.Equal(28, Sample(0));
+                }
+                Assert.Equal(14, Sample(0));
+                for (int i = 0; i < 5; i++)
+                {
+                    Assert.Equal(14, Sample(100));
+                }
+                foreach (int expected in new[] { 7, 3, 1 })
+                {
+                    int previous = count;
+                    for (int i = 0; i < 9; i++)
+                    {
+                        Assert.Equal(previous, Sample(0));
+                    }
+                    Assert.Equal(expected, Sample(0));
+                    for (int i = 0; i < 5; i++)
+                    {
+                        Assert.Equal(expected, Sample(0));
+                    }
+                }
+                for (int i = 0; i < 20; i++)
+                {
+                    Assert.Equal(1, Sample(0));
+                }
+                for (int i = 0; i < 20; i++)
+                {
+                    Assert.Equal(1, Sample(84));
+                }
+                Assert.Equal(1, Sample(85));
+                Assert.Equal(1, Sample(85, ready: false));
+                foreach (int expected in new[] { 2, 4, 8 })
+                {
+                    int previous = count;
+                    Assert.Equal(previous, Sample(85));
+                    Assert.Equal(previous, Sample(85));
+                    Assert.Equal(expected, Sample(85));
+                }
+                for (int i = 0; i < 20; i++)
+                {
+                    Assert.Equal(8, Sample(94));
+                }
+                Assert.Equal(8, Sample(95));
+                Assert.Equal(8, Sample(95));
+                Assert.Equal(16, Sample(95));
+                foreach (int initialCount in new[] { 6, 7 })
+                {
+                    count = initialCount;
+                    Assert.Equal(initialCount, Sample(85));
+                    Assert.Equal(initialCount, Sample(85));
+                    Assert.Equal(8, Sample(85));
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(8, 0, 1)]
+        [InlineData(56, 0, 1)]
+        [InlineData(56, 3, 3)]
+        public void IssuerCount_DefaultAndFixedOverride(int processors, int configured, int expected)
+        {
+            RemoteInvokeOptions options = CreateOptions(configured);
+            options.StartInfo.Environment["DOTNET_PROCESSOR_COUNT"] = processors.ToString();
+            RemoteExecutor.Invoke((configuredText, expectedText) =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type type = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                Assert.Equal(int.Parse(configuredText) == 0, (bool)type.GetField("s_isAdaptive", Flags)!.GetValue(null)!);
+                Assert.Equal(int.Parse(expectedText), ((Array)type.GetField("s_rings", Flags)!.GetValue(null)!).Length);
+#pragma warning restore IL2075
+            }, configured.ToString(), expected.ToString(), options).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void GenericSocketAndFileOperations_CompleteAcrossResize()
+        {
+            RemoteInvokeOptions options = CreateOptions(0);
+            options.StartInfo.Environment["DOTNET_PROCESSOR_COUNT"] = "8";
+            RemoteExecutor.Invoke(async () =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type poolType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                System.Reflection.MethodInfo resize = poolType.GetMethod("ResizeRings", Flags)!;
+                System.Reflection.MethodInfo getRing = poolType.GetMethod("GetRing", Flags)!;
+                System.Reflection.FieldInfo ringsField = poolType.GetField("s_rings", Flags)!;
+#pragma warning restore IL2075
+                string path = Path.GetTempFileName();
+                try
+                {
+                    using SafeFileHandle handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None, FileOptions.Asynchronous);
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    {
+                        byte[] socketBuffer = new byte[1];
+                        byte[] payload = new byte[128];
+                        byte[] fileBuffer = new byte[payload.Length];
+                        for (int round = 0; round < 16; round++)
+                        {
+                            Array.Fill(payload, (byte)round);
+                            Task<int> receive = receiver.ReceiveAsync(socketBuffer.AsMemory(), SocketFlags.None).AsTask();
+                            ValueTask write = RandomAccess.WriteAsync(handle, payload, round * payload.Length);
+                            int count = round % 2 == 0 ? 4 : 1;
+                            Assert.True((bool)resize.Invoke(null, new object[] { count })!);
+                            Array rings = (Array)ringsField.GetValue(null)!;
+                            Assert.Equal(count, rings.Length);
+                            Assert.Same(rings.GetValue((int)((uint)receiver.Handle % (uint)count)),
+                                getRing.Invoke(null, new object[] { receiver.Handle }));
+                            Assert.Equal(1, sender.Send(new byte[] { (byte)round }));
+                            Assert.Equal(1, await receive.WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.Equal((byte)round, socketBuffer[0]);
+                            await write.AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                            Assert.Equal(payload.Length, await RandomAccess.ReadAsync(handle, fileBuffer, round * payload.Length)
+                                .AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.Equal(payload, fileBuffer);
+                        }
+                    }
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, options).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void MultishotReceive_ResizeWithBufferPressure_PreservesEveryByte()
+        {
+            RemoteInvokeOptions options = CreateOptions(0);
+            options.StartInfo.Environment["DOTNET_PROCESSOR_COUNT"] = "8";
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "4";
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_SIZE"] = "128";
+            RemoteExecutor.Invoke(async () =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type poolType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                System.Reflection.MethodInfo resize = poolType.GetMethod("ResizeRings",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+#pragma warning restore IL2075
+                const int Count = 16;
+                byte[] payload = new byte[65536];
+                new Random(42).NextBytes(payload);
+                Socket[] senders = new Socket[Count];
+                Socket[] receivers = new Socket[Count];
+                Task[] transfers = new Task[Count];
+                using CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout);
+                try
+                {
+                    for (int i = 0; i < Count; i++)
+                    {
+                        (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                        senders[i] = sender;
+                        receivers[i] = receiver;
+                        transfers[i] = Task.Run(async () =>
+                        {
+                            Task send = Task.Run(() =>
+                            {
+                                int sent = 0;
+                                while (sent < payload.Length)
+                                {
+                                    int written = sender.Send(payload.AsSpan(sent));
+                                    Assert.True(written > 0);
+                                    sent += written;
+                                }
+                            });
+                            using System.IO.MemoryStream received = new();
+                            await foreach (IMemoryOwner<byte> buffer in receiver.ReceiveMultishotAsync(cancellation.Token))
+                            {
+                                using (buffer)
+                                {
+                                    received.Write(buffer.Memory.Span);
+                                }
+                                if (received.Length >= payload.Length)
+                                {
+                                    break;
+                                }
+                            }
+                            await send;
+                            Assert.Equal(payload, received.ToArray());
+                        });
+                    }
+                    for (int round = 0; round < 32; round++)
+                    {
+                        Assert.True((bool)resize.Invoke(null, new object[] { round % 2 + 1 })!);
+                        await Task.Delay(1);
+                    }
+                    await Task.WhenAll(transfers).WaitAsync(TestSettings.PassingTestTimeout);
+                }
+                finally
+                {
+                    cancellation.Cancel();
+                    for (int i = 0; i < Count; i++)
+                    {
+                        receivers[i]?.Dispose();
+                        senders[i]?.Dispose();
+                    }
+                }
+            }, options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void MultishotReceive_ResizePreservesBuffersOrderAndCancellation(bool closeSocket)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_THREAD_COUNT"] = "0";
+            options.StartInfo.Environment["DOTNET_PROCESSOR_COUNT"] = "8";
+            RemoteExecutor.Invoke(async closeText =>
+            {
+                Assert.True(IoUring.IsSupported);
+                Type poolType = typeof(object).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                System.Reflection.MethodInfo resize = poolType.GetMethod("ResizeRings", Flags)!;
+#pragma warning restore IL2075
+                const int Count = 8;
+                Socket[] senders = new Socket[Count];
+                Socket[] receivers = new Socket[Count];
+                IIoUringOperation[] operations = new IIoUringOperation[Count];
+                Channel<(int Result, IMemoryOwner<byte>? Buffer, bool More)>[] channels = new Channel<(int, IMemoryOwner<byte>?, bool)>[Count];
+                IMemoryOwner<byte>?[] retained = new IMemoryOwner<byte>?[Count];
+                try
+                {
+                    for (int i = 0; i < Count; i++)
+                    {
+                        (senders[i], receivers[i]) = SocketTestExtensions.CreateConnectedSocketPair();
+                        senders[i].NoDelay = true;
+                        Channel<(int, IMemoryOwner<byte>?, bool)> channel = Channel.CreateUnbounded<(int, IMemoryOwner<byte>?, bool)>();
+                        channels[i] = channel;
+                        Assert.True(IoUring.TrySubmitRecvMultishot(receivers[i].SafeHandle,
+                            (result, buffer, more) => channel.Writer.TryWrite((result, buffer, more)), out IIoUringOperation? operation));
+                        operations[i] = operation!;
+                    }
+
+                    for (int round = 0; round < 16; round++)
+                    {
+                        int ringCount = round % 2 + 1;
+                        Assert.True((bool)resize.Invoke(null, new object[] { ringCount })!);
+                        for (int i = 0; i < Count; i++)
+                        {
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                            System.Reflection.FieldInfo ringField = operations[i].GetType().GetField("_ring",
+                                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+                            int expectedIndex = (int)((uint)receivers[i].Handle % (uint)ringCount);
+                            Assert.True(SpinWait.SpinUntil(() =>
+                            {
+                                object ring = ringField.GetValue(operations[i])!;
+                                return (int)ring.GetType().GetField("Index")!.GetValue(ring)! == expectedIndex;
+                            }, TestSettings.PassingTestTimeout));
+#pragma warning restore IL2075
+                            Assert.Equal(1, senders[i].Send(new byte[] { (byte)round }));
+                            (int result, IMemoryOwner<byte>? buffer, bool more) =
+                                await channels[i].Reader.ReadAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                            Assert.Equal(1, result);
+                            Assert.True(more);
+                            Assert.Equal((byte)round, buffer!.Memory.Span[0]);
+                            if (round == 0)
+                            {
+                                retained[i] = buffer;
+                            }
+                            else
+                            {
+                                buffer.Dispose();
+                                Assert.Equal(0, retained[i]!.Memory.Span[0]);
+                            }
+                        }
+                    }
+
+                    await Task.WhenAll(
+                        Task.Run(() => Assert.True((bool)resize.Invoke(null, new object[] { 2 })!)),
+                        Task.Run(() =>
+                        {
+                            for (int i = 0; i < Count; i++)
+                            {
+                                if (bool.Parse(closeText))
+                                {
+                                    receivers[i].Dispose();
+                                }
+                                else
+                                {
+                                    operations[i].RequestCancellation();
+                                }
+                            }
+                        })).WaitAsync(TestSettings.PassingTestTimeout);
+                    for (int i = 0; i < Count; i++)
+                    {
+                        (int result, IMemoryOwner<byte>? buffer, bool more) =
+                            await channels[i].Reader.ReadAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                        if (bool.Parse(closeText))
+                        {
+                            Assert.True(result <= 0);
+                        }
+                        else
+                        {
+                            Assert.Equal(-125, result);
+                        }
+                        Assert.Null(buffer);
+                        Assert.False(more);
+                        Assert.Equal(0, retained[i]!.Memory.Span[0]);
+                    }
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                    Assert.True(SpinWait.SpinUntil(() =>
+                        ((Array)poolType.GetField("s_rings", Flags)!.GetValue(null)!).Length == 1,
+                        TestSettings.PassingTestTimeout));
+                    Assert.Equal(2, ((Array)poolType.GetField("s_allRings", Flags)!.GetValue(null)!).Length);
+#pragma warning restore IL2075
+                    for (int i = 0; i < Count; i++)
+                    {
+                        Assert.Equal(0, retained[i]!.Memory.Span[0]);
+                    }
+                }
+                finally
+                {
+                    for (int i = 0; i < Count; i++)
+                    {
+                        operations[i]?.RequestCancellation();
+                        retained[i]?.Dispose();
+                        receivers[i]?.Dispose();
+                        senders[i]?.Dispose();
+                    }
+                }
+            }, closeSocket.ToString(), options).Dispose();
+        }
 
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(null, 512)]
@@ -984,10 +1393,14 @@ namespace System.Net.Sockets.Tests
             }, options).Dispose();
         }
 
-        [ConditionalFact(nameof(IsSupported))]
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(0)]
+        [InlineData(3)]
         [OuterLoop]
-        public void Multishot_RepeatedPendingReceiveBursts_DoNotLoseWakeup()
+        public void Multishot_RepeatedPendingReceiveBursts_DoNotLoseWakeup(int ringCount)
         {
+            RemoteInvokeOptions options = CreateOptions(ringCount);
+            options.StartInfo.Environment["DOTNET_PROCESSOR_COUNT"] = "8";
             RemoteExecutor.Invoke(async () =>
             {
                 const int ConnectionCount = 64;
@@ -1051,7 +1464,7 @@ namespace System.Net.Sockets.Tests
                         }
                     }
                 }
-            }, CreateOptions(3)).Dispose();
+            }, options).Dispose();
         }
 
         [ConditionalFact(nameof(IsSupported))]
