@@ -53,16 +53,12 @@ namespace System.Threading
         /// (see this file's git history / design notes) showed a single ring's issuer thread executes
         /// every socket's actual recv/poll syscall work inline as part of <c>io_uring_enter</c>, so its
         /// absolute throughput is capped regardless of how many cores are otherwise available. Every
-        /// generic request is routed to a ring by its own <c>fd</c> (see <see cref="GetRing"/>) - not by which
-        /// thread happens to be calling <see cref="TrySubmit"/> - so a given fd's requests always land
-        /// on the same ring/issuer thread regardless of which thread submits them, instead of being
-        /// scattered arbitrarily across all of them. This also makes single-fd cancellation simple: the
-        /// same <c>fd -&gt; ring</c> mapping used to submit an operation is used to find the one ring
-        /// that could possibly have it in flight, without needing to track which ring a given fd's
-        /// operation actually landed on. Multishot receives instead use an adaptive receive-ring set.
-        /// Each receive tracks its submission's ring explicitly for cancellation and can migrate only
-        /// after the old submission's terminal completion has been delivered. Rings themselves never
-        /// change owners, and their provided-buffer storage survives migration and scale-down.
+        /// request is routed by its <c>fd</c> (see <see cref="GetRing"/>) within the current ring set,
+        /// preserving descriptor locality while its size is unchanged. Resizing affects new submissions;
+        /// outstanding operations finish on their original rings. Multishot receives additionally track
+        /// their submission's ring for targeted cancellation and migrate only after the old submission's
+        /// terminal completion has been delivered. Rings themselves never change owners, and their
+        /// provided-buffer storage survives migration and scale-down.
         ///
         /// A second, related gotcha (also confirmed empirically via a standalone native repro, not
         /// documented in the man page): a IORING_SETUP_SINGLE_ISSUER ring's fixed "owning" thread is
@@ -134,9 +130,9 @@ namespace System.Threading
             // actually assigns this field.
             private static bool s_isEnabled;
 
-            // One independent single-issuer ring per shard, sized by GetRingCount(). Assigned at most
-            // once, by the static constructor's own thread, right before it returns - see s_isEnabled's
-            // doc comment. Null (and unused) if s_isEnabled is false.
+            // Published initially by the static constructor and replaced by the adaptive controller.
+            // Outstanding submissions retain their original ring when this routing set changes.
+            // Null (and unused) if s_isEnabled is false.
             private static Ring[]? s_rings;
 
             internal struct OperationSlot
@@ -294,7 +290,6 @@ namespace System.Threading
                 if (allCreated)
                 {
                     s_rings = rings;
-                    s_receiveRings = rings;
                     s_allRings = rings;
                     if (adaptive)
                     {
@@ -331,13 +326,11 @@ namespace System.Threading
             /// <summary>
             /// Number of independent single-issuer rings (and dedicated issuer threads) to create. Set
             /// DOTNET_IORING_THREAD_COUNT (or the equivalent AppContext switch) to an explicit positive
-            /// value for a fixed count. Otherwise starts with a power-of-two count near one ring per
-            /// eight cores, and adapts the receive issuer count to sustained issuer CPU utilization.
+            /// value for a fixed count. Otherwise starts with one ring on first io_uring access and
+            /// adapts the issuer count to sustained issuer CPU utilization.
             /// </summary>
             private static int GetRingCount(out bool adaptive)
             {
-                const int DefaultCoresPerRing = 8;
-
                 int configured = AppContextConfigHelper.GetInt32Config(
                     "System.Threading.ThreadPool.IoUringThreadCount", "DOTNET_IORING_THREAD_COUNT", defaultValue: 0, allowNegative: false);
                 if (configured > 0)
@@ -347,7 +340,7 @@ namespace System.Threading
                 }
 
                 adaptive = true;
-                return (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(1, Environment.ProcessorCount / DefaultCoresPerRing));
+                return 1;
             }
 
             /// <summary>
@@ -371,15 +364,14 @@ namespace System.Threading
                     defaultValue: 512, allowNegative: false);
 
             /// <summary>
-            /// Routes generic operations on a descriptor to the same ring/issuer, even when async continuations
-            /// move between ThreadPool workers. Keep this descriptor-based: it improved TechEmpower JSON
-            /// throughput by ~7% compared with thread-static routing.
-            /// The stable mapping also lets cancellation find in-flight operations without a separate registry.
+            /// Routes new operations by descriptor within the current ring set, independent of the
+            /// submitting worker. Cancellation must use the ring that accepted its target submission,
+            /// not this mapping, which can change while the operation is in flight.
             /// </summary>
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             private static Ring GetRing(IntPtr fd)
             {
-                Ring[] rings = s_rings!;
+                Ring[] rings = Volatile.Read(ref s_rings)!;
                 int index = (int)((uint)(nuint)(nint)fd % (uint)rings.Length);
                 return rings[index];
             }

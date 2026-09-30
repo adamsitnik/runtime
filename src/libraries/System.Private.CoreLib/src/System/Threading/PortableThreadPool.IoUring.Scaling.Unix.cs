@@ -12,18 +12,13 @@ namespace System.Threading
     {
         internal static partial class IoUringThreadPool
         {
+            private const int BootstrapSampleIntervalMs = 250;
+            private const int SampleIntervalMs = 1000;
             private static readonly bool s_isAdaptive;
             private static readonly Lock s_adjustmentLock = new();
             private static readonly ConcurrentDictionary<MultishotReceiveOperation, byte> s_activeReceives = new();
-            private static Ring[]? s_receiveRings;
             private static Ring[]? s_allRings;
             private static bool s_scalingFailed;
-
-            private static Ring GetReceiveRing(IntPtr fd)
-            {
-                Ring[] rings = Volatile.Read(ref s_receiveRings)!;
-                return rings[(uint)(nuint)(nint)fd % (uint)rings.Length];
-            }
 
             private static Ring? CreateRing(int index, int bufferSize, int bufferCount, out int error)
             {
@@ -102,17 +97,20 @@ namespace System.Threading
 
             private static void AdjustIssuerCount()
             {
-                int minimum = s_rings!.Length;
-                int maximum = Math.Max(minimum, Environment.ProcessorCount / 2);
-                IssuerCountPolicy policy = new(minimum, maximum);
+                const int Minimum = 1;
+                const int CoresPerBootstrapIssuer = 8;
+                int maximum = Math.Max(Minimum, Environment.ProcessorCount / 2);
+                int bootstrapCount = (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
+                    (uint)Math.Max(Minimum, Environment.ProcessorCount / CoresPerBootstrapIssuer));
+                IssuerCountPolicy policy = new(Minimum, maximum, bootstrapCount);
                 while (!Volatile.Read(ref s_scalingFailed))
                 {
-                    Thread.Sleep(1000);
+                    Thread.Sleep(Volatile.Read(ref s_rings)!.Length < bootstrapCount ? BootstrapSampleIntervalMs : SampleIntervalMs);
                     if (Volatile.Read(ref s_scalingFailed))
                     {
                         return;
                     }
-                    Ring[] rings = Volatile.Read(ref s_receiveRings)!;
+                    Ring[] rings = Volatile.Read(ref s_rings)!;
                     int utilization = 0;
                     bool samplesReady = true;
                     foreach (Ring ring in rings)
@@ -122,17 +120,17 @@ namespace System.Threading
                     }
                     utilization /= rings.Length;
                     ScalingEventSource.Log.Sampled(rings.Length, utilization);
-                    int count = policy.GetNextCount(rings.Length, utilization, samplesReady, !s_activeReceives.IsEmpty);
+                    int count = policy.GetNextCount(rings.Length, utilization, samplesReady);
                     if (count != rings.Length)
                     {
-                        if (!ResizeReceiveRings(count))
+                        if (!ResizeRings(count))
                         {
                             return;
                         }
                         ScalingEventSource.Log.Resized(rings.Length, count, utilization);
                     }
 
-                    foreach (Ring ring in Volatile.Read(ref s_receiveRings)!)
+                    foreach (Ring ring in Volatile.Read(ref s_rings)!)
                     {
                         Volatile.Write(ref ring.SampleRequested, 1);
                         if (Interop.Sys.EventFdWrite(ring.WakeEventFd) < 0)
@@ -148,23 +146,26 @@ namespace System.Threading
             private sealed class IssuerCountPolicy
             {
                 private const int BusyUtilization = 95;
+                private const int BootstrapBusyUtilization = 85;
                 private const int IdleUtilization = 40;
                 private const int BusySamplesBeforeGrowth = 3;
                 private const int IdleSamplesBeforeReduction = 10;
                 private const int CooldownSamples = 5;
                 private readonly int _minimum;
                 private readonly int _maximum;
+                private readonly int _bootstrapCount;
                 private int _busySamples;
                 private int _idleSamples;
                 private int _cooldown;
 
-                public IssuerCountPolicy(int minimum, int maximum)
+                public IssuerCountPolicy(int minimum, int maximum, int bootstrapCount)
                 {
                     _minimum = minimum;
                     _maximum = maximum;
+                    _bootstrapCount = bootstrapCount;
                 }
 
-                public int GetNextCount(int count, int utilization, bool samplesReady, bool hasReceives)
+                public int GetNextCount(int count, int utilization, bool samplesReady)
                 {
                     if (_cooldown > 0)
                     {
@@ -177,16 +178,15 @@ namespace System.Threading
                         return count;
                     }
 
-                    _busySamples = hasReceives && utilization >= BusyUtilization ? _busySamples + 1 : 0;
+                    // Approach the prior CPU-based startup count with less pressure, but require
+                    // near-total saturation beyond it to avoid crowding out application workers.
+                    int busyUtilization = count < _bootstrapCount ? BootstrapBusyUtilization : BusyUtilization;
+                    _busySamples = utilization >= busyUtilization ? _busySamples + 1 : 0;
                     _idleSamples = utilization < IdleUtilization ? _idleSamples + 1 : 0;
                     int next = count;
                     if (_busySamples >= BusySamplesBeforeGrowth && count < _maximum)
                     {
-                        next = Math.Min(_maximum, count * 2);
-                    }
-                    else if (!hasReceives)
-                    {
-                        next = _minimum;
+                        next = Math.Min(count < _bootstrapCount ? _bootstrapCount : _maximum, count * 2);
                     }
                     else if (_idleSamples >= IdleSamplesBeforeReduction && count > _minimum)
                     {
@@ -195,13 +195,15 @@ namespace System.Threading
                     if (next != count)
                     {
                         _busySamples = _idleSamples = 0;
-                        _cooldown = CooldownSamples;
+                        // Sustained saturation already establishes the need for another issuer.
+                        // Delay only after a reduction to avoid immediately reversing it.
+                        _cooldown = next < count ? CooldownSamples : 0;
                     }
                     return next;
                 }
             }
 
-            private static bool ResizeReceiveRings(int count)
+            private static bool ResizeRings(int count)
             {
                 Debug.Assert(s_isAdaptive && count > 0);
                 lock (s_adjustmentLock)
@@ -230,7 +232,7 @@ namespace System.Threading
                     // Inactive rings remain alive: callers can retain their selected buffers after
                     // migrating. Their original issuer parks once the old submissions drain.
                     Ring[] active = allRings.AsSpan(0, count).ToArray();
-                    Volatile.Write(ref s_receiveRings, active);
+                    Volatile.Write(ref s_rings, active);
                     foreach (MultishotReceiveOperation operation in s_activeReceives.Keys)
                     {
                         operation.RequestMigration();

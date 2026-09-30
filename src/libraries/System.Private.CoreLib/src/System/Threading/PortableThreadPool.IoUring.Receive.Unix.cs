@@ -40,7 +40,7 @@ namespace System.Threading
                 {
                     handle.DangerousAddRef(ref refAdded);
                     IntPtr fd = handle.DangerousGetHandle();
-                    Ring ring = GetReceiveRing(fd);
+                    Ring ring = GetRing(fd);
                     if (ring.ReceiveBuffers is null)
                     {
                         operation = null;
@@ -338,7 +338,7 @@ namespace System.Threading
                         {
                             return;
                         }
-                        Ring target = GetReceiveRing(_fd);
+                        Ring target = GetRing(_fd);
                         if (target != _ring || _migrationTarget is not null)
                         {
                             _migrationTarget = target;
