@@ -72,9 +72,9 @@ namespace System.Net.Sockets
         {
             cancellationToken.ThrowIfCancellationRequested();
             TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            IIoUringOperation? operation = null;
+            IoUringOperation? operation = null;
             Exception? callbackError = null;
-            if (!IoUring.TrySubmitRecvMultishot(_handle, OnCompleted, out IIoUringOperation? submitted))
+            if (!IoUring.TrySubmitRecvMultishot(_handle, OnCompleted, out IoUringOperation? submitted))
             {
                 throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
             }
@@ -88,7 +88,7 @@ namespace System.Net.Sockets
             }
 
             using CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
-                static state => ((IIoUringOperation)state!).RequestCancellation(), submitted);
+                static state => ((IoUringOperation)state!).RequestCancellation(), submitted);
             await completed.Task.ConfigureAwait(false);
 
             void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
@@ -177,7 +177,7 @@ namespace System.Net.Sockets
                 }
             }
 
-            if (!System.Threading.IoUring.TrySubmitRecvMultishot(handle, OnCompleted, out System.Threading.IIoUringOperation? operation))
+            if (!System.Threading.IoUring.TrySubmitRecvMultishot(handle, OnCompleted, out System.Threading.IoUringOperation? operation))
             {
                 throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
             }

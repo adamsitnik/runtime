@@ -29,7 +29,7 @@ namespace Microsoft.Win32.SafeHandles
         /// be completed synchronously on the thread pool, or (on Linux, when
         /// enabled and available) asynchronously via io_uring.
         /// </summary>
-        internal sealed class ThreadPoolValueTaskSource : IThreadPoolWorkItem, IValueTaskSource<int>, IValueTaskSource<long>, IValueTaskSource, IIoUringOperation
+        internal sealed class ThreadPoolValueTaskSource : IThreadPoolWorkItem, IValueTaskSource<int>, IValueTaskSource<long>, IValueTaskSource
         {
             private readonly SafeFileHandle _fileHandle;
             private ManualResetValueTaskSourceCore<long> _source;
@@ -52,6 +52,8 @@ namespace Microsoft.Win32.SafeHandles
             // the operation using _ioUringResult instead of performing a blocking syscall.
             private bool _completedViaIoUring;
             private int _ioUringResult;
+            private Exception? _ioUringSubmissionError;
+            private FileIoUringOperation? _ioUringOperation;
 
             // io_uring in-flight pinning/ref-counting state. These are populated only while an io_uring
             // submission for this instance is outstanding, and are always fully cleaned up (pins
@@ -107,7 +109,12 @@ namespace Microsoft.Win32.SafeHandles
                 Exception? exception = null;
                 try
                 {
-                    if (_completedViaIoUring)
+                    if (_ioUringSubmissionError is not null)
+                    {
+                        ReleaseIoUringState();
+                        exception = _ioUringSubmissionError;
+                    }
+                    else if (_completedViaIoUring)
                     {
                         // The kernel already read from / wrote to the pinned buffer(s) directly; release
                         // the pins/ref now that the operation has fully completed (successfully or not).
@@ -115,7 +122,10 @@ namespace Microsoft.Win32.SafeHandles
 
                         if (_ioUringResult < 0)
                         {
-                            exception = Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(-_ioUringResult), _fileHandle.Path);
+                            exception = new Interop.ErrorInfo(-_ioUringResult).Error == Interop.Error.ECANCELED &&
+                                _cancellationToken.IsCancellationRequested
+                                ? new OperationCanceledException(_cancellationToken)
+                                : Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(-_ioUringResult), _fileHandle.Path);
                         }
                         else
                         {
@@ -177,6 +187,7 @@ namespace Microsoft.Win32.SafeHandles
                     _writeGatherBuffers = null;
                     _completedViaIoUring = false;
                     _ioUringResult = 0;
+                    _ioUringSubmissionError = null;
                 }
 
                 if (exception == null)
@@ -202,20 +213,14 @@ namespace Microsoft.Win32.SafeHandles
             }
 
             /// <summary>
-            /// Performs completion bookkeeping and returns the continuation for worker dispatch.
-            /// This can run on the issuer in legacy dispatch mode, so it must not invoke user code.
+            /// Performs completion bookkeeping on a worker and continues partial writes.
             /// </summary>
-            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+            private IThreadPoolWorkItem? CompleteFromIoUring(int result)
             {
                 if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
-                    && TryContinuePartialWrite(result, out IThreadPoolWorkItem? fallbackWorkItem))
+                    && TryContinuePartialWrite(result, out IThreadPoolWorkItem? completionWorkItem))
                 {
-                    // The write completed for fewer bytes than requested. Either we've already
-                    // resubmitted an io_uring request for the remainder (fallbackWorkItem is null, this
-                    // instance is still in flight, nothing to queue yet), or resubmission itself failed
-                    // and fallbackWorkItem is this instance, to be finalized via the ordinary blocking
-                    // path instead.
-                    return fallbackWorkItem;
+                    return completionWorkItem;
                 }
 
                 _ioUringResult = result;
@@ -223,31 +228,95 @@ namespace Microsoft.Win32.SafeHandles
                 return this;
             }
 
-            // This type's operations complete exactly once and are not (yet) cancellable once submitted
-            // in this prototype - see IIoUringOperation.RequestCancellation's own doc comment.
-            void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
+            private bool EnqueueIoUring(in Interop.Sys.IoRingRequest request)
+            {
+                FileIoUringOperation operation = _ioUringOperation ??=
+                    new FileIoUringOperation(this, IoUring.Bind(_fileHandle));
+                operation.Enqueue(in request);
+                return true;
+            }
+
+            private sealed class FileIoUringOperation : IoUringOperation
+            {
+                private readonly ThreadPoolValueTaskSource _owner;
+                private readonly IoRingBoundHandle _boundHandle;
+                private IoUringRequest _request;
+                private bool _active;
+
+                public FileIoUringOperation(ThreadPoolValueTaskSource owner, IoRingBoundHandle binding)
+                {
+                    _owner = owner;
+                    _boundHandle = binding;
+                }
+
+                protected override IoUringRequest Request => _request;
+
+                public void Enqueue(in Interop.Sys.IoRingRequest request)
+                {
+                    _request = new IoUringRequest(in request);
+                    if (_active)
+                    {
+                        EnqueueContinuation(_request);
+                    }
+                    else
+                    {
+                        _active = true;
+                        try
+                        {
+                            _boundHandle.Enqueue(this, _owner._cancellationToken);
+                        }
+                        catch
+                        {
+                            _active = false;
+                            throw;
+                        }
+                    }
+                }
+
+                protected override void OnCompleted(int result, uint flags, long sequence)
+                {
+                    try
+                    {
+                        if (_owner.CompleteFromIoUring(result) is null)
+                        {
+                            return;
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        _owner._ioUringSubmissionError = error;
+                    }
+                    CompleteOperation();
+                    _active = false;
+                    _request = default;
+                    ((IThreadPoolWorkItem)_owner).Execute();
+                }
+            }
 
             /// <summary>
             /// If <paramref name="bytesWritten"/> represents a partial write (fewer bytes than were
             /// requested by the most recent submission), advances the write state and attempts to
-            /// resubmit an io_uring request for the remainder. Returns true if a resubmission was made
-            /// (regardless of whether it itself succeeded). On success, <paramref name="fallbackWorkItem"/>
-            /// is <see langword="null"/> (this instance is still in flight). On resubmission failure,
-            /// <paramref name="fallbackWorkItem"/> is <see langword="this"/>, meaning the caller should
-            /// still queue it (falling back to completing the remainder via the ordinary blocking path).
-            /// Returns false if the write was already complete (or this isn't a write operation), in which
-            /// case <paramref name="fallbackWorkItem"/> is <see langword="null"/> and the caller should
-            /// finalize the operation as usual.
+            /// resubmit an io_uring request for the remainder. Returns true if the result was partial.
+            /// <paramref name="completionWorkItem"/> is null when a continuation was accepted, or
+            /// this instance when cancellation or a submission error must be delivered instead.
             /// </summary>
-            private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? fallbackWorkItem)
+            private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? completionWorkItem)
             {
-                fallbackWorkItem = null;
+                completionWorkItem = null;
 
                 if (_operation == Operation.Write)
                 {
                     if (bytesWritten >= _singleSegment.Length)
                     {
                         return false;
+                    }
+
+                    _singleSegment = _singleSegment.Slice(bytesWritten);
+                    _fileOffset += bytesWritten;
+                    if (StopPartialWrite(bytesWritten))
+                    {
+                        completionWorkItem = this;
+                        return true;
                     }
 
                     // The old pin is no longer valid once we reslice; TrySubmitWrite re-pins the
@@ -260,14 +329,9 @@ namespace Microsoft.Win32.SafeHandles
                         _fileHandleRefAdded = false;
                     }
 
-                    _singleSegment = _singleSegment.Slice(bytesWritten);
-                    _fileOffset += bytesWritten;
-
                     if (!TrySubmitWrite())
                     {
-                        // Fall back to the ordinary blocking path for just the remainder: _singleSegment
-                        // and _fileOffset already reflect only the not-yet-written data.
-                        fallbackWorkItem = this;
+                        completionWorkItem = this;
                     }
 
                     return true;
@@ -283,6 +347,11 @@ namespace Microsoft.Win32.SafeHandles
 
                     _fileOffset += bytesWritten;
                     AdvanceVectorsAfterPartialWrite(bytesWritten);
+                    if (StopPartialWrite(bytesWritten))
+                    {
+                        completionWorkItem = this;
+                        return true;
+                    }
 
                     // Release just the file-handle ref added for the previous submission; the vector
                     // pins/array remain valid and are reused (with an adjusted window) for the resubmit.
@@ -294,12 +363,7 @@ namespace Microsoft.Win32.SafeHandles
 
                     if (!TrySubmitWriteGatherRemainder())
                     {
-                        // Rare: the resubmission itself could not be queued (e.g., the submission queue
-                        // is momentarily full). Fall back to the ordinary blocking path, but only for the
-                        // remaining (not-yet-written) data.
-                        SwapToRemainingWriteGatherBuffers();
-                        ReleaseIoUringState();
-                        fallbackWorkItem = this;
+                        completionWorkItem = this;
                     }
 
                     return true;
@@ -308,34 +372,16 @@ namespace Microsoft.Win32.SafeHandles
                 return false;
             }
 
-            /// <summary>
-            /// Replaces <see cref="_writeGatherBuffers"/> with just the not-yet-written remainder (based
-            /// on <see cref="_vectorsOffset"/> and the current, possibly-adjusted, first remaining
-            /// vector's length), so that the ordinary blocking <see cref="RandomAccess.WriteGatherAtOffset"/>
-            /// fallback path writes only what's left, not the original buffers from the start.
-            /// </summary>
-            private void SwapToRemainingWriteGatherBuffers()
+            private bool StopPartialWrite(int bytesWritten)
             {
-                Debug.Assert(_writeGatherBuffers != null && _vectors != null);
-                IReadOnlyList<ReadOnlyMemory<byte>> original = _writeGatherBuffers;
-                Interop.Sys.IOVector[] vectors = _vectors;
-                int offset = _vectorsOffset;
-                int remainingCount = original.Count - offset;
-
-                var remaining = new ReadOnlyMemory<byte>[remainingCount];
-                for (int i = 0; i < remainingCount; i++)
+                bool canceled = _ioUringOperation!.CancellationIsRequested;
+                if (!canceled && bytesWritten != 0)
                 {
-                    int srcIndex = offset + i;
-                    ReadOnlyMemory<byte> buffer = original[srcIndex];
-                    if (i == 0)
-                    {
-                        int consumed = buffer.Length - (int)vectors[srcIndex].Count;
-                        buffer = buffer.Slice(consumed);
-                    }
-                    remaining[i] = buffer;
+                    return false;
                 }
-
-                _writeGatherBuffers = remaining;
+                _ioUringResult = -Interop.Sys.ConvertErrorPalToPlatform(canceled ? Interop.Error.ECANCELED : Interop.Error.EIO);
+                _completedViaIoUring = true;
+                return true;
             }
 
             /// <summary>
@@ -475,14 +521,14 @@ namespace Microsoft.Win32.SafeHandles
 
                     // Completion may run as soon as the request is published.
                     _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
+                    if (EnqueueIoUring(in request))
                     {
                         return true;
                     }
                 }
-                catch
+                catch (Exception error)
                 {
-                    // Fall through to cleanup and report failure to submit; caller falls back.
+                    _ioUringSubmissionError = error;
                 }
 
                 _singleSegmentPin.Dispose();
@@ -516,13 +562,14 @@ namespace Microsoft.Win32.SafeHandles
                     request.BufferLength = _singleSegment.Length;
 
                     _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
+                    if (EnqueueIoUring(in request))
                     {
                         return true;
                     }
                 }
-                catch
+                catch (Exception error)
                 {
+                    _ioUringSubmissionError = error;
                 }
 
                 _singleSegmentPin.Dispose();
@@ -579,13 +626,14 @@ namespace Microsoft.Win32.SafeHandles
                     _vectors = vectors;
                     _vectorsHandle = vectorsHandle;
                     _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
+                    if (EnqueueIoUring(in request))
                     {
                         return true;
                     }
                 }
-                catch
+                catch (Exception error)
                 {
+                    _ioUringSubmissionError = error;
                 }
 
                 _vectorPins = null;
@@ -656,13 +704,14 @@ namespace Microsoft.Win32.SafeHandles
                     _vectorsOffset = 0;
                     _remainingBytesToWrite = totalBytesToWrite;
                     _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
+                    if (EnqueueIoUring(in request))
                     {
                         return true;
                     }
                 }
-                catch
+                catch (Exception error)
                 {
+                    _ioUringSubmissionError = error;
                 }
 
                 _vectorPins = null;
@@ -716,13 +765,14 @@ namespace Microsoft.Win32.SafeHandles
                     request.VectorCount = remainingCount;
 
                     _fileHandleRefAdded = refAdded;
-                    if (PortableThreadPool.IoUringThreadPool.TrySubmit(this, in request))
+                    if (EnqueueIoUring(in request))
                     {
                         return true;
                     }
                 }
-                catch
+                catch (Exception error)
                 {
+                    _ioUringSubmissionError = error;
                 }
 
                 _fileHandleRefAdded = false;

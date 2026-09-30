@@ -105,6 +105,12 @@ namespace System.Net.Sockets
                 if (shouldClose)
                 {
                     bool canceledOperations = false;
+#if !TARGET_WINDOWS && !TARGET_BROWSER
+                    if (IoUring.TryGetBinding(this, out IoRingBoundHandle? binding))
+                    {
+                        canceledOperations = binding.DisposeAndWait();
+                    }
+#endif
 
                     // Wait until it's safe.
                     SpinWait sw = default;

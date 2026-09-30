@@ -2944,6 +2944,8 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.IoUring.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.IoUring.Receive.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.Windows.cs" Condition="'$(TargetsWindows)' == 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\LowLevelLifoSemaphore.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PreAllocatedOverlapped.Portable.cs" Condition="'$(TargetsWindows)' == 'true'" />

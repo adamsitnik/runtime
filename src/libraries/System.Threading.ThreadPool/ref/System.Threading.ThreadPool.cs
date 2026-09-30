@@ -80,24 +80,56 @@ namespace System.Threading
     public delegate void WaitCallback(object? state);
     public delegate void WaitOrTimerCallback(object? state, bool timedOut);
     // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
-    // src/libraries/System.Private.CoreLib/src/System/Threading/PortableThreadPool.IoUring.Unix.cs for details.
-    [System.CLSCompliantAttribute(false)]
-    public interface IIoUringOperation
-    {
-        System.Threading.IThreadPoolWorkItem? CompleteFromIoUring(int result, uint flags, long sequence);
-        void RequestCancellation();
-    }
-    // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
     // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.Unix.cs for details.
     [System.CLSCompliantAttribute(false)]
     public static class IoUring
     {
         public static bool IsSupported { get { throw null; } }
+        public static System.Threading.IoRingBoundHandle Bind(System.Runtime.InteropServices.SafeHandle handle) { throw null; }
+        public static bool TryGetBinding(System.Runtime.InteropServices.SafeHandle handle, [System.Diagnostics.CodeAnalysis.NotNullWhenAttribute(true)] out System.Threading.IoRingBoundHandle? binding) { throw null; }
         public static unsafe bool TrySubmitRecv(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitSend(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitSendV(System.Runtime.InteropServices.SafeHandle handle, void* vectors, int vectorCount, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitAccept(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitConnect(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, System.Action<int> onCompleted) { throw null; }
-        public static bool TrySubmitRecvMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted, out System.Threading.IIoUringOperation? operation) { throw null; }
+        public static bool TrySubmitRecvMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted, out System.Threading.IoUringOperation? operation) { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public sealed class IoRingBoundHandle : System.IDisposable, System.Threading.IThreadPoolWorkItem
+    {
+        internal IoRingBoundHandle() { }
+        public void Dispose() { }
+        public bool DisposeAndWait() { throw null; }
+        public void Enqueue(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default) { }
+        void System.Threading.IThreadPoolWorkItem.Execute() { }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public abstract class IoUringOperation : System.Threading.IThreadPoolWorkItem
+    {
+        protected IoUringOperation() { }
+        protected bool IsCancellationRequested { get { throw null; } }
+        protected abstract System.Threading.IoUringRequest Request { get; }
+        protected void CompleteOperation() { }
+        protected void EnqueueContinuation(System.Threading.IoUringRequest request) { }
+        protected abstract void OnCompleted(int result, uint flags, long sequence);
+        public void RequestCancellation() { }
+        void System.Threading.IThreadPoolWorkItem.Execute() { }
+    }
+    public enum IoUringOperationKind
+    {
+        Read = 0,
+        Write = 1,
+        ReadScatter = 2,
+        WriteGather = 3,
+        Accept = 4,
+        Connect = 5,
+        Receive = 6,
+        Send = 7,
+        SendGather = 10,
+    }
+    [System.CLSCompliantAttribute(false)]
+    public readonly unsafe struct IoUringRequest
+    {
+        public IoUringRequest(System.Threading.IoUringOperationKind kind, void* buffer, int length, long offset = -1, int flags = 0, void* socketAddress = null, int* socketAddressLength = null) { }
     }
 }

@@ -24,6 +24,552 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void BoundOperation_CancellationAndReuse(bool useToken)
+        {
+            RemoteExecutor.Invoke(async tokenText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                {
+                    Assert.Same(binding, IoUring.Bind(receiver.SafeHandle));
+                    BoundReceiveOperation operation = new BoundReceiveOperation();
+                    for (int i = 0; i < 50; i++)
+                    {
+                        using CancellationTokenSource cancellation = new CancellationTokenSource();
+                        operation.Prepare();
+                        binding.Enqueue(operation, bool.Parse(tokenText) ? cancellation.Token : default);
+                        Assert.Throws<InvalidOperationException>(() => binding.Enqueue(operation));
+                        if (bool.Parse(tokenText))
+                        {
+                            cancellation.Cancel();
+                        }
+                        else
+                        {
+                            operation.RequestCancellation();
+                        }
+                        Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                        operation.RequestCancellation();
+
+                        operation.Prepare();
+                        binding.Enqueue(operation);
+                        sender.Send(new byte[] { 42 });
+                        Assert.Equal(1, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(42, operation.Value);
+                    }
+                }
+            }, useToken.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(0, 8, false)]
+        [InlineData(1, 8, false)]
+        [InlineData(2, 8, false)]
+        [InlineData(0, 1200, false)]
+        [InlineData(0, 1200, true)]
+        public void BoundHandle_Dispose_DrainsPendingReceives(int closeKind, int count, bool exhaustGenerations)
+        {
+            RemoteExecutor.Invoke(async (kindText, countText, exhaustText) =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                {
+                    BoundReceiveOperation[] operations = new BoundReceiveOperation[int.Parse(countText)];
+                    object? freeSlots = null;
+                    if (bool.Parse(exhaustText))
+                    {
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                        Type poolType = typeof(IoUring).Assembly.GetType("System.Threading.PortableThreadPool+IoUringThreadPool", throwOnError: true)!;
+                        Array rings = (Array)poolType.GetField("s_rings",
+                            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!.GetValue(null)!;
+                        object ring = rings.GetValue(0)!;
+                        Array slots = (Array)ring.GetType().GetField("OperationSlots")!.GetValue(ring)!;
+                        freeSlots = ring.GetType().GetField("FreeOperationSlots")!.GetValue(ring)!;
+                        Assert.True(operations.Length > slots.Length);
+                        for (int i = 0; i < slots.Length; i++)
+                        {
+                            object slot = slots.GetValue(i)!;
+                            slot.GetType().GetField("Generation")!.SetValue(slot, uint.MaxValue - 1);
+                            slots.SetValue(slot, i);
+                        }
+#pragma warning restore IL2075
+                    }
+                    for (int i = 0; i < operations.Length; i++)
+                    {
+                        operations[i] = new BoundReceiveOperation();
+                        operations[i].Prepare();
+                        binding.Enqueue(operations[i]);
+                    }
+                    switch (int.Parse(kindText))
+                    {
+                        case 0:
+                            binding.Dispose();
+                            break;
+                        case 1:
+                            receiver.Dispose();
+                            break;
+                        case 2:
+                            receiver.SafeHandle.Dispose();
+                            break;
+                    }
+                    Assert.True(binding.DisposeAndWait());
+                    foreach (BoundReceiveOperation operation in operations)
+                    {
+                        Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                    }
+                    if (freeSlots is not null)
+                    {
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                        Assert.Equal(0, (int)freeSlots.GetType().GetProperty("Count")!.GetValue(freeSlots)!);
+#pragma warning restore IL2075
+                    }
+                    Assert.Throws<ObjectDisposedException>(() => binding.Enqueue(new BoundReceiveOperation()));
+                    if (int.Parse(kindText) == 0)
+                    {
+                        sender.Send(new byte[] { 7 });
+                        Assert.Equal(1, receiver.Receive(new byte[1]));
+                    }
+                }
+            }, closeKind.ToString(), count.ToString(), exhaustGenerations.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_RacingSocketDispose_DoesNotRetainHandle()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                for (int i = 0; i < 100; i++)
+                {
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    {
+                        SafeSocketHandle handle = receiver.SafeHandle;
+                        IoRingBoundHandle? binding = null;
+                        using Barrier barrier = new Barrier(2);
+                        Task bind = Task.Run(() =>
+                        {
+                            barrier.SignalAndWait();
+                            try
+                            {
+                                binding = IoUring.Bind(handle);
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                            }
+                        });
+                        Task close = Task.Run(() =>
+                        {
+                            barrier.SignalAndWait();
+                            receiver.Dispose();
+                        });
+                        await Task.WhenAll(bind, close).WaitAsync(TestSettings.PassingTestTimeout);
+                        Assert.True(handle.IsClosed);
+                        if (binding is not null)
+                        {
+                            Assert.Throws<ObjectDisposedException>(() => binding.Enqueue(new BoundReceiveOperation()));
+                        }
+                    }
+                }
+            }, CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void BoundOperation_CancellationAndReuseAcrossRings()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                List<(Socket Sender, Socket Receiver)> pairs = new List<(Socket, Socket)>();
+                try
+                {
+                    HashSet<long> rings = new HashSet<long>();
+                    for (int i = 0; i < 3; i++)
+                    {
+                        (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                        pairs.Add((sender, receiver));
+                        rings.Add(receiver.SafeHandle.DangerousGetHandle().ToInt64() % 3);
+                    }
+                    Assert.True(rings.Count > 1);
+                    BoundReceiveOperation operation = new BoundReceiveOperation();
+                    for (int iteration = 0; iteration < 30; iteration++)
+                    {
+                        foreach ((Socket sender, Socket receiver) in pairs)
+                        {
+                            IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
+                            using CancellationTokenSource cancellation = new CancellationTokenSource();
+                            operation.Prepare();
+                            binding.Enqueue(operation, cancellation.Token);
+                            cancellation.Cancel();
+                            Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                            operation.Prepare();
+                            binding.Enqueue(operation);
+                            sender.Send(new byte[] { 42 });
+                            Assert.Equal(1, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.Equal(42, operation.Value);
+                        }
+                    }
+                }
+                finally
+                {
+                    foreach ((Socket sender, Socket receiver) in pairs)
+                    {
+                        receiver.Dispose();
+                        sender.Dispose();
+                    }
+                }
+            }, CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_DisposalDuringValidation_ThrowsObjectDisposedException()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                ReleaseCounter counter = new ReleaseCounter();
+                using CountingHandle handle = new CountingHandle(
+                    socket.SafeHandle.DangerousGetHandle(), counter, disposeDuringValidation: true);
+                Assert.Throws<ObjectDisposedException>(() => IoUring.Bind(handle));
+                Assert.Equal(1, counter.Count);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void BoundHandle_ReentrantHandleRelease_DoesNotWaitForItself()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                ReleaseCounter counter = new ReleaseCounter();
+                CountingHandle handle = new CountingHandle(socket.SafeHandle.DangerousGetHandle(), counter);
+                IoRingBoundHandle binding = IoUring.Bind(handle);
+                counter.OnRelease = () => binding.DisposeAndWait();
+                await Task.Run(handle.Dispose).WaitAsync(TimeSpan.FromSeconds(10));
+                Assert.Equal(1, counter.Count);
+                Assert.True(handle.IsClosed);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void IdleBinding_DoesNotRootHandle_AndReleasesReference()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                ReleaseCounter counter = new ReleaseCounter();
+                (WeakReference handle, WeakReference binding) = CreateCollectibleBinding(
+                    socket.SafeHandle.DangerousGetHandle(), counter);
+                Assert.True(SpinWait.SpinUntil(() =>
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    return !handle.IsAlive && !binding.IsAlive && Volatile.Read(ref counter.Count) == 1;
+                }, TestSettings.PassingTestTimeout));
+                GC.KeepAlive(socket);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static (WeakReference Handle, WeakReference Binding) CreateCollectibleBinding(
+            IntPtr descriptor, ReleaseCounter counter)
+        {
+            CountingHandle handle = new CountingHandle(descriptor, counter);
+            IoRingBoundHandle binding = IoUring.Bind(handle);
+            return (new WeakReference(handle), new WeakReference(binding));
+        }
+
+        private sealed class ReleaseCounter
+        {
+            public int Count;
+            public Action? OnRelease;
+        }
+
+        private sealed class CountingHandle : SafeHandle
+        {
+            private readonly ReleaseCounter _counter;
+            private bool _disposeDuringValidation;
+
+            public CountingHandle(IntPtr descriptor, ReleaseCounter counter, bool disposeDuringValidation = false)
+                : base(new IntPtr(-1), ownsHandle: true)
+            {
+                _counter = counter;
+                _disposeDuringValidation = disposeDuringValidation;
+                SetHandle(descriptor);
+            }
+
+            public override bool IsInvalid
+            {
+                get
+                {
+                    if (_disposeDuringValidation)
+                    {
+                        _disposeDuringValidation = false;
+                        Dispose();
+                    }
+                    return IsClosed || handle == new IntPtr(-1);
+                }
+            }
+
+            protected override bool ReleaseHandle()
+            {
+                // The socket owns the descriptor; this wrapper tracks its own lifetime only.
+                Interlocked.Increment(ref _counter.Count);
+                _counter.OnRelease?.Invoke();
+                return true;
+            }
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void BoundHandle_CloseOnOnlyWorker_DoesNotWaitForCallbacks()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                ThreadPool.GetMinThreads(out _, out int minIo);
+                ThreadPool.GetMaxThreads(out _, out int maxIo);
+                Assert.True(ThreadPool.SetMinThreads(1, minIo));
+                Assert.True(ThreadPool.SetMaxThreads(1, maxIo));
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                {
+                    BoundReceiveOperation operation = new BoundReceiveOperation();
+                    operation.Prepare();
+                    await Task.Run(() =>
+                    {
+                        binding.Enqueue(operation);
+                        receiver.Dispose();
+                    }).WaitAsync(TestSettings.PassingTestTimeout);
+                    Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        private sealed class BoundReceiveOperation : IoUringOperation
+        {
+            private readonly byte[] _buffer = GC.AllocateArray<byte>(1, pinned: true);
+            private TaskCompletionSource<int> _completion = null!;
+
+            public Task<int> Completion => _completion.Task;
+            public byte Value => _buffer[0];
+
+            public void Prepare() =>
+                _completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            protected override unsafe IoUringRequest Request
+            {
+                get
+                {
+                    fixed (byte* buffer = _buffer)
+                    {
+                        return new IoUringRequest(IoUringOperationKind.Receive, buffer, _buffer.Length);
+                    }
+                }
+            }
+
+            protected override void OnCompleted(int result, uint flags, long sequence)
+            {
+                TaskCompletionSource<int> completion = _completion;
+                CompleteOperation();
+                completion.SetResult(result);
+            }
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ReceiveCancellation_RetiresPinsBeforeReuse(bool closeSocket)
+        {
+            RemoteExecutor.Invoke(async closeText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (TrackingMemoryManager memory = new TrackingMemoryManager())
+                using (CancellationTokenSource cancellation = new CancellationTokenSource())
+                {
+                    Task<int> receive = receiver.ReceiveAsync(memory.Memory, SocketFlags.None, cancellation.Token).AsTask();
+                    Assert.False(receive.IsCompleted);
+                    Assert.Equal(1, memory.PinCount);
+                    Assert.Equal(0, memory.UnpinCount);
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    cancellation.Cancel();
+                    if (bool.Parse(closeText))
+                    {
+                        receiver.Dispose();
+                    }
+                    OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                        () => receive.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(cancellation.Token, error.CancellationToken);
+                    Assert.Equal(1, memory.UnpinCount);
+                    memory.GetSpan()[0] = 0xCC;
+                    if (!bool.Parse(closeText))
+                    {
+                        sender.Send(new byte[] { 9 });
+                        byte[] next = new byte[1];
+                        Assert.Equal(1, await receiver.ReceiveAsync(next.AsMemory()).AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(9, next[0]);
+                        Assert.Equal(0xCC, memory.GetSpan()[0]);
+                    }
+                }
+            }, closeSocket.ToString(), CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void SocketClose_OnOnlyWorker_DrainsWithoutUnpinningOnIssuer()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                ThreadPool.GetMinThreads(out _, out int minIo);
+                ThreadPool.GetMaxThreads(out _, out int maxIo);
+                Assert.True(ThreadPool.SetMinThreads(1, minIo));
+                Assert.True(ThreadPool.SetMaxThreads(1, maxIo));
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (TrackingMemoryManager memory = new TrackingMemoryManager())
+                {
+                    Task<int>? receive = null;
+                    await Task.Run(() =>
+                    {
+                        receive = receiver.ReceiveAsync(memory.Memory).AsTask();
+                        receiver.Dispose();
+                        Assert.Equal(0, memory.UnpinCount);
+                    }).WaitAsync(TestSettings.PassingTestTimeout);
+                    SocketException error = await Assert.ThrowsAsync<SocketException>(
+                        () => receive!.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(SocketError.OperationAborted, error.SocketErrorCode);
+                    Assert.Equal(1, memory.UnpinCount);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void NetworkStreamWrite_Backpressure_DoesNotCompleteAfterShortSend(bool cancel)
+        {
+            RemoteExecutor.Invoke(async cancelText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (NetworkStream stream = new NetworkStream(sender, ownsSocket: false))
+                using (CancellationTokenSource cancellation = new CancellationTokenSource())
+                {
+                    sender.SendBufferSize = 4096;
+                    byte[] data = new byte[4 * 1024 * 1024];
+                    new Random(42).NextBytes(data);
+                    Task write = stream.WriteAsync(data.AsMemory(), cancellation.Token).AsTask();
+                    if (bool.Parse(cancelText))
+                    {
+                        byte[] prefix = new byte[4096];
+                        Assert.NotEqual(0, await receiver.ReceiveAsync(prefix.AsMemory()).AsTask()
+                            .WaitAsync(TestSettings.PassingTestTimeout));
+                        cancellation.Cancel();
+                        OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                            () => write.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(cancellation.Token, error.CancellationToken);
+                    }
+                    else
+                    {
+                        byte[] received = new byte[data.Length];
+                        Task<int> read = Task.Run(async () =>
+                        {
+                            int offset = 0;
+                            while (offset < received.Length)
+                            {
+                                int count = await receiver.ReceiveAsync(received.AsMemory(offset)).AsTask()
+                                    .WaitAsync(TestSettings.PassingTestTimeout);
+                                if (count == 0)
+                                {
+                                    break;
+                                }
+                                offset += count;
+                            }
+                            return offset;
+                        });
+                        await write.WaitAsync(TestSettings.PassingTestTimeout);
+                        sender.Shutdown(SocketShutdown.Send);
+                        Assert.Equal(data.Length, await read.WaitAsync(TestSettings.PassingTestTimeout));
+                        AssertExtensions.SequenceEqual(data.AsSpan(), received.AsSpan());
+                    }
+                }
+            }, cancel.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void BoundSend_CloseBetweenNativeRequests_RemembersLogicalSend()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle))
+                using (ManualResetEventSlim delivered = new ManualResetEventSlim())
+                using (ManualResetEventSlim resume = new ManualResetEventSlim())
+                {
+                    PausedSendOperation operation = new PausedSendOperation(delivered, resume);
+                    binding.Enqueue(operation);
+                    try
+                    {
+                        Assert.True(delivered.Wait(TestSettings.PassingTestTimeout));
+                        Assert.True(binding.DisposeAndWait());
+                    }
+                    finally
+                    {
+                        resume.Set();
+                        Assert.True(operation.Completion.Wait(TestSettings.PassingTestTimeout));
+                    }
+                    Assert.True(operation.Completion.Result);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        private sealed class PausedSendOperation : IoUringOperation
+        {
+            private readonly byte[] _buffer = GC.AllocateArray<byte>(1, pinned: true);
+            private readonly ManualResetEventSlim _delivered;
+            private readonly ManualResetEventSlim _resume;
+            private readonly TaskCompletionSource<bool> _completion =
+                new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            public PausedSendOperation(ManualResetEventSlim delivered, ManualResetEventSlim resume)
+            {
+                _delivered = delivered;
+                _resume = resume;
+            }
+
+            public Task<bool> Completion => _completion.Task;
+
+            protected override unsafe IoUringRequest Request
+            {
+                get
+                {
+                    fixed (byte* buffer = _buffer)
+                    {
+                        return new IoUringRequest(IoUringOperationKind.Send, buffer, _buffer.Length);
+                    }
+                }
+            }
+
+            protected override void OnCompleted(int result, uint flags, long sequence)
+            {
+                _delivered.Set();
+                bool resumed = _resume.Wait(TestSettings.PassingTestTimeout);
+                bool canceled = IsCancellationRequested;
+                CompleteOperation();
+                _completion.SetResult(resumed && canceled && result == 1);
+            }
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
         [InlineData(2)]
         [InlineData(1200)]
         public void GatherSend_WaitAll_CompletesOnceAtNativeVectorLimit(int vectorCount)
@@ -413,7 +959,6 @@ namespace System.Net.Sockets.Tests
             RemoteExecutor.Invoke(async closeText =>
             {
                 bool close = bool.Parse(closeText);
-                const int BadFileDescriptor = 9;
                 const int OperationCanceled = 125;
                 using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
@@ -424,7 +969,7 @@ namespace System.Net.Sockets.Tests
                 TaskCompletionSource drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 AsyncLocal<int> context = new AsyncLocal<int>();
                 TrackingMemoryManager owner = new TrackingMemoryManager();
-                IIoUringOperation? operation = null;
+                IoUringOperation? operation = null;
                 bool testing = false;
                 int callbacks = 0;
                 Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
@@ -461,7 +1006,7 @@ namespace System.Net.Sockets.Tests
                     else
                     {
                         Assert.Equal(2, callbacks);
-                        Assert.Equal(close ? -BadFileDescriptor : -OperationCanceled, result);
+                        Assert.Equal(-OperationCanceled, result);
                         Assert.Null(buffer);
                         Assert.False(more);
                     }
@@ -473,8 +1018,8 @@ namespace System.Net.Sockets.Tests
 #pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
                 Type operationType = operation.GetType();
                 const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
-                operationType.GetField("_finished", Flags)!.SetValue(operation, false);
-                operationType.GetField("_cancelRequested", Flags)!.SetValue(operation, 0);
+                typeof(IoUringOperation).GetMethod("Begin", Flags)!.Invoke(operation,
+                    new object[] { IoUring.Bind(receiver.SafeHandle), CancellationToken.None });
                 System.Reflection.MethodInfo deliver = operationType.GetMethod("Deliver", Flags)!;
 #pragma warning restore IL2075
                 testing = true;
@@ -1123,7 +1668,7 @@ namespace System.Net.Sockets.Tests
                         {
                             buffer?.Dispose();
                         }
-                    }, out IIoUringOperation? operation));
+                    }, out IoUringOperation? operation));
                     try
                     {
                         Assert.Equal(1, sender.Send(new byte[] { 0x5A }));
@@ -1338,7 +1883,7 @@ namespace System.Net.Sockets.Tests
                         {
                             buffer?.Dispose();
                         }
-                    }, out IIoUringOperation? operation));
+                    }, out IoUringOperation? operation));
                     try
                     {
                         sender.Send(new byte[] { 42 });

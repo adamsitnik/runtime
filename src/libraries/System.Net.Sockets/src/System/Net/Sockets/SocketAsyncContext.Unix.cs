@@ -1510,9 +1510,7 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            // TODO: io_uring: Add accept cancellation support. Cancellation is intentionally
-            // unsupported while we compare io_uring performance against epoll.
-            if (ready && TryAcceptViaIoUring(socketAddress, callback))
+            if (ready && TryAcceptViaIoUring(socketAddress, callback, cancellationToken))
             {
                 acceptedFd = (IntPtr)(-1);
                 socketAddressLen = 0;
@@ -1574,7 +1572,7 @@ namespace System.Net.Sockets
 
             SetHandleNonBlocking();
 
-            if (buffer.Length == 0 && !_socket.IsDisconnected && TryConnectViaIoUring(socketAddress, callback))
+            if (buffer.Length == 0 && !_socket.IsDisconnected && TryConnectViaIoUring(socketAddress, callback, cancellationToken))
             {
                 sentBytes = 0;
                 return SocketError.IOPending;
@@ -1729,7 +1727,7 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && TryReceiveViaIoUring(buffer, flags, callback))
+            if (ready && TryReceiveViaIoUring(buffer, flags, callback, cancellationToken))
             {
                 bytesReceived = 0;
                 return SocketError.IOPending;
@@ -1769,7 +1767,7 @@ namespace System.Net.Sockets
             }
 
             if (ready && socketAddress.Length == 0 &&
-                TryReceiveViaIoUring(buffer, flags, callback))
+                TryReceiveViaIoUring(buffer, flags, callback, cancellationToken))
             {
                 socketAddressLen = 0;
                 bytesReceived = 0;
@@ -2091,7 +2089,7 @@ namespace System.Net.Sockets
             }
 
             if (ready && socketAddress.Length == 0 &&
-                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback))
+                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback, cancellationToken))
             {
                 return SocketError.IOPending;
             }

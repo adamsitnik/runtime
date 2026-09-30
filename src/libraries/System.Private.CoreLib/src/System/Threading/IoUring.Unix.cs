@@ -24,6 +24,44 @@ namespace System.Threading
         /// </summary>
         public static bool IsSupported => PortableThreadPool.IoUringThreadPool.IsEnabled;
 
+        /// <summary>Gets the canonical binding of a handle to one io_uring issuer.</summary>
+        /// <param name="handle">The handle to bind without transferring its ownership.</param>
+        /// <returns>The shared binding for this handle.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="handle"/> is null.</exception>
+        /// <exception cref="ArgumentException"><paramref name="handle"/> is invalid.</exception>
+        /// <exception cref="PlatformNotSupportedException">io_uring is unavailable.</exception>
+        /// <exception cref="ObjectDisposedException">The handle or its binding has been disposed.</exception>
+        public static IoRingBoundHandle Bind(SafeHandle handle)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            ObjectDisposedException.ThrowIf(handle.IsClosed || handle.IsDisposeRequested, handle);
+            if (handle.IsInvalid)
+            {
+                // SafeSocketHandle.IsInvalid also observes IsClosed, which can change
+                // after the preceding check.
+                ObjectDisposedException.ThrowIf(handle.IsClosed || handle.IsDisposeRequested, handle);
+                throw new ArgumentException(SR.Arg_InvalidHandle, nameof(handle));
+            }
+            if (!IsSupported)
+            {
+                throw new PlatformNotSupportedException();
+            }
+            return IoRingBoundHandle.GetOrCreate(handle);
+        }
+
+        /// <summary>Gets an existing handle binding without creating one or reopening a disposed binding.</summary>
+        /// <param name="handle">The handle whose binding to retrieve.</param>
+        /// <param name="binding">The existing binding, or <see langword="null"/> if none exists.</param>
+        /// <returns><see langword="true"/> if a binding exists; otherwise, <see langword="false"/>.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="handle"/> is null.</exception>
+        public static bool TryGetBinding(SafeHandle handle,
+            [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IoRingBoundHandle? binding)
+        {
+            ArgumentNullException.ThrowIfNull(handle);
+            binding = null;
+            return SafeHandle.s_disposeNotification is not null && IoRingBoundHandle.TryGet(handle, out binding);
+        }
+
         /// <summary>
         /// Attempts to submit a <c>recv(2)</c>-like read of up to <paramref name="length"/> bytes
         /// from <paramref name="handle"/> into <paramref name="buffer"/>. On success (return value
@@ -33,9 +71,10 @@ namespace System.Threading
         /// thread (never inline on the calling thread, and never on the shared ring's driver
         /// thread - completions are always redispatched as ordinary Thread Pool work items), with
         /// either the number of bytes received (&gt;= 0) or <c>-errno</c> on failure. Returns
-        /// <see langword="false"/> if the operation could not be submitted (e.g. io_uring is
-        /// unsupported/disabled, or the submission queue is momentarily full); no callback is
-        /// invoked in that case and the caller should fall back to its normal code path.
+        /// <see langword="false"/> if io_uring is unsupported or disabled; no callback is invoked
+        /// in that case. Other submission failures throw before accepting the request.
+        /// Disposing the handle or its canonical binding requests cancellation, but callers
+        /// must still retain their buffers until completion.
         /// </summary>
         public static unsafe bool TrySubmitRecv(SafeHandle handle, byte* buffer, int length, int flags, Action<int> onCompleted) =>
             TrySubmitCore(handle, Interop.Sys.IoRingOp.Recv, buffer, length, flags, null, null, onCompleted);
@@ -61,7 +100,7 @@ namespace System.Threading
         /// The vectors and their buffers must remain pinned until the callback, following
         /// <see cref="TrySubmitRecv"/>'s lifetime contract. Uses <c>MSG_WAITALL</c> to retry partial
         /// stream sends in the kernel, but errors and the native vector limit can still produce
-        /// a short result. This prototype does not support cancellation after submission.
+        /// a short result. Handle or binding disposal requests cancellation of outstanding sends.
         /// </remarks>
         public static unsafe bool TrySubmitSendV(SafeHandle handle, void* vectors, int vectorCount, int flags, Action<int> onCompleted)
         {
@@ -96,7 +135,7 @@ namespace System.Threading
         /// Attempts to submit a persistent, multishot <c>recv(2)</c>-like read on
         /// <paramref name="handle"/>: a single submission that keeps producing completions - one per
         /// datagram/read the kernel has data for - until cancelled (via <paramref name="operation"/>'s
-        /// <see cref="IIoUringOperation.RequestCancellation"/>), EOF, or an error occurs, instead of
+        /// <see cref="IoUringOperation.RequestCancellation"/>), EOF, or an error occurs, instead of
         /// completing exactly once like <see cref="TrySubmitRecv"/>. Received data is delivered via
         /// kernel-provided buffers leased from a pool, rather than a caller-supplied buffer:
         /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
@@ -110,7 +149,7 @@ namespace System.Threading
         /// operation could not be submitted (in which case <paramref name="operation"/> is
         /// <see langword="null"/> and no callback is invoked).
         /// </summary>
-        public static bool TrySubmitRecvMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted, out IIoUringOperation? operation)
+        public static bool TrySubmitRecvMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted, out IoUringOperation? operation)
         {
             ArgumentNullException.ThrowIfNull(handle);
             ArgumentNullException.ThrowIfNull(onCompleted);
@@ -142,107 +181,71 @@ namespace System.Threading
                 return false;
             }
 
-            ActionIoUringOperation operation = ActionIoUringOperation.Rent(handle, onCompleted);
-
-            bool refAdded = false;
+            Interop.Sys.IoRingRequest request = default;
+            request.OpCode = opCode;
+            request.Offset = -1;
+            request.Buffer = buffer;
+            request.BufferLength = length;
+            request.Flags = flags;
+            request.SockAddr = sockAddr;
+            request.SockAddrLen = sockAddrLen;
+            ActionIoUringOperation operation = ActionIoUringOperation.Rent(in request, onCompleted);
             bool submitted = false;
             try
             {
-                handle.DangerousAddRef(ref refAdded);
-                Interop.Sys.IoRingRequest request = default;
-                request.OpCode = opCode;
-                request.Fd = handle.DangerousGetHandle();
-                request.Offset = -1;
-                request.Buffer = buffer;
-                request.BufferLength = length;
-                request.Flags = flags;
-                request.SockAddr = sockAddr;
-                request.SockAddrLen = sockAddrLen;
-                if (opCode == Interop.Sys.IoRingOp.SendMsg)
-                {
-                    operation.MessageHeader = Interop.Sys.IoRingCreateSendMessage(request.Fd, (Interop.Sys.IOVector*)buffer, length);
-                    if (operation.MessageHeader == null)
-                    {
-                        throw new OutOfMemoryException();
-                    }
-                    request.Buffer = operation.MessageHeader;
-                }
-
-                submitted = PortableThreadPool.IoUringThreadPool.TrySubmit(operation, in request);
-                return submitted;
+                Bind(handle).Enqueue(operation);
+                submitted = true;
+                return true;
             }
             finally
             {
                 if (!submitted)
                 {
                     operation.Return();
-                    if (refAdded)
-                    {
-                        handle.DangerousRelease();
-                    }
                 }
             }
         }
 
         /// <summary>
         /// Adapts a plain <see cref="Action{Int32}"/> completion callback to the
-        /// <see cref="IIoUringOperation"/> contract, so callers of this public API never need to know
+        /// <see cref="IoUringOperation"/> contract, so callers of this public API never need to know
         /// about (or implement) that interface. Unlike a per-thread-ring design, the shared-ring driver
         /// never runs continuations inline: this type also implements <see cref="IThreadPoolWorkItem"/>
-        /// so it can be returned from <see cref="IIoUringOperation.CompleteFromIoUring(int, uint, long)"/>
+        /// so it can be returned from <see cref="IoUringOperation.CompleteFromIoUring(int, uint, long)"/>
         /// and queued (possibly batched together with other completions drained in the same pass)
         /// instead of being invoked directly on the driver thread.
         /// </summary>
-        private sealed class ActionIoUringOperation : IThreadPoolWorkItem, IIoUringOperation
+        private sealed class ActionIoUringOperation : IoUringOperation
         {
             [ThreadStatic]
             private static ActionIoUringOperation? t_cachedOperation;
 
-            private SafeHandle? _handle;
             private Action<int>? _onCompleted;
-            private int _result;
-            public unsafe byte* MessageHeader;
+            private IoUringRequest _request;
 
-            public static ActionIoUringOperation Rent(SafeHandle handle, Action<int> onCompleted)
+            protected override IoUringRequest Request => _request;
+
+            public static ActionIoUringOperation Rent(in Interop.Sys.IoRingRequest request, Action<int> onCompleted)
             {
                 ActionIoUringOperation operation = t_cachedOperation ?? new ActionIoUringOperation();
                 t_cachedOperation = null;
-                operation._handle = handle;
+                operation._request = new IoUringRequest(in request);
                 operation._onCompleted = onCompleted;
                 return operation;
             }
 
-            public unsafe void Return()
+            public void Return()
             {
-                if (MessageHeader != null)
-                {
-                    NativeMemory.Free(MessageHeader);
-                    MessageHeader = null;
-                }
-                _handle = null;
+                _request = default;
                 _onCompleted = null;
                 t_cachedOperation ??= this;
             }
 
-            IThreadPoolWorkItem? IIoUringOperation.CompleteFromIoUring(int result, uint flags, long sequence)
+            protected override void OnCompleted(int result, uint flags, long sequence)
             {
-                // Legacy dispatch resolves completions on the issuer, so defer the user callback.
-                _result = result;
-                return this;
-            }
-
-            // This type's operations (recv/send/accept/connect) complete exactly once and are not
-            // (yet) cancellable once submitted in this prototype - see IIoUringOperation.RequestCancellation's
-            // own doc comment.
-            void IIoUringOperation.RequestCancellation() => throw new NotImplementedException();
-
-            void IThreadPoolWorkItem.Execute()
-            {
-                SafeHandle handle = _handle!;
                 Action<int> onCompleted = _onCompleted!;
-                int result = _result;
+                CompleteOperation();
                 Return();
-                handle.DangerousRelease();
                 onCompleted(result);
             }
         }

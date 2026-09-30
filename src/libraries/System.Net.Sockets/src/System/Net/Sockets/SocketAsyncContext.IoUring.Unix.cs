@@ -11,12 +11,29 @@ namespace System.Net.Sockets
 {
     // Experimental completion-based socket operations over shared, sharded io_uring rings.
     // Each ring has one issuer; callbacks run on Thread Pool workers. Returning false leaves
-    // the caller to use the existing SocketAsyncEngine path. This prototype does not yet
-    // integrate the existing operation queues' cancellation and close bookkeeping.
+    // the caller to use the existing SocketAsyncEngine path.
     internal sealed partial class SocketAsyncContext
     {
-        private IoUringReceiveOperation? _cachedIoUringReceiveOperation;
+        private IoRingBoundHandle? _ioUringBinding;
+        private IoUringBufferOperation? _cachedIoUringReceiveOperation;
+        private IoUringBufferOperation? _cachedIoUringSendOperation;
         private IoUringBufferListSendOperation? _cachedIoUringBufferListSendOperation;
+        private IoUringAddressOperation? _cachedIoUringAcceptOperation;
+        private IoUringAddressOperation? _cachedIoUringConnectOperation;
+
+        private IoRingBoundHandle IoUringBinding
+        {
+            get
+            {
+                IoRingBoundHandle? binding = Volatile.Read(ref _ioUringBinding);
+                if (binding is null)
+                {
+                    binding = IoUring.Bind(_socket);
+                    binding = Interlocked.CompareExchange(ref _ioUringBinding, binding, null) ?? binding;
+                }
+                return binding;
+            }
+        }
 
         /// <summary>
         /// Attempts to complete a plain, single-buffer, no-destination-address Receive via io_uring
@@ -24,44 +41,56 @@ namespace System.Net.Sockets
         /// <see langword="true"/> if the operation was submitted - <paramref name="callback"/> will be
         /// invoked exactly once, later, with the final result (bytes received, or a mapped
         /// <see cref="SocketError"/> on failure). Returns <see langword="false"/> if the fast path does
-        /// not apply or submission failed; the caller must fall back to its normal code path and no
-        /// callback will ever be invoked for this attempt.
+        /// not apply; the caller must fall back to its normal code path and no callback will be invoked
+        /// for this attempt. Submission exceptions are propagated before accepting the operation.
         /// </summary>
-        private unsafe bool TryReceiveViaIoUring(Memory<byte> buffer, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        private bool TryReceiveViaIoUring(Memory<byte> buffer, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback,
+            CancellationToken cancellationToken)
         {
             if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None || buffer.Length == 0)
             {
                 return false;
             }
 
-            IoUringReceiveOperation operation = Interlocked.Exchange(ref _cachedIoUringReceiveOperation, null)
-                ?? new IoUringReceiveOperation(this);
-            return operation.TrySubmit(buffer, callback);
+            IoUringBufferOperation operation = Interlocked.Exchange(ref _cachedIoUringReceiveOperation, null)
+                ?? new IoUringBufferOperation(this, isReceive: true);
+            return operation.TrySubmit(buffer, 0, buffer.Length, 0, callback, cancellationToken);
         }
 
-        private sealed class IoUringReceiveOperation
+        private sealed class IoUringBufferOperation : IoUringOperation
         {
             private readonly SocketAsyncContext _context;
-            private readonly Action<int> _onCompleted;
+            private readonly bool _isReceive;
             private MemoryHandle _pin;
+            private int _offset;
+            private int _count;
+            private int _bytesAlreadyTransferred;
             private Action<int, Memory<byte>, SocketFlags, SocketError>? _callback;
 
-            public IoUringReceiveOperation(SocketAsyncContext context)
+            public IoUringBufferOperation(SocketAsyncContext context, bool isReceive)
             {
                 _context = context;
-                _onCompleted = Complete;
+                _isReceive = isReceive;
             }
 
-            public unsafe bool TrySubmit(Memory<byte> buffer, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+            protected override unsafe IoUringRequest Request =>
+                new IoUringRequest(_isReceive ? IoUringOperationKind.Receive : IoUringOperationKind.Send,
+                    (byte*)_pin.Pointer + _offset, _count);
+
+            public unsafe bool TrySubmit(Memory<byte> buffer, int offset, int count, int bytesAlreadyTransferred,
+                Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
             {
                 bool submitted = false;
                 try
                 {
                     _pin = buffer.Pin();
                     _callback = callback;
-                    submitted = System.Threading.IoUring.TrySubmitRecv(
-                        _context._socket, (byte*)_pin.Pointer, buffer.Length, 0, _onCompleted);
-                    return submitted;
+                    _bytesAlreadyTransferred = bytesAlreadyTransferred;
+                    _offset = offset;
+                    _count = count;
+                    _context.IoUringBinding.Enqueue(this, cancellationToken);
+                    submitted = true;
+                    return true;
                 }
                 finally
                 {
@@ -74,12 +103,55 @@ namespace System.Net.Sockets
                 }
             }
 
-            private void Complete(int result)
+            protected override void OnCompleted(int result, uint flags, long sequence)
             {
+                SocketError error = result < 0
+                    ? SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error)
+                    : SocketError.Success;
+                if (result >= 0)
+                {
+                    _bytesAlreadyTransferred += result;
+                    if (!_isReceive)
+                    {
+                        _offset += result;
+                        _count -= result;
+                        if (_count != 0)
+                        {
+                            if (IsCancellationRequested)
+                            {
+                                error = SocketError.OperationAborted;
+                            }
+                            else if (result == 0)
+                            {
+                                error = SocketError.ConnectionReset;
+                            }
+                            else
+                            {
+                                try
+                                {
+                                    EnqueueContinuation(Request);
+                                    return;
+                                }
+                                catch (ObjectDisposedException)
+                                {
+                                    error = SocketError.OperationAborted;
+                                }
+                                catch (OutOfMemoryException)
+                                {
+                                    error = SocketError.NoBufferSpaceAvailable;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 MemoryHandle pin = _pin;
                 Action<int, Memory<byte>, SocketFlags, SocketError> callback = _callback!;
+                int bytesAlreadyTransferred = _bytesAlreadyTransferred;
+                CompleteOperation();
                 Return();
-                CompleteReceiveOrSend(pin, callback, result);
+                pin.Dispose();
+                callback(bytesAlreadyTransferred, Memory<byte>.Empty, SocketFlags.None, error);
             }
 
             private void Return()
@@ -87,7 +159,14 @@ namespace System.Net.Sockets
                 _pin = default;
                 _callback = null;
                 // User callbacks (including Unpin) may immediately submit another receive.
-                Interlocked.CompareExchange(ref _context._cachedIoUringReceiveOperation, this, null);
+                if (_isReceive)
+                {
+                    Interlocked.CompareExchange(ref _context._cachedIoUringReceiveOperation, this, null);
+                }
+                else
+                {
+                    Interlocked.CompareExchange(ref _context._cachedIoUringSendOperation, this, null);
+                }
             }
         }
 
@@ -96,28 +175,17 @@ namespace System.Net.Sockets
         /// instead of registering the socket for epoll-based readiness notification. See
         /// <see cref="TryReceiveViaIoUring"/> for the submission/callback contract.
         /// </summary>
-        private unsafe bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        private bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, int bytesSent,
+            Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
         {
             if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
             {
                 return false;
             }
 
-            MemoryHandle pin = buffer.Pin();
-            byte* bufferPtr = (byte*)pin.Pointer + offset;
-            bool submitted = System.Threading.IoUring.TrySubmitSend(
-                _socket,
-                bufferPtr,
-                count,
-                0,
-                result => CompleteReceiveOrSend(pin, callback, result, bytesSent));
-
-            if (!submitted)
-            {
-                pin.Dispose();
-            }
-
-            return submitted;
+            IoUringBufferOperation operation = Interlocked.Exchange(ref _cachedIoUringSendOperation, null)
+                ?? new IoUringBufferOperation(this, isReceive: false);
+            return operation.TrySubmit(buffer, offset, count, bytesSent, callback, cancellationToken);
         }
 
         private bool TrySendViaIoUring(IList<ArraySegment<byte>> buffers, int bufferIndex, int offset, SocketFlags flags,
@@ -133,10 +201,9 @@ namespace System.Net.Sockets
             return operation.TrySubmit(buffers, bufferIndex, offset, bytesSent, callback);
         }
 
-        private sealed class IoUringBufferListSendOperation
+        private sealed class IoUringBufferListSendOperation : IoUringOperation
         {
             private readonly SocketAsyncContext _context;
-            private readonly Action<int> _onCompleted;
             private GCHandle[] _pins = Array.Empty<GCHandle>();
             private Interop.Sys.IOVector[] _vectors = Array.Empty<Interop.Sys.IOVector>();
             private GCHandle _vectorsPin;
@@ -148,7 +215,6 @@ namespace System.Net.Sockets
             public IoUringBufferListSendOperation(SocketAsyncContext context)
             {
                 _context = context;
-                _onCompleted = Complete;
             }
 
             public unsafe bool TrySubmit(IList<ArraySegment<byte>> buffers, int bufferIndex, int offset, int bytesSent,
@@ -180,8 +246,9 @@ namespace System.Net.Sockets
                     }
 
                     _vectorsPin = GCHandle.Alloc(_vectors, GCHandleType.Pinned);
-                    submitted = Submit();
-                    return submitted;
+                    _context.IoUringBinding.Enqueue(this);
+                    submitted = true;
+                    return true;
                 }
                 finally
                 {
@@ -192,11 +259,11 @@ namespace System.Net.Sockets
                 }
             }
 
-            private unsafe bool Submit() =>
-                System.Threading.IoUring.TrySubmitSendV(_context._socket,
-                    (Interop.Sys.IOVector*)_vectorsPin.AddrOfPinnedObject() + _vectorIndex, _pinCount - _vectorIndex, 0, _onCompleted);
+            protected override unsafe IoUringRequest Request =>
+                new IoUringRequest(IoUringOperationKind.SendGather,
+                    (Interop.Sys.IOVector*)_vectorsPin.AddrOfPinnedObject() + _vectorIndex, _pinCount - _vectorIndex);
 
-            private unsafe void Complete(int result)
+            protected override unsafe void OnCompleted(int result, uint flags, long sequence)
             {
                 SocketError error = result < 0
                     ? SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error)
@@ -224,7 +291,11 @@ namespace System.Net.Sockets
                     // produce a short result. Keep the pins until the logical send finishes.
                     if (_vectorIndex < _pinCount)
                     {
-                        if (result == 0)
+                        if (IsCancellationRequested)
+                        {
+                            error = SocketError.OperationAborted;
+                        }
+                        else if (result == 0)
                         {
                             error = SocketError.ConnectionReset;
                         }
@@ -232,13 +303,8 @@ namespace System.Net.Sockets
                         {
                             try
                             {
-                                bool submitted = Submit();
-                                Debug.Assert(submitted);
-                                if (submitted)
-                                {
-                                    return;
-                                }
-                                error = SocketError.OperationNotSupported;
+                                EnqueueContinuation(Request);
+                                return;
                             }
                             catch (ObjectDisposedException)
                             {
@@ -254,6 +320,7 @@ namespace System.Net.Sockets
 
                 Action<int, Memory<byte>, SocketFlags, SocketError> callback = _callback!;
                 int bytesSent = _bytesSent;
+                CompleteOperation();
                 Return();
                 callback(bytesSent, Memory<byte>.Empty, SocketFlags.None, error);
             }
@@ -275,18 +342,6 @@ namespace System.Net.Sockets
             }
         }
 
-        private static void CompleteReceiveOrSend(MemoryHandle pin, Action<int, Memory<byte>, SocketFlags, SocketError> callback, int result, int bytesAlreadyTransferred = 0)
-        {
-            pin.Dispose();
-
-            int bytesTransferred = bytesAlreadyTransferred + (result >= 0 ? result : 0);
-            SocketError errorCode = result >= 0
-                ? SocketError.Success
-                : SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error);
-
-            callback(bytesTransferred, Memory<byte>.Empty, SocketFlags.None, errorCode);
-        }
-
         /// <summary>
         /// Attempts to complete an Accept via io_uring instead of registering the listening socket for
         /// epoll-based readiness notification. <paramref name="socketAddress"/> must remain valid until
@@ -294,54 +349,17 @@ namespace System.Net.Sockets
         /// length, on success). See <see cref="TryReceiveViaIoUring"/> for the general
         /// submission/callback contract.
         /// </summary>
-        private unsafe bool TryAcceptViaIoUring(Memory<byte> socketAddress, Action<IntPtr, Memory<byte>, SocketError> callback)
+        private bool TryAcceptViaIoUring(Memory<byte> socketAddress, Action<IntPtr, Memory<byte>, SocketError> callback,
+            CancellationToken cancellationToken)
         {
             if (!System.Threading.IoUring.IsSupported)
             {
                 return false;
             }
 
-            MemoryHandle addressPin = socketAddress.Pin();
-
-            // The io_uring Accept op needs a pinned, in/out socklen_t for the address length: the
-            // kernel writes the actual peer address length back into it on completion. A GC-pinned
-            // array (rather than a stack-allocated int, which wouldn't survive past this synchronous
-            // call) keeps this alive and at a stable address for as long as the operation is in
-            // flight, without requiring an explicit GCHandle to free later.
-            int[] addressLengthBox = GC.AllocateArray<int>(1, pinned: true);
-            addressLengthBox[0] = socketAddress.Length;
-
-            bool submitted;
-            fixed (int* addressLengthPtr = addressLengthBox)
-            {
-                submitted = System.Threading.IoUring.TrySubmitAccept(
-                    _socket,
-                    (byte*)addressPin.Pointer,
-                    addressLengthPtr,
-                    0,
-                    result =>
-                    {
-                        addressPin.Dispose();
-
-                        if (result >= 0)
-                        {
-                            int actualLength = Math.Min(addressLengthBox[0], socketAddress.Length);
-                            callback((IntPtr)result, socketAddress.Slice(0, actualLength), SocketError.Success);
-                        }
-                        else
-                        {
-                            SocketError errorCode = SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error);
-                            callback((IntPtr)(-1), socketAddress, errorCode);
-                        }
-                    });
-            }
-
-            if (!submitted)
-            {
-                addressPin.Dispose();
-            }
-
-            return submitted;
+            IoUringAddressOperation operation = Interlocked.Exchange(ref _cachedIoUringAcceptOperation, null)
+                ?? new IoUringAddressOperation(this, isAccept: true);
+            return operation.TrySubmit(socketAddress, callback, null, cancellationToken);
         }
 
         /// <summary>
@@ -350,45 +368,115 @@ namespace System.Net.Sockets
         /// existing non-blocking-connect-then-epoll-wait sequence. See
         /// <see cref="TryReceiveViaIoUring"/> for the general submission/callback contract.
         /// </summary>
-        private unsafe bool TryConnectViaIoUring(Memory<byte> socketAddress, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        private bool TryConnectViaIoUring(Memory<byte> socketAddress, Action<int, Memory<byte>, SocketFlags, SocketError> callback,
+            CancellationToken cancellationToken)
         {
             if (!System.Threading.IoUring.IsSupported)
             {
                 return false;
             }
 
-            MemoryHandle addressPin = socketAddress.Pin();
-            int[] addressLengthBox = GC.AllocateArray<int>(1, pinned: true);
-            addressLengthBox[0] = socketAddress.Length;
+            IoUringAddressOperation operation = Interlocked.Exchange(ref _cachedIoUringConnectOperation, null)
+                ?? new IoUringAddressOperation(this, isAccept: false);
+            return operation.TrySubmit(socketAddress, null, callback, cancellationToken);
+        }
 
-            bool submitted;
-            fixed (int* addressLengthPtr = addressLengthBox)
+        private sealed class IoUringAddressOperation : IoUringOperation
+        {
+            private readonly SocketAsyncContext _context;
+            private readonly bool _isAccept;
+            private readonly int[] _addressLength = GC.AllocateArray<int>(1, pinned: true);
+            private Memory<byte> _address;
+            private MemoryHandle _pin;
+            private Action<IntPtr, Memory<byte>, SocketError>? _acceptCallback;
+            private Action<int, Memory<byte>, SocketFlags, SocketError>? _connectCallback;
+
+            public IoUringAddressOperation(SocketAsyncContext context, bool isAccept)
             {
-                submitted = System.Threading.IoUring.TrySubmitConnect(
-                    _socket,
-                    (byte*)addressPin.Pointer,
-                    addressLengthPtr,
-                    result =>
+                _context = context;
+                _isAccept = isAccept;
+            }
+
+            protected override unsafe IoUringRequest Request
+            {
+                get
+                {
+                    fixed (int* addressLength = _addressLength)
                     {
-                        addressPin.Dispose();
-
-                        SocketError errorCode = result == 0
-                            ? SocketError.Success
-                            : SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error);
-
-                        _socket.RegisterConnectResult(errorCode);
-                        _socket.SetBlocking();
-
-                        callback(0, socketAddress, SocketFlags.None, errorCode);
-                    });
+                        return new IoUringRequest(_isAccept ? IoUringOperationKind.Accept : IoUringOperationKind.Connect,
+                            null, 0, socketAddress: _pin.Pointer, socketAddressLength: addressLength);
+                    }
+                }
             }
 
-            if (!submitted)
+            public bool TrySubmit(Memory<byte> address, Action<IntPtr, Memory<byte>, SocketError>? acceptCallback,
+                Action<int, Memory<byte>, SocketFlags, SocketError>? connectCallback, CancellationToken cancellationToken)
             {
-                addressPin.Dispose();
+                bool submitted = false;
+                try
+                {
+                    _address = address;
+                    _addressLength[0] = address.Length;
+                    _acceptCallback = acceptCallback;
+                    _connectCallback = connectCallback;
+                    _pin = address.Pin();
+                    _context.IoUringBinding.Enqueue(this, cancellationToken);
+                    submitted = true;
+                    return true;
+                }
+                finally
+                {
+                    if (!submitted)
+                    {
+                        MemoryHandle pin = _pin;
+                        Return();
+                        pin.Dispose();
+                    }
+                }
             }
 
-            return submitted;
+            protected override void OnCompleted(int result, uint flags, long sequence)
+            {
+                MemoryHandle pin = _pin;
+                Memory<byte> address = _address;
+                int addressLength = Math.Min(_addressLength[0], address.Length);
+                Action<IntPtr, Memory<byte>, SocketError>? acceptCallback = _acceptCallback;
+                Action<int, Memory<byte>, SocketFlags, SocketError>? connectCallback = _connectCallback;
+                SocketError error = result >= 0
+                    ? SocketError.Success
+                    : SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error);
+                CompleteOperation();
+                Return();
+                pin.Dispose();
+
+                if (_isAccept)
+                {
+                    acceptCallback!((IntPtr)(result >= 0 ? result : -1),
+                        result >= 0 ? address.Slice(0, addressLength) : address, error);
+                }
+                else
+                {
+                    _context._socket.RegisterConnectResult(error);
+                    _context._socket.SetBlocking();
+                    connectCallback!(0, address, SocketFlags.None, error);
+                }
+            }
+
+            private void Return()
+            {
+                _pin = default;
+                _address = default;
+                _acceptCallback = null;
+                _connectCallback = null;
+                if (_isAccept)
+                {
+                    Interlocked.CompareExchange(ref _context._cachedIoUringAcceptOperation, this, null);
+                }
+                else
+                {
+                    Interlocked.CompareExchange(ref _context._cachedIoUringConnectOperation, this, null);
+                }
+            }
         }
     }
 }
