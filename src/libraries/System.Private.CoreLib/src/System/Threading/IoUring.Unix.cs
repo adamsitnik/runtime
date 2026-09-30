@@ -49,6 +49,29 @@ namespace System.Threading
             TrySubmitCore(handle, Interop.Sys.IoRingOp.Send, buffer, length, flags, null, null, onCompleted);
 
         /// <summary>
+        /// Attempts to submit a gather send using native <c>iovec</c> entries.
+        /// </summary>
+        /// <param name="handle">The socket handle.</param>
+        /// <param name="vectors">A pointer to an array of native <c>iovec</c> entries.</param>
+        /// <param name="vectorCount">The number of entries in <paramref name="vectors"/>.</param>
+        /// <param name="flags">A bitwise combination of native <c>MSG_*</c> flags.</param>
+        /// <param name="onCompleted">The callback receiving the byte count or negative errno.</param>
+        /// <returns><see langword="true"/> if submitted; otherwise, <see langword="false"/>.</returns>
+        /// <remarks>
+        /// The vectors and their buffers must remain pinned until the callback, following
+        /// <see cref="TrySubmitRecv"/>'s lifetime contract. Uses <c>MSG_WAITALL</c> to retry partial
+        /// stream sends in the kernel, but errors and the native vector limit can still produce
+        /// a short result. This prototype does not support cancellation after submission.
+        /// </remarks>
+        public static unsafe bool TrySubmitSendV(SafeHandle handle, void* vectors, int vectorCount, int flags, Action<int> onCompleted)
+        {
+            ArgumentNullException.ThrowIfNull(vectors);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(vectorCount);
+
+            return TrySubmitCore(handle, Interop.Sys.IoRingOp.SendMsg, (byte*)vectors, vectorCount, flags, null, null, onCompleted);
+        }
+
+        /// <summary>
         /// Attempts to submit an <c>accept(2)</c>-like operation on the listening socket
         /// <paramref name="handle"/>. On completion, <paramref name="onCompleted"/> is invoked with
         /// either the new connected socket's file descriptor (&gt;= 0) or <c>-errno</c> on failure;
@@ -135,6 +158,15 @@ namespace System.Threading
                 request.Flags = flags;
                 request.SockAddr = sockAddr;
                 request.SockAddrLen = sockAddrLen;
+                if (opCode == Interop.Sys.IoRingOp.SendMsg)
+                {
+                    operation.MessageHeader = Interop.Sys.IoRingCreateSendMessage(request.Fd, (Interop.Sys.IOVector*)buffer, length);
+                    if (operation.MessageHeader == null)
+                    {
+                        throw new OutOfMemoryException();
+                    }
+                    request.Buffer = operation.MessageHeader;
+                }
 
                 submitted = PortableThreadPool.IoUringThreadPool.TrySubmit(operation, in request);
                 return submitted;
@@ -169,6 +201,7 @@ namespace System.Threading
             private SafeHandle? _handle;
             private Action<int>? _onCompleted;
             private int _result;
+            public unsafe byte* MessageHeader;
 
             public static ActionIoUringOperation Rent(SafeHandle handle, Action<int> onCompleted)
             {
@@ -179,8 +212,13 @@ namespace System.Threading
                 return operation;
             }
 
-            public void Return()
+            public unsafe void Return()
             {
+                if (MessageHeader != null)
+                {
+                    NativeMemory.Free(MessageHeader);
+                    MessageHeader = null;
+                }
                 _handle = null;
                 _onCompleted = null;
                 t_cachedOperation ??= this;

@@ -2,6 +2,9 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace System.Net.Sockets
@@ -13,6 +16,7 @@ namespace System.Net.Sockets
     internal sealed partial class SocketAsyncContext
     {
         private IoUringReceiveOperation? _cachedIoUringReceiveOperation;
+        private IoUringBufferListSendOperation? _cachedIoUringBufferListSendOperation;
 
         /// <summary>
         /// Attempts to complete a plain, single-buffer, no-destination-address Receive via io_uring
@@ -114,6 +118,161 @@ namespace System.Net.Sockets
             }
 
             return submitted;
+        }
+
+        private bool TrySendViaIoUring(IList<ArraySegment<byte>> buffers, int bufferIndex, int offset, SocketFlags flags,
+            int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+        {
+            if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
+            {
+                return false;
+            }
+
+            IoUringBufferListSendOperation operation = Interlocked.Exchange(ref _cachedIoUringBufferListSendOperation, null)
+                ?? new IoUringBufferListSendOperation(this);
+            return operation.TrySubmit(buffers, bufferIndex, offset, bytesSent, callback);
+        }
+
+        private sealed class IoUringBufferListSendOperation
+        {
+            private readonly SocketAsyncContext _context;
+            private readonly Action<int> _onCompleted;
+            private GCHandle[] _pins = Array.Empty<GCHandle>();
+            private Interop.Sys.IOVector[] _vectors = Array.Empty<Interop.Sys.IOVector>();
+            private GCHandle _vectorsPin;
+            private int _pinCount;
+            private int _vectorIndex;
+            private int _bytesSent;
+            private Action<int, Memory<byte>, SocketFlags, SocketError>? _callback;
+
+            public IoUringBufferListSendOperation(SocketAsyncContext context)
+            {
+                _context = context;
+                _onCompleted = Complete;
+            }
+
+            public unsafe bool TrySubmit(IList<ArraySegment<byte>> buffers, int bufferIndex, int offset, int bytesSent,
+                Action<int, Memory<byte>, SocketFlags, SocketError> callback)
+            {
+                bool submitted = false;
+                try
+                {
+                    int count = buffers.Count - bufferIndex;
+                    if (_pins.Length < count)
+                    {
+                        _pins = new GCHandle[count];
+                    }
+                    if (_vectors.Length < count)
+                    {
+                        _vectors = new Interop.Sys.IOVector[count];
+                    }
+
+                    _bytesSent = bytesSent;
+                    _callback = callback;
+                    for (int i = 0; i < count; i++, offset = 0)
+                    {
+                        ArraySegment<byte> buffer = buffers[bufferIndex + i];
+                        RangeValidationHelpers.ValidateSegment(buffer);
+                        _pins[i] = GCHandle.Alloc(buffer.Array, GCHandleType.Pinned);
+                        _pinCount++;
+                        _vectors[i].Base = (byte*)_pins[i].AddrOfPinnedObject() + buffer.Offset + offset;
+                        _vectors[i].Count = (UIntPtr)(buffer.Count - offset);
+                    }
+
+                    _vectorsPin = GCHandle.Alloc(_vectors, GCHandleType.Pinned);
+                    submitted = Submit();
+                    return submitted;
+                }
+                finally
+                {
+                    if (!submitted)
+                    {
+                        Return();
+                    }
+                }
+            }
+
+            private unsafe bool Submit() =>
+                System.Threading.IoUring.TrySubmitSendV(_context._socket,
+                    (Interop.Sys.IOVector*)_vectorsPin.AddrOfPinnedObject() + _vectorIndex, _pinCount - _vectorIndex, 0, _onCompleted);
+
+            private unsafe void Complete(int result)
+            {
+                SocketError error = result < 0
+                    ? SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error)
+                    : SocketError.Success;
+                if (result >= 0)
+                {
+                    _bytesSent += result;
+                    int remaining = result;
+                    while (_vectorIndex < _pinCount)
+                    {
+                        ref Interop.Sys.IOVector vector = ref _vectors[_vectorIndex];
+                        if ((nuint)remaining < vector.Count)
+                        {
+                            vector.Base += remaining;
+                            vector.Count -= (nuint)remaining;
+                            remaining = 0;
+                            break;
+                        }
+                        remaining -= (int)vector.Count;
+                        _vectorIndex++;
+                    }
+                    Debug.Assert(remaining == 0);
+
+                    // MSG_WAITALL does not span native vector limits, and errors can also
+                    // produce a short result. Keep the pins until the logical send finishes.
+                    if (_vectorIndex < _pinCount)
+                    {
+                        if (result == 0)
+                        {
+                            error = SocketError.ConnectionReset;
+                        }
+                        else
+                        {
+                            try
+                            {
+                                bool submitted = Submit();
+                                Debug.Assert(submitted);
+                                if (submitted)
+                                {
+                                    return;
+                                }
+                                error = SocketError.OperationNotSupported;
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                error = SocketError.OperationAborted;
+                            }
+                            catch (OutOfMemoryException)
+                            {
+                                error = SocketError.NoBufferSpaceAvailable;
+                            }
+                        }
+                    }
+                }
+
+                Action<int, Memory<byte>, SocketFlags, SocketError> callback = _callback!;
+                int bytesSent = _bytesSent;
+                Return();
+                callback(bytesSent, Memory<byte>.Empty, SocketFlags.None, error);
+            }
+
+            private void Return()
+            {
+                if (_vectorsPin.IsAllocated)
+                {
+                    _vectorsPin.Free();
+                }
+                for (int i = 0; i < _pinCount; i++)
+                {
+                    _pins[i].Free();
+                }
+                _pinCount = 0;
+                _vectorIndex = 0;
+                _callback = null;
+                Interlocked.CompareExchange(ref _context._cachedIoUringBufferListSendOperation, this, null);
+            }
         }
 
         private static void CompleteReceiveOrSend(MemoryHandle pin, Action<int, Memory<byte>, SocketFlags, SocketError> callback, int result, int bytesAlreadyTransferred = 0)
