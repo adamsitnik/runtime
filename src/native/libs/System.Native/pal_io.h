@@ -927,6 +927,7 @@ typedef enum
                                   // (see SystemNative_IoRingRegisterBufferRing); keeps producing completions,
                                   // each selecting one buffer, until cancelled, EOF, or an error occurs; every
                                   // completion but the last one carries IORING_CQE_F_MORE in its Flags
+    IoRingOp_ReadMultishot = 10, // persistent pipe read using provided-buffer group zero
 } IoRingOp;
 
 /**
@@ -966,7 +967,7 @@ typedef struct
 
 /**
  * Determines whether io_uring is usable on this system (kernel support, not blocked by
- * seccomp/sysctl, etc.). This performs a real io_uring_setup/close probe and caches the result.
+ * seccomp/sysctl, etc.), including READ_MULTISHOT support. Probes and caches the result.
  *
  * Returns 1 if io_uring is available, 0 if not.
  */
@@ -1025,17 +1026,18 @@ PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* 
 PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
 
 /**
- * Creates an eventfd and registers it with the given ring via IORING_REGISTER_EVENTFD: from then
- * on, the kernel bumps that eventfd's counter (making it readable) every time a CQE is posted to
- * this ring's completion queue. The returned fd is also safe for any *other* thread to write to
- * directly (see SystemNative_EventFdWrite) to piggyback its own wake-up onto the same fd a single
- * waiter is blocked on in SystemNative_EventFdWait - this lets one blocking wait call respond to
- * either "a completion is ready" or "a new request was enqueued" without polling.
- *
- * Returns the eventfd on success (also owned by, and closed together with, ringHandle); returns
- * -1 and sets errno on failure.
+ * Creates a nonblocking, close-on-exec pipe owned by the ring and publishes its multishot read.
+ * Requires provided-buffer group zero to be registered. Wake CQEs have UserData zero.
+ * Returns 0 on success, -1 with errno on failure. The ring owns partial initialization as well.
  */
-PALEXPORT int32_t SystemNative_IoRingRegisterEventFd(intptr_t ringHandle);
+PALEXPORT int32_t SystemNative_IoRingInitializeWakePipe(intptr_t ringHandle);
+
+/**
+ * Publishes a replacement wake read after its terminal CQE. Only the issuer may call this.
+ * Returns 0 on success, -1 with errno on failure (EAGAIN when the SQ is full).
+ * Like IoRingSubmit, this does not enter the kernel.
+ */
+PALEXPORT int32_t SystemNative_IoRingArmWakeRead(intptr_t ringHandle);
 
 /**
  * Allocates bufferCount page-aligned buffers of bufferSize bytes each (owned by, and freed
@@ -1062,24 +1064,10 @@ PALEXPORT int32_t SystemNative_IoRingRegisterBufferRing(intptr_t ringHandle, int
 PALEXPORT int32_t SystemNative_IoRingReturnBuffers(intptr_t ringHandle, uint16_t* bufferIds, int32_t count);
 
 /**
- * Bumps the given eventfd's counter by 1, making it readable. Safe to call from any thread,
- * concurrently with other writers and/or with a reader blocked in SystemNative_EventFdWait.
- *
- * Returns 0 on success; otherwise, returns -1 and sets errno.
+ * Writes one byte to the wake pipe from any thread. A full pipe already contains a signal.
+ * Returns 0 on success (including a full pipe), -1 with errno on failure.
  */
-PALEXPORT int32_t SystemNative_EventFdWrite(int32_t eventFd);
-
-/**
- * Blocks the calling thread (a real, non-spinning kernel wait - see poll(2)) until the given
- * eventfd becomes readable or timeoutMilliseconds elapses (pass -1 to block indefinitely). If it
- * becomes readable, drains its counter back to 0 before returning, so a subsequent call only
- * returns once a *new* event has occurred - the same "wait, then reset" pattern a
- * ManualResetEventSlim-based design would use, but implemented with a real kernel-level wait
- * instead of any userland spin-before-blocking behavior.
- *
- * Returns 1 if the fd became readable, 0 if the call timed out, or -1 (with errno set) on error.
- */
-PALEXPORT int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilliseconds);
+PALEXPORT int32_t SystemNative_IoRingWake(intptr_t ringHandle);
 
 /**
  * Reaps completions from the given ring's completion queue, waiting in-kernel for at least

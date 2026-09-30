@@ -541,6 +541,19 @@ if (HAVE_LINUX_IO_URING_H)
     endif()
 endif()
 
+# The issuer wake pipe uses multishot read (Linux 6.7).
+if (HAVE_LINUX_IO_URING_H)
+    check_c_source_compiles(
+        "
+        #include <linux/io_uring.h>
+        int main(void) { return IORING_OP_READ_MULTISHOT; }
+        "
+        HAVE_IO_URING_READ_MULTISHOT)
+    if (NOT HAVE_IO_URING_READ_MULTISHOT)
+        set(HAVE_LINUX_IO_URING_H 0)
+    endif()
+endif()
+
 check_symbol_exists(
     gethostname
     unistd.h

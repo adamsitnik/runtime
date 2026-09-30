@@ -37,10 +37,9 @@ namespace System.Threading
         /// <c>SystemNative_IoRingWaitForCompletions</c>'s native-side doc comment for why this call cannot
         /// be skipped even when nothing is known to be ready). Any other thread that wants to submit a
         /// request enqueues it into a lock-free MPSC queue and wakes the issuer thread by writing to a
-        /// shared eventfd registered on the ring (<c>IORING_REGISTER_EVENTFD</c>, see
-        /// <see cref="Ring.WakeEventFd"/>'s doc comment); the issuer thread drains the queue in batches,
-        /// submits them, then polls for completions and waits on that same eventfd for either a new
-        /// submission or a completion becoming ready (see <see cref="IssuerLoop"/>), rather than spinning
+        /// ring-owned pipe with a multishot read in flight. The issuer drains the queue in batches,
+        /// submits them, then waits directly for completions, including the pipe's wake CQEs
+        /// (see <see cref="IssuerLoop"/>), rather than spinning
         /// or busy-polling. Each ring's submission queue is unbounded, so <see cref="TrySubmit"/> always
         /// succeeds (once enabled) - there is no "ring is full, fall back" signal in this design. Worker
         /// threads no longer participate in reaping completions at all; each ring's dedicated issuer
@@ -48,7 +47,7 @@ namespace System.Threading
         ///
         /// Rather than a single global ring, this is sharded across <see cref="s_rings"/> - a
         /// configurable number of independent <see cref="Ring"/> instances, each with its own ring
-        /// handle, wake-eventfd, queues, and dedicated issuer thread (see <see cref="GetRingCount"/>).
+        /// handle, wake pipe, queues, and dedicated issuer thread (see <see cref="GetRingCount"/>).
         /// This exists to avoid a single issuer thread becoming a hard, non-scaling bottleneck: profiling
         /// (see this file's git history / design notes) showed a single ring's issuer thread executes
         /// every socket's actual recv/poll syscall work inline as part of <c>io_uring_enter</c>, so its
@@ -87,6 +86,7 @@ namespace System.Threading
             private const int QueueDepth = 1024;
             private const ulong OperationSlotTag = 1;
             private const int OperationSlotGenerationShift = 32;
+            private const ulong WakeUserData = 0;
 
             // Maximum number of completions fetched per IoRingWaitForCompletions call. Batching here
             // means the issuer thread, when it wakes up to many simultaneously-ready completions (e.g.
@@ -95,18 +95,6 @@ namespace System.Threading
             private const int MaxCompletionsPerWait = 64;
             private const int MaxCompletionsPerTurn = 256;
             private const int SubmissionRetryDelayMs = 1;
-
-            // Defensive safety-net timeout (milliseconds) for the issuer thread's wait when operations
-            // are in flight but nothing is immediately ready. In the common/expected case this timeout
-            // never actually elapses: the registered eventfd (see Ring.WakeEventFd) is expected to wake
-            // the issuer thread directly whenever deferred completion task-work becomes ready to run -
-            // this is the documented intent of pairing IORING_SETUP_DEFER_TASKRUN with a registered
-            // eventfd (see SystemNative_IoRingRegisterEventFd's doc comment). This bound exists only to
-            // self-heal (within at most this many milliseconds) if that assumption ever turns out to be
-            // wrong for some request type/kernel version - trading a small amount of worst-case
-            // completion-latency for defense in depth, without reintroducing the tight busy-poll loop
-            // this design replaced.
-            private const int InFlightWaitTimeoutMs = 1000;
 
             private const int CompletionProcessorTimeSliceMs = 15;
 
@@ -177,7 +165,7 @@ namespace System.Threading
 
             /// <summary>
             /// Per-shard state: one independent <c>IORING_SETUP_SINGLE_ISSUER</c> ring, its own
-            /// submission/completion queues, wake-eventfd, and dedicated issuer thread. See this type's
+            /// submission/completion queues, wake pipe, and dedicated issuer thread. See this type's
             /// own doc comment (on <see cref="IoUringThreadPool"/>) for why sharding across multiple
             /// rings/issuer threads exists and how callers are assigned to one.
             /// </summary>
@@ -204,24 +192,15 @@ namespace System.Threading
                 // fails due to this queue being "full".
                 public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingSubmissions = new();
 
-                // An eventfd registered with this ring via IORING_REGISTER_EVENTFD (see
-                // Interop.Sys.IoRingRegisterEventFd), or -1 if unavailable. The kernel bumps its counter
-                // (making it readable) whenever a CQE is posted - including, per the documented intent of
-                // pairing IORING_SETUP_DEFER_TASKRUN with a registered eventfd, when *deferred* completion
-                // task-work becomes ready to run, even though it has not been posted to the CQ yet.
-                // TrySubmit also writes to this same fd directly (see Interop.Sys.EventFdWrite) to wake
-                // this ring's issuer thread when it enqueues a new request. Interop.Sys.EventFdWait is a
-                // real (poll(2)-based) kernel wait with no userland spin, and unifies both wake reasons
-                // (new submission, and completion becoming ready) onto the one fd/one wait call instead of
-                // needing a separate bounded poll interval for each. Assigned at most once, by this ring's
-                // own dedicated issuer thread, before that thread signals readiness.
-                public int WakeEventFd = -1;
+                // Issuer-owned state. Never block for completions without an armed wake read.
+                public bool WakeReadArmed;
+                public bool WakeReadBufferExhausted;
 
                 // Coalescing flag for TrySubmit's wake-up signal on this ring: 0 means no thread has
                 // signaled this ring's issuer since its last reset, 1 means one already has (so no
-                // further EventFdWrite syscall is needed until the issuer resets it again). Turns any
+                // further pipe write is needed until the issuer resets it again). Turns any
                 // number of concurrent TrySubmit calls (assigned to this ring) between two issuer wake
-                // cycles into at most one EventFdWrite syscall, without risking a missed wake-up - see
+                // cycles into at most one pipe write, without risking a missed wake-up - see
                 // TrySubmit and IssuerLoop for the reset-then-recheck protocol that makes this safe.
                 public int WakeSignaled;
 
@@ -238,8 +217,7 @@ namespace System.Threading
                 public readonly ConcurrentQueue<int> FreeOperationSlots = new();
 
                 // This ring's provided-buffer group zero (see SystemNative_IoRingRegisterBufferRing),
-                // used by IoRingOp_RecvMultishot; null until registered by the static constructor's
-                // handshake, alongside RingHandle/WakeEventFd.
+                // shared by multishot receives and the wake read; null until registered during startup.
                 public ReceiveBufferPool? ReceiveBuffers;
 
                 public Ring(int index)
@@ -289,7 +267,7 @@ namespace System.Threading
                     // (including merely calling one of the type's other static methods, such as
                     // IssuerLoop) blocks until the constructor completes. The new thread is instead only
                     // ever given a reference to its own (non-static) Ring instance - assigning that
-                    // object's own instance fields (RingHandle, WakeEventFd) from the new thread is safe,
+                    // object's own instance fields from the new thread is safe,
                     // since those are not static members of IoUringThreadPool. Only this thread - which is
                     // allowed to, since it is the one actually running the static constructor - assigns
                     // s_isEnabled/s_rings themselves, once every ring's handshake completes.
@@ -309,18 +287,7 @@ namespace System.Threading
 
                         if (created)
                         {
-                            ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
-                            created = ring.WakeEventFd >= 0;
-                        }
-
-                        if (created)
-                        {
-                            // Registers this ring's provided-buffer group zero for RecvMultishot. Per
-                            // the mandatory HAVE_LINUX_IO_URING_H check (see configure.cmake), a kernel
-                            // that supports io_uring at all also supports this - so a failure here is
-                            // treated exactly like a failure to create the ring or register its eventfd:
-                            // this ring (and, transitively, the whole io_uring integration - see
-                            // s_isEnabled below) is abandoned in favor of the non-io_uring fallback path.
+                            // Group zero is shared by socket receives and the issuer wake pipe.
                             unsafe
                             {
                                 byte* bufferStorage = null;
@@ -332,6 +299,18 @@ namespace System.Threading
                                     ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, bufferStorage);
                                 }
                             }
+                        }
+
+                        if (created)
+                        {
+                            created = Interop.Sys.IoRingInitializeWakePipe(ring.RingHandle) == 0;
+                            ring.WakeReadArmed = created;
+                        }
+
+                        if (!created && ring.RingHandle != IntPtr.Zero)
+                        {
+                            Interop.Sys.IoRingClose(ring.RingHandle);
+                            ring.RingHandle = IntPtr.Zero;
                         }
 
                         readyToRun.Set();
@@ -517,7 +496,7 @@ namespace System.Threading
                     throw;
                 }
 
-                // Only the thread that wins the 0->1 transition actually writes to the eventfd; every
+                // Only the thread that wins the 0->1 transition actually writes to the pipe; every
                 // other concurrent caller (assigned to this same ring) can rely on that single write to
                 // wake the issuer, since the issuer only resets this flag back to 0 immediately before it
                 // is about to re-check the queue/wait (see IssuerLoop) - so any enqueue that raced with a
@@ -525,7 +504,10 @@ namespace System.Threading
                 // the issuer's own post-reset recheck of the queue.
                 if (Interlocked.Exchange(ref ring.WakeSignaled, 1) == 0)
                 {
-                    Interop.Sys.EventFdWrite(ring.WakeEventFd);
+                    if (Interop.Sys.IoRingWake(ring.RingHandle) != 0)
+                    {
+                        Environment.FailFast($"io_uring pipe wake failed: {Marshal.GetLastPInvokeError()}.");
+                    }
                 }
 
                 return true;
@@ -534,15 +516,11 @@ namespace System.Threading
             /// <summary>
             /// Body of a single dedicated issuer thread, once <paramref name="ring"/> has already been
             /// created (by this same thread - see the static constructor) and its
-            /// <see cref="Ring.RingHandle"/>/<see cref="Ring.WakeEventFd"/> have been published by it.
+            /// <see cref="Ring.RingHandle"/> and wake read have been initialized by it.
             /// Every iteration submits whatever is currently queued in
             /// <see cref="Ring.PendingSubmissions"/>, then drains and dispatches whatever completions are
-            /// already available. If nothing at all is in flight and the queue is empty, parks
-            /// indefinitely on <see cref="Ring.WakeEventFd"/> until <see cref="TrySubmit"/> writes to it.
-            /// If something is in flight but nothing was immediately ready, waits on that same fd with a
-            /// defensive bounded timeout (<see cref="InFlightWaitTimeoutMs"/>) instead of an indefinite
-            /// one, purely as a safety net - see <see cref="InFlightWaitTimeoutMs"/>'s doc comment for why
-            /// the expected/common case does not actually rely on this bound elapsing.
+            /// already available, then blocks directly for a CQE. Producers wake that wait by writing
+            /// the pipe; its read completion is handled on the issuer, never dispatched to workers.
             /// </summary>
             private static void IssuerLoop(Ring ring)
             {
@@ -553,17 +531,41 @@ namespace System.Threading
                 var sequenceBatch = new long[MaxCompletionsPerWait];
                 var workItemBatch = new IThreadPoolWorkItem[MaxCompletionsPerWait];
                 var bufferReturnBatch = new ushort[MaxCompletionsPerWait];
+                bool waitForCompletions = false;
 
                 while (true)
                 {
                     DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch, workItemBatch);
-                    bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
+                    bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch, waitForCompletions);
+                    waitForCompletions = false;
 
                     // Opportunistic only: a ReceiveBufferLease.Dispose() on any other thread never wakes
                     // this issuer just to return one buffer - return bits remain set until this thread
                     // is next awake anyway (e.g. for a completion or submission),
                     // at which point republishing them costs no syscall (see IoRingReturnBuffers).
                     ring.ReceiveBuffers!.DrainReturns(bufferReturnBatch);
+
+                    if (!ring.WakeReadArmed)
+                    {
+                        // The shared pool may be entirely held by application callbacks. Keep pumping
+                        // submissions/returns instead of blocking forever or spinning on ENOBUFS.
+                        if (ring.WakeReadBufferExhausted)
+                        {
+                            Thread.Sleep(SubmissionRetryDelayMs);
+                            ring.WakeReadBufferExhausted = false;
+                        }
+                        if (Interop.Sys.IoRingArmWakeRead(ring.RingHandle) == 0)
+                        {
+                            ring.WakeReadArmed = true;
+                        }
+                        else if (new Interop.ErrorInfo(Marshal.GetLastPInvokeError()).Error != Interop.Error.EAGAIN)
+                        {
+                            Environment.FailFast($"io_uring wake read rearm failed: {Marshal.GetLastPInvokeError()}.");
+                        }
+
+                        // Submit the replacement and process immediate errors before attempting to park.
+                        continue;
+                    }
 
                     if (moreCompletions || !ring.PendingSubmissions.IsEmpty)
                     {
@@ -576,7 +578,7 @@ namespace System.Threading
                     // waiting, so that any TrySubmit call for this ring from here on is guaranteed to win
                     // the 0->1 transition and signal us. Then re-check the queue: a TrySubmit call could
                     // have raced with this very reset (observed the flag as still 1 from a *previous*
-                    // cycle, so skipped its own EventFdWrite, right before we set it back to 0) - the
+                    // cycle, so skipped its own pipe write, right before we set it back to 0) - the
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
                     Interlocked.Exchange(ref ring.WakeSignaled, 0);
@@ -585,11 +587,7 @@ namespace System.Threading
                         continue;
                     }
 
-                    int timeoutMs = ring.InFlightCount > 0 ? InFlightWaitTimeoutMs : -1;
-                    if (Interop.Sys.EventFdWait(ring.WakeEventFd, timeoutMs) < 0)
-                    {
-                        Environment.FailFast($"io_uring eventfd wait failed: {Marshal.GetLastPInvokeError()}.");
-                    }
+                    waitForCompletions = true;
                 }
             }
 
@@ -655,10 +653,10 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// Drains a bounded number of completions without waiting. Returns true when the budget
-            /// was exhausted, so the issuer alternates with submissions rather than parking.
+            /// Drains a bounded number of completions, optionally waiting for the first batch.
+            /// Returns true when the issuer should retry rather than park.
             /// </summary>
-            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
+            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch, bool wait = false)
             {
                 int processed = 0;
                 while (processed < MaxCompletionsPerTurn)
@@ -666,14 +664,15 @@ namespace System.Threading
                     int completedCount;
                     fixed (Interop.Sys.IoRingCompletion* completionsPtr = completionsBatch)
                     {
-                        int result = Interop.Sys.IoRingWaitForCompletions(ring.RingHandle, completionsPtr, completionsBatch.Length, minComplete: 0, out completedCount);
+                        int result = Interop.Sys.IoRingWaitForCompletions(ring.RingHandle, completionsPtr, completionsBatch.Length, minComplete: wait ? 1 : 0, out completedCount);
+                        wait = false;
                         if (result != 0)
                         {
                             int error = Marshal.GetLastPInvokeError();
                             if (new Interop.ErrorInfo(error).Error == Interop.Error.EAGAIN)
                             {
                                 // Published SQEs still own their buffers. Retry without parking on
-                                // eventfd: allocation failure need not generate a completion or wake.
+                                // a CQE: allocation failure need not generate a completion or wake.
                                 Thread.Sleep(SubmissionRetryDelayMs);
                                 return true;
                             }
@@ -700,6 +699,36 @@ namespace System.Threading
                     {
                         ref readonly Interop.Sys.IoRingCompletion completion = ref completions[i];
                         bool isFinal = (completion.Flags & Interop.Sys.IoRingCompletion.More) == 0;
+                        if (completion.UserData == WakeUserData)
+                        {
+                            if ((completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
+                            {
+                                ushort bufferId = (ushort)(completion.Flags >> Interop.Sys.IoRingCompletion.BufferShift);
+                                if (Interop.Sys.IoRingReturnBuffers(ring.RingHandle, &bufferId, 1) != 0)
+                                {
+                                    Environment.FailFast($"io_uring wake buffer return failed: {Marshal.GetLastPInvokeError()}.");
+                                }
+                            }
+
+                            if (isFinal)
+                            {
+                                ring.WakeReadArmed = false;
+                            }
+                            if (completion.Result <= 0)
+                            {
+                                if (isFinal && completion.Result < 0 &&
+                                    new Interop.ErrorInfo(-completion.Result).Error == Interop.Error.ENOBUFS)
+                                {
+                                    ring.WakeReadBufferExhausted = true;
+                                }
+                                else
+                                {
+                                    Environment.FailFast($"io_uring wake read failed: {completion.Result}.");
+                                }
+                            }
+                            continue;
+                        }
+
                         if (isFinal)
                         {
                             finalCompletions++;
