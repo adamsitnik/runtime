@@ -927,6 +927,7 @@ typedef enum
                                   // (see SystemNative_IoRingRegisterBufferRing); keeps producing completions,
                                   // each selecting one buffer, until cancelled, EOF, or an error occurs; every
                                   // completion but the last one carries IORING_CQE_F_MORE in its Flags
+    IoRingOp_SendMsg = 10,       // gather socket send; Buffer points to an owned native msghdr
 } IoRingOp;
 
 /**
@@ -943,7 +944,7 @@ typedef struct
     intptr_t Fd;
     int64_t Offset;      // file offset for positional ops; -1 for non-positional ops; for
                           // IoRingOp_Cancel, the target request's UserData instead
-    uint8_t* Buffer;     // used by IoRingOp_Read / IoRingOp_Write / IoRingOp_Recv / IoRingOp_Send
+    uint8_t* Buffer;     // used by Read / Write / Recv / Send; native msghdr for SendMsg
     int32_t BufferLength;
     IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
     int32_t VectorCount;
@@ -971,6 +972,14 @@ typedef struct
  * Returns 1 if io_uring is available, 0 if not.
  */
 PALEXPORT int32_t SystemNative_IoRingIsAvailable(void);
+
+/**
+ * Allocates a native msghdr referencing the supplied vectors. The caller must keep the
+ * header, vectors and their buffers alive until the send completes, then free the header
+ * with SystemNative_Free. Stream sends are limited to IOV_MAX vectors, like SendMessage.
+ * Returns NULL on allocation failure or when io_uring is not compiled in.
+ */
+PALEXPORT uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVector* vectors, int32_t vectorCount);
 
 /**
  * Creates a new io_uring instance with the requested submission/completion queue depths.

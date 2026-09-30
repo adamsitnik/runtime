@@ -16,6 +16,213 @@ namespace System.Net.Sockets.Tests
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SendVector
+        {
+            public IntPtr Base;
+            public UIntPtr Count;
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(2)]
+        [InlineData(1200)]
+        public void GatherSend_WaitAll_CompletesOnceAtNativeVectorLimit(int vectorCount)
+        {
+            RemoteExecutor.Invoke(async countText =>
+            {
+                int count = int.Parse(countText);
+                int bufferSize = count == 2 ? 1024 * 1024 : 2048;
+                byte[] data = new byte[count * bufferSize];
+                new Random(42).NextBytes(data);
+                SendVector[] vectors = new SendVector[count];
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    sender.SendBufferSize = 4096;
+                    GCHandle dataPin = GCHandle.Alloc(data, GCHandleType.Pinned);
+                    GCHandle vectorsPin = default;
+                    try
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            vectors[i].Base = dataPin.AddrOfPinnedObject() + i * bufferSize;
+                            vectors[i].Count = (UIntPtr)bufferSize;
+                        }
+                        vectorsPin = GCHandle.Alloc(vectors, GCHandleType.Pinned);
+                        int callbacks = 0;
+                        TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        unsafe
+                        {
+                            Assert.True(IoUring.TrySubmitSendV(sender.SafeHandle, (void*)vectorsPin.AddrOfPinnedObject(), count, 0, result =>
+                            {
+                                Interlocked.Increment(ref callbacks);
+                                completion.TrySetResult(result);
+                            }));
+                        }
+
+                        int expected = Math.Min(count, 1024) * bufferSize;
+                        byte[] received = new byte[expected];
+                        int offset = 0;
+                        while (offset < expected)
+                        {
+                            int read = await receiver.ReceiveAsync(received.AsMemory(offset), SocketFlags.None)
+                                .AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                            Assert.NotEqual(0, read);
+                            offset += read;
+                        }
+                        Assert.Equal(expected, await completion.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(1, Volatile.Read(ref callbacks));
+                        AssertExtensions.SequenceEqual(data.AsSpan(0, expected), received.AsSpan());
+                    }
+                    finally
+                    {
+                        // Drain kernel ownership before unpinning, including on assertion failures.
+                        sender.Dispose();
+                        if (vectorsPin.IsAllocated)
+                        {
+                            vectorsPin.Free();
+                        }
+                        dataPin.Free();
+                    }
+                }
+            }, vectorCount.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false, false, 5)]
+        [InlineData(false, true, 5)]
+        [InlineData(true, false, 5)]
+        [InlineData(true, true, 5)]
+        [InlineData(false, false, 1200)]
+        [InlineData(true, false, 1200)]
+        public void BufferListSend_Backpressure_PreservesOffsetsAndPins(bool useEventArgs, bool useIPv6, int vectorCount)
+        {
+            RemoteExecutor.Invoke(async (eventArgsText, ipv6Text, vectorCountText) =>
+            {
+                bool eventArgs = bool.Parse(eventArgsText);
+                IPAddress address = bool.Parse(ipv6Text) ? IPAddress.IPv6Loopback : IPAddress.Loopback;
+                using Socket listener = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(address, 0));
+                listener.Listen(1);
+                using Socket sender = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                sender.SendBufferSize = 4096;
+                sender.Connect(listener.LocalEndPoint!);
+                using Socket receiver = listener.Accept();
+                receiver.ReceiveBufferSize = 65536;
+                using SocketAsyncEventArgs args = new SocketAsyncEventArgs();
+                TaskCompletionSource<int>? completion = null;
+                args.Completed += (_, completed) =>
+                {
+                    Assert.Equal(SocketError.Success, completed.SocketError);
+                    completion!.SetResult(completed.BytesTransferred);
+                };
+
+                for (int iteration = 0; iteration < 3; iteration++)
+                {
+                    byte[] first = new byte[1024 * 1024 + 13];
+                    byte[] second = new byte[1024 * 1024 + 17];
+                    new Random(42 + iteration).NextBytes(first);
+                    new Random(100 + iteration).NextBytes(second);
+                    List<ArraySegment<byte>> buffers = new List<ArraySegment<byte>>
+                    {
+                        new ArraySegment<byte>(first, 0, 0),
+                        new ArraySegment<byte>(first, 3, first.Length - 13),
+                        new ArraySegment<byte>(second, 2, 0),
+                        new ArraySegment<byte>(second, 7, second.Length - 17),
+                        new ArraySegment<byte>(first, first.Length, 0),
+                    };
+                    while (buffers.Count < int.Parse(vectorCountText))
+                    {
+                        buffers.Add(new ArraySegment<byte>(first, buffers.Count, 2048));
+                    }
+                    int length = 0;
+                    foreach (ArraySegment<byte> segment in buffers)
+                    {
+                        length += segment.Count;
+                    }
+                    Task<int> pending;
+                    if (eventArgs)
+                    {
+                        completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        args.BufferList = buffers;
+                        Assert.True(sender.SendAsync(args));
+                        pending = completion.Task;
+                    }
+                    else
+                    {
+                        pending = sender.SendAsync(buffers, SocketFlags.None);
+                    }
+                    Assert.False(pending.IsCompleted);
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+
+                    byte[] received = new byte[length];
+                    Task receiveTask = ReceiveAll();
+                    Assert.Equal(length, await pending.WaitAsync(TestSettings.PassingTestTimeout));
+                    await receiveTask.WaitAsync(TestSettings.PassingTestTimeout);
+                    int offset = 0;
+                    foreach (ArraySegment<byte> segment in buffers)
+                    {
+                        AssertExtensions.SequenceEqual(segment.AsSpan(), received.AsSpan(offset, segment.Count));
+                        offset += segment.Count;
+                    }
+
+                    async Task ReceiveAll()
+                    {
+                        int receivedCount = 0;
+                        while (receivedCount < received.Length)
+                        {
+                            int read = await receiver.ReceiveAsync(received.AsMemory(receivedCount), SocketFlags.None);
+                            Assert.NotEqual(0, read);
+                            receivedCount += read;
+                        }
+                    }
+                }
+            }, useEventArgs.ToString(), useIPv6.ToString(), vectorCount.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void BufferListSend_Backpressure_CloseCompletes(bool closeSender)
+        {
+            RemoteExecutor.Invoke(async closeText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (SocketAsyncEventArgs args = new SocketAsyncEventArgs())
+                {
+                    sender.SendBufferSize = 4096;
+                    byte[] buffer = new byte[2 * 1024 * 1024];
+                    args.BufferList = new List<ArraySegment<byte>>
+                    {
+                        new ArraySegment<byte>(buffer, 0, buffer.Length / 2),
+                        new ArraySegment<byte>(buffer, buffer.Length / 2, buffer.Length / 2),
+                    };
+                    TaskCompletionSource completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    args.Completed += (_, _) => completion.SetResult();
+                    Assert.True(sender.SendAsync(args));
+                    Assert.False(completion.Task.IsCompleted);
+                    if (bool.Parse(closeText))
+                    {
+                        sender.Dispose();
+                    }
+                    else
+                    {
+                        receiver.LingerState = new LingerOption(true, 0);
+                        receiver.Dispose();
+                    }
+                    await completion.Task.WaitAsync(TestSettings.PassingTestTimeout);
+                    Assert.InRange(args.BytesTransferred, 0, buffer.Length - 1);
+                    if (args.SocketError == SocketError.Success)
+                    {
+                        Assert.NotEqual(0, args.BytesTransferred);
+                    }
+                }
+            }, closeSender.ToString(), CreateOptions(1)).Dispose();
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(null, 512)]
         [InlineData("128", 128)]

@@ -95,6 +95,7 @@ namespace System.Threading
         public static bool IsSupported { get { throw null; } }
         public static unsafe bool TrySubmitRecv(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitSend(System.Runtime.InteropServices.SafeHandle handle, byte* buffer, int length, int flags, System.Action<int> onCompleted) { throw null; }
+        public static unsafe bool TrySubmitSendV(System.Runtime.InteropServices.SafeHandle handle, void* vectors, int vectorCount, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitAccept(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, int flags, System.Action<int> onCompleted) { throw null; }
         public static unsafe bool TrySubmitConnect(System.Runtime.InteropServices.SafeHandle handle, byte* sockAddr, int* sockAddrLen, System.Action<int> onCompleted) { throw null; }
         public static bool TrySubmitRecvMultishot(System.Runtime.InteropServices.SafeHandle handle, System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted, out System.Threading.IIoUringOperation? operation) { throw null; }

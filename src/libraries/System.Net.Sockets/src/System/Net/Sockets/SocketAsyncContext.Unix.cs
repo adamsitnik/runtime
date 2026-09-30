@@ -2170,10 +2170,17 @@ namespace System.Net.Sockets
             int offset = 0;
             SocketError errorCode;
             int observedSequenceNumber;
-            if (_sendQueue.IsReady(this, out observedSequenceNumber) &&
+            bool ready = _sendQueue.IsReady(this, out observedSequenceNumber);
+            if (ready &&
                 SocketPal.TryCompleteSendTo(_socket, buffers, ref bufferIndex, ref offset, flags, socketAddress.Span, ref bytesSent, out errorCode))
             {
                 return errorCode;
+            }
+
+            if (ready && socketAddress.IsEmpty &&
+                TrySendViaIoUring(buffers, bufferIndex, offset, flags, bytesSent, callback))
+            {
+                return SocketError.IOPending;
             }
 
             BufferListSendOperation operation = RentBufferListSendOperation();

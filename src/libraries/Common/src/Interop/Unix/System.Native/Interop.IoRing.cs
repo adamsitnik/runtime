@@ -21,6 +21,7 @@ internal static partial class Interop
             Send = 7,
             Cancel = 8,
             RecvMultishot = 9,
+            SendMsg = 10,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -32,7 +33,7 @@ internal static partial class Interop
             public IoRingOp OpCode;
             public IntPtr Fd;
             public long Offset; // -1 for non-positional ops
-            public byte* Buffer; // used by Read/Write/Recv/Send
+            public byte* Buffer; // used by Read/Write/Recv/Send; native msghdr for SendMsg
             public int BufferLength;
             public IOVector* Vectors; // used by ReadV/WriteV
             public int VectorCount;
@@ -62,6 +63,9 @@ internal static partial class Interop
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsAvailable")]
         internal static partial int IoRingIsAvailable();
+
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreateSendMessage")]
+        internal static unsafe partial byte* IoRingCreateSendMessage(IntPtr socket, IOVector* vectors, int vectorCount);
 
         // Pass singleIssuer: 1 to request IORING_SETUP_SINGLE_ISSUER + IORING_SETUP_DEFER_TASKRUN: every
         // subsequent IoRingSubmit/IoRingKick/IoRingWaitForCompletions call for the returned ring must then

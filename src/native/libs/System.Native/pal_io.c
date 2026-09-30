@@ -2362,6 +2362,17 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
 #endif
             break;
+        case IoRingOp_SendMsg:
+            sqe->opcode = IORING_OP_SENDMSG;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = 1;
+            // io_uring retries partial stream sends internally with MSG_WAITALL.
+            // An error can still produce a final short completion.
+            sqe->msg_flags = (uint32_t)request->Flags | MSG_WAITALL | MSG_NOSIGNAL;
+#if defined(IORING_RECVSEND_POLL_FIRST)
+            sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
+#endif
+            break;
         case IoRingOp_Cancel:
             // Targets a still-pending request by its own user_data (addr), looked up within this
             // same ring - the target request must have been submitted to the very ring this
@@ -2383,6 +2394,33 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 }
 
 #endif // HAVE_LINUX_IO_URING_H
+
+uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVector* vectors, int32_t vectorCount)
+{
+#if HAVE_LINUX_IO_URING_H
+    assert(vectors != NULL && vectorCount > 0);
+    struct msghdr* message = (struct msghdr*)calloc(1, sizeof(struct msghdr));
+    if (message != NULL)
+    {
+        // Match SendMessage: never split a datagram, but allow a short stream send.
+        if (vectorCount > IOV_MAX)
+        {
+            int type;
+            socklen_t length = sizeof(type);
+            if (getsockopt((int)socket, SOL_SOCKET, SO_TYPE, &type, &length) == 0 && type == SOCK_STREAM)
+            {
+                vectorCount = IOV_MAX;
+            }
+        }
+        message->msg_iov = (struct iovec*)vectors;
+        message->msg_iovlen = (__typeof__(message->msg_iovlen))vectorCount;
+    }
+    return (uint8_t*)message;
+#else
+    (void)socket, (void)vectors, (void)vectorCount;
+    return NULL;
+#endif
+}
 
 int32_t SystemNative_IoRingIsAvailable(void)
 {
