@@ -209,9 +209,9 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(IsLinuxPlatform)' == 'true'">
-    <Compile Include="System\Net\Sockets\SafeSocketHandle.IoUring.Linux.cs" />
+    <Compile Include="System\Net\Sockets\SafeSocketHandle.Linux.cs" />
     <Compile Include="System\Net\Sockets\Socket.Multishot.Linux.cs" />
-    <Compile Include="System\Net\Sockets\SocketAsyncContext.IoUring.Linux.cs" />
+    <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(IsLinuxPlatform)' != 'true' and '$(TargetPlatformIdentifier)' != '' and '$(TargetPlatformIdentifier)' != 'browser'">

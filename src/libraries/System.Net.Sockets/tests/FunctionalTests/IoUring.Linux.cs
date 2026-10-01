@@ -403,10 +403,223 @@ namespace System.Net.Sockets.Tests
             return (new WeakReference(handle), new WeakReference(binding));
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void Bind_DistinctWrappersShareBindingAndCancellation(bool bindBorrowedFirst)
+        {
+            RemoteExecutor.Invoke(async borrowedText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (Microsoft.Win32.SafeHandles.SafeFileHandle borrowed = new(receiver.SafeHandle.DangerousGetHandle(), ownsHandle: false))
+                {
+                    bool borrowedFirst = bool.Parse(borrowedText);
+                    using IoRingBoundHandle first = IoUring.Bind(borrowedFirst ? borrowed : receiver.SafeHandle);
+                    using IoRingBoundHandle second = IoUring.Bind(borrowedFirst ? receiver.SafeHandle : borrowed);
+                    Assert.Same(first, second);
+                    IoRingBoundHandle[] simultaneous = await Task.WhenAll(
+                        Task.Run(() => IoUring.Bind(borrowed)),
+                        Task.Run(() => IoUring.Bind(receiver.SafeHandle)));
+                    Assert.All(simultaneous, binding => Assert.Same(first, binding));
+
+                    BoundReceiveOperation read = new();
+                    read.Prepare();
+                    first.EnqueueForSubmission(read);
+                    second.DisposeAndWait();
+                    Assert.Equal(-125, await read.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Throws<ObjectDisposedException>(() => first.EnqueueForSubmission(read));
+                    Assert.False(receiver.SafeHandle.IsClosed);
+                    Assert.Equal(1, sender.Send(new byte[] { 17 }));
+                    Assert.Equal(1, receiver.Receive(new byte[1]));
+
+                    using IoRingBoundHandle rebound = IoUring.Bind(receiver.SafeHandle);
+                    Assert.NotSame(first, rebound);
+                    Assert.Same(rebound, IoUring.Bind(borrowed));
+                }
+            }, bindBorrowedFirst.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_AliasReferencesAreBalancedAndReleasedOutsideRegistryLock()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                using Socket socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                ReleaseCounter firstCounter = new();
+                ReleaseCounter secondCounter = new();
+                using CountingHandle first = new(socket.Handle, firstCounter);
+                using CountingHandle second = new(socket.Handle, secondCounter);
+                using IoRingBoundHandle binding = IoUring.Bind(first);
+                using IoRingBoundHandle aliasBinding = IoUring.Bind(second);
+                Assert.Same(binding, aliasBinding);
+                for (int i = 0; i < 20; i++)
+                {
+                    Assert.Same(binding, IoUring.Bind(second));
+                }
+
+                // These wrappers deliberately leave binding disposal to the explicit owner below.
+                first.Dispose();
+                second.Dispose();
+                Assert.Equal(0, firstCounter.Count);
+                Assert.Equal(0, secondCounter.Count);
+                firstCounter.OnRelease = () =>
+                {
+                    binding.DisposeAndWait();
+                    Task.Run(() =>
+                    {
+                        using IoRingBoundHandle replacement = IoUring.Bind(socket.SafeHandle);
+                        Assert.NotSame(binding, replacement);
+                    }).WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
+                };
+                await Task.Run(() => binding.DisposeAndWait()).WaitAsync(TestSettings.PassingTestTimeout);
+                Assert.Equal(1, firstCounter.Count);
+                Assert.Equal(1, secondCounter.Count);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Receive_PinThrows_ReleasesQueueReservation()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (TrackingMemoryManager memory = new())
+                {
+                    memory.ThrowOnPin = true;
+                    await Assert.ThrowsAsync<InvalidOperationException>(
+                        () => receiver.ReceiveAsync(memory.Memory, SocketFlags.None).AsTask());
+                    memory.ThrowOnPin = false;
+                    Task<int> pending = receiver.ReceiveAsync(memory.Memory, SocketFlags.None).AsTask();
+                    Assert.False(pending.IsCompleted);
+                    Assert.Equal(1, sender.Send(new byte[] { 23 }));
+                    Assert.Equal(1, await pending.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(23, memory.GetSpan()[0]);
+                    Assert.Equal(1, memory.PinCount);
+                    Assert.Equal(1, memory.UnpinCount);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_DescriptorReplacedDuringRelease_PreservesNewBinding()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                (Socket sender, Socket source) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (source)
+                using (Socket original = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+                {
+                    IntPtr descriptor = original.Handle;
+                    ReleaseCounter counter = new();
+                    using CountingHandle owner = new(descriptor, counter);
+                    using IoRingBoundHandle oldBinding = IoUring.Bind(owner);
+                    using Microsoft.Win32.SafeHandles.SafeFileHandle alias = new(descriptor, ownsHandle: false);
+                    Assert.Same(oldBinding, IoUring.Bind(alias));
+                    Socket? replacement = null;
+                    IoRingBoundHandle? newBinding = null;
+                    counter.OnRelease = () =>
+                    {
+                        // dup2 atomically closes the old descriptor and installs a different socket
+                        // at that number, without a free-fd window for an unrelated allocation.
+                        Assert.Equal(descriptor.ToInt32(), DuplicateDescriptor(source.Handle.ToInt32(), descriptor.ToInt32()));
+                        original.SafeHandle.SetHandleAsInvalid();
+                        replacement = new Socket(new SafeSocketHandle(descriptor, ownsHandle: true));
+                        newBinding = IoUring.Bind(replacement.SafeHandle);
+                        Assert.NotSame(oldBinding, newBinding);
+                    };
+                    owner.Dispose();
+                    try
+                    {
+                        oldBinding.DisposeAndWait();
+                        Assert.NotNull(replacement);
+                        Assert.Same(newBinding, IoUring.Bind(replacement.SafeHandle));
+                        Assert.Equal(1, sender.Send(new byte[] { 31 }));
+                        byte[] buffer = new byte[1];
+                        Assert.Equal(1, replacement.Receive(buffer));
+                        Assert.Equal(31, buffer[0]);
+                        Assert.Equal(1, counter.Count);
+                    }
+                    finally
+                    {
+                        newBinding?.DisposeAndWait();
+                        replacement?.Dispose();
+                    }
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [DllImport("libc", EntryPoint = "dup2", SetLastError = true)]
+        private static extern int DuplicateDescriptor(int source, int destination);
+
         private sealed class ReleaseCounter
         {
             public int Count;
             public Action? OnRelease;
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_FinalizerPendingBinding_RemainsCanonical()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                using Socket socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                using ManualResetEventSlim entered = new();
+                using ManualResetEventSlim release = new();
+                BlockFinalizer(entered, release);
+                ReleaseCounter counter = new();
+                try
+                {
+                    GC.Collect();
+                    Assert.True(entered.Wait(TestSettings.PassingTestTimeout));
+                    WeakReference<IoRingBoundHandle> weak = CreateFinalizableBinding(socket.Handle, counter);
+                    GC.Collect();
+                    Assert.True(weak.TryGetTarget(out IoRingBoundHandle? original));
+                    using Microsoft.Win32.SafeHandles.SafeFileHandle alias = new(socket.Handle, ownsHandle: false);
+                    using IoRingBoundHandle binding = IoUring.Bind(alias);
+                    Assert.Same(original, binding);
+                    binding.DisposeAndWait();
+                }
+                finally
+                {
+                    release.Set();
+                    GC.WaitForPendingFinalizers();
+                }
+                Assert.Equal(1, counter.Count);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static WeakReference<IoRingBoundHandle> CreateFinalizableBinding(IntPtr descriptor, ReleaseCounter counter)
+        {
+            CountingHandle handle = new(descriptor, counter);
+            return new WeakReference<IoRingBoundHandle>(handle.Binding, trackResurrection: true);
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        private static void BlockFinalizer(ManualResetEventSlim entered, ManualResetEventSlim release) =>
+            _ = new FinalizerGate(entered, release);
+
+        private sealed class FinalizerGate
+        {
+            private readonly ManualResetEventSlim _entered;
+            private readonly ManualResetEventSlim _release;
+
+            public FinalizerGate(ManualResetEventSlim entered, ManualResetEventSlim release)
+            {
+                _entered = entered;
+                _release = release;
+            }
+
+            ~FinalizerGate()
+            {
+                _entered.Set();
+                _release.Wait();
+            }
         }
 
         private sealed class CountingHandle : SafeHandle
@@ -2390,11 +2603,16 @@ namespace System.Net.Sockets.Tests
             public int UnpinCount;
             public int DisposeCount;
             public Action? OnUnpin;
+            public bool ThrowOnPin;
 
             public override Span<byte> GetSpan() => _buffer;
 
             public override unsafe MemoryHandle Pin(int elementIndex = 0)
             {
+                if (ThrowOnPin)
+                {
+                    throw new InvalidOperationException("Pin failed.");
+                }
                 Assert.Equal(0, elementIndex);
                 GCHandle handle = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
                 Interlocked.Increment(ref PinCount);

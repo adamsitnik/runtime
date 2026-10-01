@@ -18,16 +18,16 @@ public sealed partial class SafeFileHandle
             IoRingBoundHandle? binding = Volatile.Read(ref _ioUringBinding);
             if (binding is null)
             {
-                // Prevent first-time binding after disposal, even if another reference keeps IsClosed false.
-                ObjectDisposedException.ThrowIf(Volatile.Read(ref _ioUringDisposed), this);
-                binding = IoUring.Bind(this);
-                binding = Interlocked.CompareExchange(ref _ioUringBinding, binding, null) ?? binding;
-
-                // Disposal may have observed no binding before this publication.
-                if (Volatile.Read(ref _ioUringDisposed))
+                lock (this)
                 {
-                    binding.DisposeAndWait();
-                    throw new ObjectDisposedException(nameof(SafeFileHandle));
+                    // Dispose uses the same lock so it cannot miss a first-time binding.
+                    ObjectDisposedException.ThrowIf(_ioUringDisposed, this);
+                    binding = _ioUringBinding;
+                    if (binding is null)
+                    {
+                        binding = IoUring.Bind(this);
+                        Volatile.Write(ref _ioUringBinding, binding);
+                    }
                 }
             }
 
@@ -38,9 +38,13 @@ public sealed partial class SafeFileHandle
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
-        // Fence the closing flag before checking for a concurrently published binding.
-        Interlocked.Exchange(ref _ioUringDisposed, true);
-        Volatile.Read(ref _ioUringBinding)?.Dispose();
+        IoRingBoundHandle? binding;
+        lock (this)
+        {
+            _ioUringDisposed = true;
+            binding = _ioUringBinding;
+        }
+        binding?.Dispose();
         base.Dispose(disposing);
     }
 }

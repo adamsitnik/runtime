@@ -26,12 +26,15 @@ namespace System.Threading
 
         /// <summary>Gets the canonical binding of a handle to one io_uring issuer.</summary>
         /// <param name="handle">The handle to bind without transferring its ownership.</param>
-        /// <returns>The shared binding for this handle.</returns>
+        /// <returns>The shared binding for this file descriptor.</returns>
         /// <remarks>
         /// The handle owner must retain the binding, submit operations through
         /// <see cref="IoRingBoundHandle.EnqueueForSubmission"/>, and dispose the binding before disposing the handle.
         /// Disposing the handle alone does not cancel operations or release the binding's handle reference.
         /// Binding disposal requests cancellation but does not end the lifetime of outstanding operation buffers.
+        /// Different handle wrappers for the same file descriptor share admission and cancellation.
+        /// Each registered wrapper is retained until native requests drain. This does not transfer descriptor
+        /// ownership or make multiple owning wrappers safe from closing the same descriptor twice.
         /// </remarks>
         /// <exception cref="ArgumentNullException"><paramref name="handle"/> is null.</exception>
         /// <exception cref="ArgumentException"><paramref name="handle"/> is invalid.</exception>

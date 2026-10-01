@@ -761,7 +761,7 @@ namespace System.Net.Sockets
             Cancelled = 2
         }
 
-        private struct OperationQueue<TOperation>
+        private partial struct OperationQueue<TOperation>
             where TOperation : AsyncOperation
         {
             // Quick overview:
@@ -804,8 +804,12 @@ namespace System.Net.Sockets
                                             // "losing" the notification and causing the operation to pend indefinitely.
             private AsyncOperation? _tail;   // Queue of pending IO operations to process when data becomes available.
 #if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-            private bool _nativeOperationPending;
+            // A direct io_uring request occupies this direction without being linked into _tail.
+            // Reserve its queue position so later queued or synchronous operations cannot overtake it.
+            private bool _ioUringOperationPending;
+            // One-shot POLL_ADD wakes syscall-based adapters after EAGAIN, without using epoll.
             private IoUringPollOperation? _readinessOperation;
+            // Deliver poll failures to the queued operation instead of retrying as if it were ready.
             private SocketError _readinessError;
 #endif
 
@@ -818,89 +822,6 @@ namespace System.Net.Sockets
 
             public bool IsNextOperationSynchronous_Speculative => _isNextOperationSynchronous;
 
-#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-            public bool TryStartNativeOperation()
-            {
-                using (Lock())
-                {
-                    if (_state != QueueState.Ready)
-                    {
-                        return false;
-                    }
-
-                    Debug.Assert(_tail is null && !_nativeOperationPending);
-                    _nativeOperationPending = true;
-                    _state = QueueState.Processing;
-                    return true;
-                }
-            }
-
-            public void CompleteNativeOperation()
-            {
-                AsyncOperation? next = null;
-                using (Lock())
-                {
-                    Debug.Assert(_nativeOperationPending);
-                    _nativeOperationPending = false;
-                    if (_state != QueueState.Stopped)
-                    {
-                        Debug.Assert(_state == QueueState.Processing);
-                        if (_tail is null)
-                        {
-                            _state = QueueState.Ready;
-                            _sequenceNumber++;
-                        }
-                        else
-                        {
-                            next = _tail.Next;
-                        }
-                    }
-                }
-                next?.Dispatch();
-            }
-
-            private void EnsureIoUringReadiness()
-            {
-                if (!IoUring.IsSupported)
-                {
-                    return;
-                }
-
-                using (Lock())
-                {
-                    if (_state != QueueState.Waiting || _isNextOperationSynchronous)
-                    {
-                        return;
-                    }
-                }
-                _readinessOperation!.Start();
-            }
-
-            public bool IsWaitingSynchronously(TOperation operation)
-            {
-                using (Lock())
-                {
-                    return _state == QueueState.Waiting && _tail?.Next == operation;
-                }
-            }
-
-            public void HandleIoUringReadiness(SocketAsyncContext context, SocketError error)
-            {
-                using (Lock())
-                {
-                    if (_state == QueueState.Stopped)
-                    {
-                        return;
-                    }
-                    if (error != SocketError.Success)
-                    {
-                        _readinessError = error;
-                    }
-                }
-                context.HandleEvents(typeof(TOperation) == typeof(ReadOperation)
-                    ? Interop.Sys.SocketEvents.Read : Interop.Sys.SocketEvents.Write);
-            }
-#endif
 
             public void Init()
             {
@@ -962,6 +883,7 @@ namespace System.Net.Sockets
                 while (true)
                 {
                     bool doAbort = false;
+                    bool enqueued = false;
                     using (Lock())
                     {
                         switch (_state)
@@ -1007,7 +929,8 @@ namespace System.Net.Sockets
                                     operation.CancellationRegistration = cancellationToken.UnsafeRegister(s => ((TOperation)s!).TryCancel(), operation);
                                 }
 
-                                goto Enqueued;
+                                enqueued = true;
+                                break;
 
                             case QueueState.Stopped:
                                 Debug.Assert(_tail == null);
@@ -1018,6 +941,15 @@ namespace System.Net.Sockets
                                 Environment.FailFast("unexpected queue state");
                                 break;
                         }
+                    }
+
+                    if (enqueued)
+                    {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                        // Poll submission and failure notification must run outside the queue lock.
+                        EnsureIoUringReadiness();
+#endif
+                        return true;
                     }
 
                     if (doAbort)
@@ -1034,12 +966,6 @@ namespace System.Net.Sockets
                         return false;
                     }
                 }
-
-            Enqueued:
-#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-                EnsureIoUringReadiness();
-#endif
-                return true;
 
                 static void HandleFailedRegistration(SocketAsyncContext context, TOperation operation, Interop.Error error)
                 {
@@ -1099,7 +1025,7 @@ namespace System.Net.Sockets
 
                         case QueueState.Processing:
 #if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-                            Debug.Assert(_tail != null || _nativeOperationPending, "State == Processing but queue is empty!");
+                            Debug.Assert(_tail != null || _ioUringOperationPending, "State == Processing but queue is empty!");
 #else
                             Debug.Assert(_tail != null, "State == Processing but queue is empty!");
 #endif
@@ -1199,6 +1125,7 @@ namespace System.Net.Sockets
 
                     // Check for retry and reset queue state.
 
+                    bool waiting = false;
                     using (Lock())
                     {
                         if (_state == QueueState.Stopped)
@@ -1226,9 +1153,17 @@ namespace System.Net.Sockets
                             {
                                 _state = QueueState.Waiting;
                                 Trace(context, $"Exit (received EAGAIN)");
-                                goto Waiting;
+                                waiting = true;
                             }
                         }
+                    }
+                    if (waiting)
+                    {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                        // Poll submission and failure notification must run outside the queue lock.
+                        EnsureIoUringReadiness();
+#endif
+                        return OperationResult.Pending;
                     }
                 }
 
@@ -1270,11 +1205,6 @@ namespace System.Net.Sockets
                 Debug.Assert(result != OperationResult.Pending);
                 return result;
 
-            Waiting:
-#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-                EnsureIoUringReadiness();
-#endif
-                return OperationResult.Pending;
             }
 
             public void CancelAndContinueProcessing(TOperation op)
@@ -1313,7 +1243,7 @@ namespace System.Net.Sockets
 
                             // We're the first op in the queue.
 #if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-                            if (_state == QueueState.Processing && !_nativeOperationPending)
+                            if (_state == QueueState.Processing && !_ioUringOperationPending)
 #else
                             if (_state == QueueState.Processing)
 #endif
@@ -1384,7 +1314,7 @@ namespace System.Net.Sockets
 
                     _state = QueueState.Stopped;
 #if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
-                    aborted = _nativeOperationPending;
+                    aborted = _ioUringOperationPending;
 #endif
 
                     if (_tail != null)

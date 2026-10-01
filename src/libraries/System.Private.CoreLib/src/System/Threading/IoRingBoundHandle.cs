@@ -7,7 +7,8 @@ namespace System.Threading;
 /// <remarks>
 /// Disposing the binding stops admission and requests cancellation, but does not synchronously
 /// retire outstanding I/O or dispose the caller's handle. Native ownership remains protected
-/// until all accepted requests retire. Bind returns the same binding for a given SafeHandle instance.
+/// until all accepted requests retire. Wrappers of the same file descriptor share a binding
+/// until that binding is disposed and its native requests have drained.
 /// The owner must retain and dispose this binding when disposing its handle; disposing an
 /// arbitrary SafeHandle does not notify the binding.
 /// </remarks>

@@ -75,7 +75,7 @@ namespace System.Net.Sockets
             IoUringOperation? operation = null;
             Exception? callbackError = null;
             IoUringOperation receiveOperation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
-            _handle.IoUringBinding.EnqueueForSubmission(receiveOperation, CancellationToken.None);
+            _handle.IoUringBinding.EnqueueForSubmission(receiveOperation, cancellationToken);
 
             // Full fences on both publications prevent an early failing callback and
             // submission from each missing the other's cancellation state.
@@ -85,8 +85,6 @@ namespace System.Net.Sockets
                 receiveOperation.RequestCancellation();
             }
 
-            using CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
-                static state => ((IoUringOperation)state!).RequestCancellation(), receiveOperation);
             await completed.Task.ConfigureAwait(false);
 
             void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
@@ -168,7 +166,7 @@ namespace System.Net.Sockets
                     // instead of the raw (usually -ECANCELED) SocketException.
                     Exception? error = result >= 0
                         ? null
-                        : Volatile.Read(ref cancellationRequested)
+                        : Volatile.Read(ref cancellationRequested) || cancellationToken.IsCancellationRequested
                             ? new OperationCanceledException(cancellationToken)
                             : CreateMultishotReceiveException(result);
                     channel.Writer.TryComplete(error);
@@ -176,18 +174,7 @@ namespace System.Net.Sockets
             }
 
             IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
-            handle.IoUringBinding.EnqueueForSubmission(operation, CancellationToken.None);
-
-            // Skip allocating the callback delegate entirely when the token can never be canceled
-            // (e.g. CancellationToken.None) - UnsafeRegister would end up being a no-op internally,
-            // but the delegate passed to it is still allocated by the caller regardless.
-            using CancellationTokenRegistration registration = cancellationToken.CanBeCanceled
-                ? cancellationToken.UnsafeRegister(_ =>
-                {
-                    Volatile.Write(ref cancellationRequested, true);
-                    operation.RequestCancellation();
-                }, null)
-                : default;
+            handle.IoUringBinding.EnqueueForSubmission(operation, cancellationToken);
 
             try
             {
