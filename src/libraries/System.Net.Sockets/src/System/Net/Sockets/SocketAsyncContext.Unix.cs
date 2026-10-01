@@ -1596,6 +1596,7 @@ namespace System.Net.Sockets
                         try
                         {
                             // Validate disposal-requested state even while another I/O retains the handle.
+                            ObjectDisposedException.ThrowIf(_socket.IsIoUringDisposed, _socket);
                             _ = _socket.IoUringBinding;
                             pollError = Interop.Sys.Poll(_socket,
                                 typeof(TOperation) == typeof(ReadOperation) ? Interop.PollEvents.POLLIN : Interop.PollEvents.POLLOUT,

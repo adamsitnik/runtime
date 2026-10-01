@@ -2686,8 +2686,9 @@
     <Compile Include="$(CommonPath)Interop\Android\Interop.Libraries.cs" Condition="'$(TargetsAndroid)' == 'true'">
       <Link>Common\Interop\Android\Interop.Libraries.cs</Link>
     </Compile>
-    <Compile Include="$(MSBuildThisFileDirectory)Microsoft\Win32\SafeHandles\SafeFileHandle.IoUring.Linux.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'" />
+    <Compile Include="$(MSBuildThisFileDirectory)Microsoft\Win32\SafeHandles\SafeFileHandle.Linux.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)Microsoft\Win32\SafeHandles\SafeFileHandle.ThreadPoolValueTaskSource.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Microsoft\Win32\SafeHandles\SafeFileHandle.ThreadPoolValueTaskSource.Linux.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)Microsoft\Win32\SafeHandles\SafeFileHandle.Unix.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\AppDomain.Unix.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\DateTime.Unix.cs" />
@@ -2945,9 +2946,9 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.Unix.cs" Condition="'$(TargetsWindows)' != 'true' and '$(TargetsBrowser)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.IoUring.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.IoUring.Receive.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
-    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringRequest.Linux.cs" Condition="'$(TargetOS)' == 'linux'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PortableThreadPool.Windows.cs" Condition="'$(TargetsWindows)' == 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\LowLevelLifoSemaphore.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PreAllocatedOverlapped.Portable.cs" Condition="'$(TargetsWindows)' == 'true'" />
@@ -2959,8 +2960,12 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\ThreadPoolBoundHandle.Windows.cs" Condition="'$(TargetsWindows)' == 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\ThreadPoolCallbackWrapper.cs" Condition="'$(FeatureNativeAot)' != 'true'" />
   </ItemGroup>
-  <ItemGroup Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'">
-    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.PlatformNotSupported.cs" />
+  <ItemGroup>
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperationKind.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringRequest.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetsWindows)' != 'true'">
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PreAllocatedOverlapped.PlatformNotSupported.cs" />

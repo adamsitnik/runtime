@@ -15,10 +15,11 @@ public sealed partial class SafeFileHandle
     {
         get
         {
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ioUringDisposed), this);
             IoRingBoundHandle? binding = Volatile.Read(ref _ioUringBinding);
             if (binding is null)
             {
+                // Prevent first-time binding after disposal, even if another reference keeps IsClosed false.
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _ioUringDisposed), this);
                 binding = IoUring.Bind(this);
                 binding = Interlocked.CompareExchange(ref _ioUringBinding, binding, null) ?? binding;
 

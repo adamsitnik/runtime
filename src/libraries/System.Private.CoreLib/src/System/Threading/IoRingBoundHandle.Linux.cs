@@ -8,16 +8,7 @@ using Ring = System.Threading.PortableThreadPool.IoUringThreadPool.Ring;
 
 namespace System.Threading;
 
-/// <summary>Binds a handle to one experimental io_uring issuer for its lifetime.</summary>
-/// <remarks>
-/// Disposing the binding stops admission and requests cancellation, but does not synchronously
-/// retire outstanding I/O or dispose the caller's handle. Native ownership remains protected
-/// until all accepted requests retire. Bind returns the same binding for a given SafeHandle.
-/// The owner must retain and dispose this binding when disposing its handle; disposing an
-/// arbitrary SafeHandle does not notify the binding.
-/// </remarks>
-[CLSCompliant(false)]
-public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
+public sealed partial class IoRingBoundHandle
 {
     private const int Closed = int.MinValue;
     private const int HadPendingOperations = 1 << 30;
@@ -60,7 +51,7 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         }
     }
 
-    /// <summary>Requests deferred cleanup if the binding is no longer reachable.</summary>
+    // Balance the DangerousAddRef even if the owner abandons its handle and binding.
     ~IoRingBoundHandle()
     {
         if (_referenceReleased == 0)
@@ -97,15 +88,8 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         return binding;
     }
 
-    /// <summary>Enqueues an operation for submission by this handle's issuer.</summary>
-    /// <param name="operation">The operation whose buffers remain valid through terminal completion.</param>
-    /// <param name="cancellationToken">The token that requests cancellation of this logical operation.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
-    /// <exception cref="ObjectDisposedException">The binding is disposed.</exception>
-    /// <exception cref="InvalidOperationException">The operation is already active.</exception>
-    public void Enqueue(IoUringOperation operation, CancellationToken cancellationToken = default)
+    private void EnqueueForSubmissionCore(IoUringOperation operation, CancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(operation);
         ObjectDisposedException.ThrowIf(IsDisposed, this);
         operation.Begin(this, cancellationToken);
         try
@@ -113,6 +97,8 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
             IoUringRequest request = operation.GetRequest();
             if (request._nativeRequest.OpCode is Interop.Sys.IoRingOp.Send or Interop.Sys.IoRingOp.SendMsg)
             {
+                // A partial send can have no native request while its continuation is pending.
+                // Track the logical send so closing in that gap still uses abortive close.
                 operation.TrackSend();
             }
             EnqueueContinuation(operation, in request._nativeRequest);
@@ -188,9 +174,7 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
 
     internal void ReleaseSend() => Interlocked.Decrement(ref _pendingSends);
 
-    /// <summary>Stops admission and requests cancellation without waiting for native completion.</summary>
-    /// <remarks>This method does not authorize reusing any outstanding operation's buffers.</remarks>
-    public void Dispose()
+    private void DisposeCore()
     {
         int state = Volatile.Read(ref _state);
         while (true)
@@ -224,13 +208,7 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         GC.SuppressFinalize(this);
     }
 
-    /// <summary>Disposes the binding and waits for its native requests to retire.</summary>
-    /// <remarks>
-    /// This does not wait for application callbacks or revoke transferred receive buffers.
-    /// It allows synchronous socket close to progress without waiting for a ThreadPool worker.
-    /// </remarks>
-    /// <returns>Whether outstanding operations were present when disposal stopped admission.</returns>
-    public bool DisposeAndWait()
+    private bool DisposeAndWaitCore()
     {
         Dispose();
         if ((Volatile.Read(ref _state) & CountMask) != 0)
@@ -303,5 +281,5 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         }
     }
 
-    void IThreadPoolWorkItem.Execute() => ReleaseReference();
+    private void ExecuteCore() => ReleaseReference();
 }

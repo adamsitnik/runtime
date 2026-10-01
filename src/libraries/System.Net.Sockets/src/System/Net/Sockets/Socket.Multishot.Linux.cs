@@ -74,19 +74,19 @@ namespace System.Net.Sockets
             TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
             IoUringOperation? operation = null;
             Exception? callbackError = null;
-            IoUringOperation submitted = IoUringOperation.CreateReceiveMultishot(OnCompleted);
-            _handle.IoUringBinding.Enqueue(submitted, CancellationToken.None);
+            IoUringOperation receiveOperation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
+            _handle.IoUringBinding.EnqueueForSubmission(receiveOperation, CancellationToken.None);
 
             // Full fences on both publications prevent an early failing callback and
             // submission from each missing the other's cancellation state.
-            Interlocked.Exchange(ref operation, submitted);
+            Interlocked.Exchange(ref operation, receiveOperation);
             if (Volatile.Read(ref callbackError) is not null)
             {
-                submitted.RequestCancellation();
+                receiveOperation.RequestCancellation();
             }
 
             using CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
-                static state => ((IoUringOperation)state!).RequestCancellation(), submitted);
+                static state => ((IoUringOperation)state!).RequestCancellation(), receiveOperation);
             await completed.Task.ConfigureAwait(false);
 
             void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
@@ -176,7 +176,7 @@ namespace System.Net.Sockets
             }
 
             IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
-            handle.IoUringBinding.Enqueue(operation, CancellationToken.None);
+            handle.IoUringBinding.EnqueueForSubmission(operation, CancellationToken.None);
 
             // Skip allocating the callback delegate entirely when the token can never be canceled
             // (e.g. CancellationToken.None) - UnsafeRegister would end up being a no-op internally,

@@ -80,7 +80,7 @@ namespace System.Threading
     public delegate void WaitCallback(object? state);
     public delegate void WaitOrTimerCallback(object? state, bool timedOut);
     // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
-    // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.Linux.cs for details.
+    // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.cs for details.
     [System.CLSCompliantAttribute(false)]
     public static class IoUring
     {
@@ -93,7 +93,7 @@ namespace System.Threading
         internal IoRingBoundHandle() { }
         public void Dispose() { }
         public bool DisposeAndWait() { throw null; }
-        public void Enqueue(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default) { }
+        public void EnqueueForSubmission(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default) { }
         void System.Threading.IThreadPoolWorkItem.Execute() { }
     }
     [System.CLSCompliantAttribute(false)]

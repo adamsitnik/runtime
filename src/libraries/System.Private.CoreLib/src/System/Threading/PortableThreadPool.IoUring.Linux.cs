@@ -235,6 +235,7 @@ namespace System.Threading
                 public readonly IThreadPoolWorkItem CompletionProcessor;
                 public readonly OperationSlot[] OperationSlots = new OperationSlot[QueueDepth];
                 public readonly ConcurrentQueue<int> FreeOperationSlots = new();
+                // Producers add identities before queueing; completion workers release them after delivery.
                 public readonly ConcurrentDictionary<ulong, OverflowToken> OverflowTokens = new();
                 public long NextOverflowToken;
                 public IoUringOperation? PendingCancellations;
@@ -271,6 +272,8 @@ namespace System.Threading
                 int receiveBufferSize = GetReceiveBufferSize();
                 int receiveBufferCount = GetReceiveBufferCount();
                 Ring[] rings = new Ring[ringCount];
+                // Startup-only handshake: publish all rings together, or wait for every issuer to
+                // close its partial ring. No issuer may run until the type initializer commits.
                 object initializationLock = new object();
                 int pendingIssuers = 0;
                 bool initializationFinished = false;

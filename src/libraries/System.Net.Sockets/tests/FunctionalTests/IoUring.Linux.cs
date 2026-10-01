@@ -121,7 +121,7 @@ namespace System.Net.Sockets.Tests
         private static IoUringOperation EnqueueMultishot(IoRingBoundHandle binding, Action<int, IMemoryOwner<byte>?, bool> callback)
         {
             IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(callback);
-            binding.Enqueue(operation);
+            binding.EnqueueForSubmission(operation);
             return operation;
         }
 
@@ -144,8 +144,8 @@ namespace System.Net.Sockets.Tests
                     {
                         using CancellationTokenSource cancellation = new CancellationTokenSource();
                         operation.Prepare();
-                        binding.Enqueue(operation, bool.Parse(tokenText) ? cancellation.Token : default);
-                        Assert.Throws<InvalidOperationException>(() => binding.Enqueue(operation));
+                        binding.EnqueueForSubmission(operation, bool.Parse(tokenText) ? cancellation.Token : default);
+                        Assert.Throws<InvalidOperationException>(() => binding.EnqueueForSubmission(operation));
                         if (bool.Parse(tokenText))
                         {
                             cancellation.Cancel();
@@ -158,7 +158,7 @@ namespace System.Net.Sockets.Tests
                         operation.RequestCancellation();
 
                         operation.Prepare();
-                        binding.Enqueue(operation);
+                        binding.EnqueueForSubmission(operation);
                         sender.Send(new byte[] { 42 });
                         Assert.Equal(1, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
                         Assert.Equal(42, operation.Value);
@@ -207,7 +207,7 @@ namespace System.Net.Sockets.Tests
                     {
                         operations[i] = new BoundReceiveOperation();
                         operations[i].Prepare();
-                        binding.Enqueue(operations[i]);
+                        binding.EnqueueForSubmission(operations[i]);
                     }
                     switch (int.Parse(kindText))
                     {
@@ -232,7 +232,7 @@ namespace System.Net.Sockets.Tests
                         Assert.Equal(0, (int)freeSlots.GetType().GetProperty("Count")!.GetValue(freeSlots)!);
 #pragma warning restore IL2075
                     }
-                    Assert.Throws<ObjectDisposedException>(() => binding.Enqueue(new BoundReceiveOperation()));
+                    Assert.Throws<ObjectDisposedException>(() => binding.EnqueueForSubmission(new BoundReceiveOperation()));
                     if (int.Parse(kindText) == 0)
                     {
                         sender.Send(new byte[] { 7 });
@@ -322,11 +322,11 @@ namespace System.Net.Sockets.Tests
                             IoRingBoundHandle binding = owner.Binding;
                             using CancellationTokenSource cancellation = new CancellationTokenSource();
                             operation.Prepare();
-                            binding.Enqueue(operation, cancellation.Token);
+                            binding.EnqueueForSubmission(operation, cancellation.Token);
                             cancellation.Cancel();
                             Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
                             operation.Prepare();
-                            binding.Enqueue(operation);
+                            binding.EnqueueForSubmission(operation);
                             sender.Send(new byte[] { 42 });
                             Assert.Equal(1, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
                             Assert.Equal(42, operation.Value);
@@ -487,7 +487,7 @@ namespace System.Net.Sockets.Tests
                     operation.Prepare();
                     await Task.Run(() =>
                     {
-                        binding.Enqueue(operation);
+                        binding.EnqueueForSubmission(operation);
                         binding.DisposeAndWait();
                         receiver.Dispose();
                     }).WaitAsync(TestSettings.PassingTestTimeout);
@@ -662,7 +662,7 @@ namespace System.Net.Sockets.Tests
                 using (ManualResetEventSlim resume = new ManualResetEventSlim())
                 {
                     PausedSendOperation operation = new PausedSendOperation(delivered, resume);
-                    binding.Enqueue(operation);
+                    binding.EnqueueForSubmission(operation);
                     try
                     {
                         Assert.True(delivered.Wait(TestSettings.PassingTestTimeout));
@@ -747,7 +747,7 @@ namespace System.Net.Sockets.Tests
                         TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
                         unsafe
                         {
-                            binding.Enqueue(new CallbackOperation(
+                            binding.EnqueueForSubmission(new CallbackOperation(
                                 new IoUringRequest(IoUringOperationKind.SendGather, (void*)vectorsPin.AddrOfPinnedObject(), count), result =>
                             {
                                 Interlocked.Increment(ref callbacks);
@@ -1082,7 +1082,7 @@ namespace System.Net.Sockets.Tests
                 int callerThreadId = Environment.CurrentManagedThreadId;
                 unsafe
                 {
-                    binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Accept, null, 0), result =>
+                    binding.EnqueueForSubmission(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Accept, null, 0), result =>
                     {
                         Assert.True(Thread.CurrentThread.IsThreadPoolThread);
                         Assert.NotEqual(callerThreadId, Environment.CurrentManagedThreadId);
@@ -1287,7 +1287,7 @@ namespace System.Net.Sockets.Tests
                                     completion.SetResult(result);
                                 }
                                 : completion.SetResult;
-                            binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
+                            binding.EnqueueForSubmission(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
                         }
                     }
                 }
@@ -1421,6 +1421,84 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void BufferOperation_ReusedForBothDirections(bool reenterFromUnpin)
+        {
+            RemoteExecutor.Invoke(async reenterText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (TrackingMemoryManager receiveMemory = new TrackingMemoryManager())
+                using (TrackingMemoryManager sendMemory = new TrackingMemoryManager())
+                {
+#pragma warning disable IL2075 // RemoteExecutor runs these implementation-specific checks without trimming.
+                    const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+                    object context = typeof(SafeSocketHandle).GetProperty("AsyncContext", Flags)!.GetValue(receiver.SafeHandle)!;
+                    Type contextType = context.GetType();
+                    System.Reflection.FieldInfo operationField = contextType.GetField("_bufferOperation", Flags)!;
+                    Assert.NotNull(operationField);
+                    System.Reflection.MethodInfo sendMethod = contextType.GetMethod("TrySendViaIoUring", Flags, null,
+                        new[] { typeof(Memory<byte>), typeof(int), typeof(int), typeof(SocketFlags), typeof(int),
+                            typeof(Action<int, Memory<byte>, SocketFlags, SocketError>), typeof(CancellationToken) }, null)!;
+#pragma warning restore IL2075
+                    Task<int> receive = receiver.ReceiveAsync(receiveMemory.Memory, SocketFlags.None).AsTask();
+                    Assert.False(receive.IsCompleted);
+                    TaskCompletionSource<int> sent = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Action<int, Memory<byte>, SocketFlags, SocketError> callback = (count, _, _, error) =>
+                    {
+                        if (error == SocketError.Success)
+                        {
+                            sent.SetResult(count);
+                        }
+                        else
+                        {
+                            sent.SetException(new SocketException((int)error));
+                        }
+                    };
+                    object? reused = null;
+                    if (bool.Parse(reenterText))
+                    {
+                        receiveMemory.OnUnpin = SendReply;
+                    }
+                    Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                    Assert.Equal(1, await receive.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(42, receiveMemory.GetSpan()[0]);
+                    if (!bool.Parse(reenterText))
+                    {
+                        SendReply();
+                    }
+                    Assert.Equal(1, await sent.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Same(reused, operationField.GetValue(context));
+                    byte[] reply = new byte[1];
+                    Assert.Equal(1, await sender.ReceiveAsync(reply, SocketFlags.None).WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(43, reply[0]);
+
+                    Task<int> nextReceive = receiver.ReceiveAsync(receiveMemory.Memory, SocketFlags.None).AsTask();
+                    Assert.False(nextReceive.IsCompleted);
+                    Assert.Equal(1, sender.Send(new byte[] { 44 }));
+                    Assert.Equal(1, await nextReceive.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(44, receiveMemory.GetSpan()[0]);
+                    Assert.Same(reused, operationField.GetValue(context));
+                    Assert.Equal(2, receiveMemory.UnpinCount);
+                    Assert.Equal(1, sendMemory.UnpinCount);
+
+                    void SendReply()
+                    {
+                        reused = operationField.GetValue(context);
+                        Assert.NotNull(reused);
+                        sendMemory.GetSpan()[0] = 43;
+                        Assert.True((bool)sendMethod.Invoke(context, new object[]
+                        {
+                            sendMemory.Memory, 0, 1, SocketFlags.None, 0, callback, CancellationToken.None
+                        })!);
+                    }
+                }
+            }, reenterFromUnpin.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
         [InlineData(1, false)]
         [InlineData(1, true)]
         [InlineData(3, false)]
@@ -1484,7 +1562,7 @@ namespace System.Net.Sockets.Tests
                         {
                             for (int i = 0; i < OperationCount; i++)
                             {
-                                binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
+                                binding.EnqueueForSubmission(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
                             }
                         }
                     }
