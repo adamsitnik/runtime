@@ -21,7 +21,7 @@ namespace System.Threading
             /// kernel has data for - until cancelled (see <paramref name="operation"/>'s
             /// <see cref="IoUringOperation.RequestCancellation"/>), EOF, or an error occurs.
             /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
-            /// completion, with the raw result (bytes received, 0 on graceful EOF, or <c>-errno</c> on
+            /// completion, with the raw result (bytes received, 0 on stream EOF or an empty datagram, or <c>-errno</c> on
             /// failure), the received data (as a buffer leased from the pool - dispose it to return it),
             /// and whether the operation is still alive and will keep producing further completions.
             /// <paramref name="handle"/> is ref-counted while each native submission is outstanding.
@@ -41,7 +41,13 @@ namespace System.Threading
                     return false;
                 }
 
-                MultishotReceiveOperation multishotOperation = new(binding._ring, onCompleted);
+                Interop.Error error = Interop.Sys.GetIoRingSocketType(handle, out _, out int socketType, out _, out _);
+                if (error != Interop.Error.SUCCESS)
+                {
+                    throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
+                }
+                const int DatagramSocketType = 2; // SocketType_SOCK_DGRAM in pal_networking.h.
+                MultishotReceiveOperation multishotOperation = new(binding._ring, onCompleted, socketType == DatagramSocketType);
                 binding.Enqueue(multishotOperation);
                 operation = multishotOperation;
                 return true;
@@ -53,11 +59,8 @@ namespace System.Threading
             /// <see cref="Interop.Sys.IoRingRegisterBufferRing"/>. Backed by natively-allocated,
             /// page-aligned storage that the ring itself owns and frees on close. A completion selects a
             /// buffer by id (0..<see cref="BufferCount"/>-1); <see cref="Rent"/> wraps that buffer's
-            /// slice as an <see cref="IMemoryOwner{Byte}"/> without copying, reusing one persistent
-            /// <see cref="ReceiveBufferLease"/> per buffer id instead of allocating one per completion -
-            /// safe because the kernel never selects the same id again until this pool republishes it
-            /// (see <see cref="Return"/>), which only happens after the previous lease for that id has
-            /// been disposed.
+            /// slice as a distinct <see cref="IMemoryOwner{Byte}"/> without copying. The owner must not
+            /// be reused: a repeated Dispose on an old owner must never return a subsequent lease.
             /// </summary>
             internal sealed unsafe class ReceiveBufferPool
             {
@@ -67,29 +70,29 @@ namespace System.Threading
                 public readonly int BufferCount;
 
                 private readonly Ring _ring;
-                private readonly ReceiveBufferLease[] _leases;
+                private readonly byte* _storage;
                 private readonly long[] _returnedBuffers;
+                private MultishotReceiveOperation? _waitingReceives;
+                private MultishotReceiveOperation? _lastWaitingReceive;
+
+                // Issuer-owned count: selected buffers leave at CQE reaping, and returns
+                // reenter only after being published to the kernel.
+                internal int AvailableBuffers;
 
                 internal ReceiveBufferPool(Ring ring, int bufferSize, int bufferCount, byte* storage)
                 {
                     _ring = ring;
                     BufferSize = bufferSize;
                     BufferCount = bufferCount;
+                    AvailableBuffers = bufferCount;
+                    _storage = storage;
                     _returnedBuffers = new long[checked((bufferCount + BitsPerReturnWord - 1) / BitsPerReturnWord)];
-
-                    var leases = new ReceiveBufferLease[bufferCount];
-                    for (int i = 0; i < bufferCount; i++)
-                    {
-                        leases[i] = new ReceiveBufferLease(this, i, storage + (long)i * bufferSize);
-                    }
-                    _leases = leases;
                 }
 
                 public IMemoryOwner<byte> Rent(int bufferId, int length)
                 {
-                    ReceiveBufferLease lease = _leases[bufferId];
-                    lease.SetLength(length);
-                    return lease;
+                    Debug.Assert((uint)bufferId < (uint)BufferCount && (uint)length <= (uint)BufferSize);
+                    return new ReceiveBufferLease(this, bufferId, _storage + (long)bufferId * BufferSize, length);
                 }
 
                 /// <summary>
@@ -99,8 +102,89 @@ namespace System.Threading
                 /// May be called from any thread (whichever one disposes the corresponding
                 /// <see cref="ReceiveBufferLease"/>).
                 /// </summary>
-                internal void Return(int bufferId) =>
+                internal void Return(int bufferId)
+                {
                     Interlocked.Or(ref _returnedBuffers[bufferId / BitsPerReturnWord], 1L << (bufferId % BitsPerReturnWord));
+                    if (Volatile.Read(ref _waitingReceives) is not null)
+                    {
+                        WakeIssuer(_ring);
+                    }
+                }
+
+                internal bool HasReadyWaiters => _waitingReceives is not null && AvailableBuffers > 0;
+
+                internal bool HasPendingReturns
+                {
+                    get
+                    {
+                        if (_waitingReceives is not null)
+                        {
+                            foreach (ref long word in _returnedBuffers.AsSpan())
+                            {
+                                if (Volatile.Read(ref word) != 0)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                }
+
+                internal void AddWaiter(MultishotReceiveOperation operation, in Interop.Sys.IoRingRequest request)
+                {
+                    Debug.Assert(AvailableBuffers == 0);
+                    operation._waitingRequest = request;
+                    operation._previousWaiter = _lastWaitingReceive;
+                    if (_lastWaitingReceive is null)
+                    {
+                        Volatile.Write(ref _waitingReceives, operation);
+                    }
+                    else
+                    {
+                        _lastWaitingReceive._nextWaiter = operation;
+                    }
+                    _lastWaitingReceive = operation;
+                    LinkOperation(operation, published: false);
+                }
+
+                internal void RemoveWaiter(MultishotReceiveOperation operation)
+                {
+                    if (operation._previousWaiter is null)
+                    {
+                        Debug.Assert(_waitingReceives == operation);
+                        Volatile.Write(ref _waitingReceives, operation._nextWaiter);
+                    }
+                    else
+                    {
+                        operation._previousWaiter._nextWaiter = operation._nextWaiter;
+                    }
+                    if (operation._nextWaiter is null)
+                    {
+                        _lastWaitingReceive = operation._previousWaiter;
+                    }
+                    else
+                    {
+                        operation._nextWaiter._previousWaiter = operation._previousWaiter;
+                    }
+                    operation._previousWaiter = null;
+                    operation._nextWaiter = null;
+                    operation._waitingRequest = default;
+                    UnlinkOperation(operation);
+                }
+
+                internal bool TryResume(out Interop.Sys.IoRingRequest request)
+                {
+                    if (HasReadyWaiters)
+                    {
+                        MultishotReceiveOperation operation = _waitingReceives!;
+                        request = operation._waitingRequest;
+                        RemoveWaiter(operation);
+                        return true;
+                    }
+                    request = default;
+                    return false;
+                }
 
                 internal void DrainReturns(ushort[] batch)
                 {
@@ -141,34 +225,40 @@ namespace System.Threading
                             Environment.FailFast($"io_uring provided-buffer return failed: {Marshal.GetLastPInvokeError()}.");
                         }
                     }
+                    AvailableBuffers += count;
+                    Debug.Assert(AvailableBuffers <= BufferCount);
                 }
             }
 
             /// <summary>
-            /// A persistent, reusable <see cref="IMemoryOwner{Byte}"/> over one fixed provided buffer
+            /// A single-use <see cref="IMemoryOwner{Byte}"/> over one fixed provided buffer
             /// (see <see cref="ReceiveBufferPool"/>). <see cref="Dispose"/> returns the buffer to its
             /// pool instead of freeing anything - the backing storage is owned by the ring itself.
             /// </summary>
             private sealed unsafe class ReceiveBufferLease : MemoryManager<byte>
             {
-                private readonly ReceiveBufferPool _pool;
+                private ReceiveBufferPool? _pool;
                 private readonly int _bufferId;
                 private readonly byte* _basePointer;
-                private int _length;
+                private readonly int _length;
 
-                public ReceiveBufferLease(ReceiveBufferPool pool, int bufferId, byte* basePointer)
+                public ReceiveBufferLease(ReceiveBufferPool pool, int bufferId, byte* basePointer, int length)
                 {
                     _pool = pool;
                     _bufferId = bufferId;
                     _basePointer = basePointer;
+                    _length = length;
                 }
 
-                public void SetLength(int length) => _length = length;
-
-                public override Span<byte> GetSpan() => new Span<byte>(_basePointer, _length);
+                public override Span<byte> GetSpan()
+                {
+                    ObjectDisposedException.ThrowIf(Volatile.Read(ref _pool) is null, this);
+                    return new Span<byte>(_basePointer, _length);
+                }
 
                 public override MemoryHandle Pin(int elementIndex = 0)
                 {
+                    ObjectDisposedException.ThrowIf(Volatile.Read(ref _pool) is null, this);
                     if ((uint)elementIndex > (uint)_length)
                     {
                         throw new ArgumentOutOfRangeException(nameof(elementIndex));
@@ -181,7 +271,7 @@ namespace System.Threading
                 {
                 }
 
-                protected override void Dispose(bool disposing) => _pool.Return(_bufferId);
+                protected override void Dispose(bool disposing) => Interlocked.Exchange(ref _pool, null)?.Return(_bufferId);
             }
 
             /// <summary>
@@ -196,6 +286,10 @@ namespace System.Threading
             {
                 private readonly Ring _ring;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
+                private readonly bool _isDatagram;
+                internal MultishotReceiveOperation? _previousWaiter;
+                internal MultishotReceiveOperation? _nextWaiter;
+                internal Interop.Sys.IoRingRequest _waitingRequest;
 
                 // Completions reaped by the issuer thread (see EnqueueFromIssuer) but this operation's
                 // own drainer (see Execute) has not yet delivered to _onCompleted. This queue has exactly
@@ -220,10 +314,11 @@ namespace System.Threading
                 // the exact same out-of-order delivery this type exists to avoid.
                 private int _dispatchRequested;
 
-                public MultishotReceiveOperation(Ring ring, Action<int, IMemoryOwner<byte>?, bool> onCompleted)
+                public MultishotReceiveOperation(Ring ring, Action<int, IMemoryOwner<byte>?, bool> onCompleted, bool isDatagram)
                 {
                     _ring = ring;
                     _onCompleted = onCompleted;
+                    _isDatagram = isDatagram;
                 }
 
                 protected override IoUringRequest Request
@@ -274,10 +369,21 @@ namespace System.Threading
                         while (_pending.TryDequeue(out PendingCompletion completion))
                         {
                             IMemoryOwner<byte>? buffer = null;
-                            if (completion.Result > 0 && (completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
+                            if ((completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
                             {
                                 int bufferId = (int)(completion.Flags >> Interop.Sys.IoRingCompletion.BufferShift);
-                                buffer = _ring.ReceiveBuffers!.Rent(bufferId, completion.Result);
+                                if (completion.Result > 0 || (completion.Result == 0 && _isDatagram))
+                                {
+                                    buffer = _ring.ReceiveBuffers!.Rent(bufferId, completion.Result);
+                                }
+                                else
+                                {
+                                    _ring.ReceiveBuffers!.Return(bufferId);
+                                }
+                            }
+                            else if (completion.Result == 0 && _isDatagram)
+                            {
+                                buffer = EmptyDatagram.Instance;
                             }
 
                             Deliver(completion.Result, buffer,
@@ -338,7 +444,7 @@ namespace System.Threading
                 {
                     if (!hasMore)
                     {
-                        if (result > 0)
+                        if (result > 0 || (result == 0 && _isDatagram))
                         {
                             // CQ pressure can terminate a native submission without reaching EOF.
                             // Transfer the final buffer before rearming, and observe cancellation
@@ -370,6 +476,13 @@ namespace System.Threading
                     _onCompleted(result, buffer, hasMore);
                     ExecutionContext.ResetThreadPoolThread(currentThread);
                     currentThread.ResetThreadPoolThread();
+                }
+
+                private sealed class EmptyDatagram : IMemoryOwner<byte>
+                {
+                    internal static readonly EmptyDatagram Instance = new();
+                    public Memory<byte> Memory => Memory<byte>.Empty;
+                    public void Dispose() { }
                 }
 
                 private readonly struct PendingCompletion

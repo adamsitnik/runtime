@@ -27,6 +27,10 @@ public enum IoUringOperationKind
     Send = 7,
     /// <summary>Sends socket data from native iovec entries.</summary>
     SendGather = 10,
+    /// <summary>Waits for a descriptor to become readable.</summary>
+    PollRead = 11,
+    /// <summary>Waits for a descriptor to become writable.</summary>
+    PollWrite = 12,
 }
 
 /// <summary>Describes an experimental io_uring request without its descriptor or correlation identity.</summary>
@@ -52,7 +56,7 @@ public readonly unsafe struct IoUringRequest
         int flags = 0, void* socketAddress = null, int* socketAddressLength = null)
     {
         if (kind is < IoUringOperationKind.Read or > IoUringOperationKind.Send &&
-            kind != IoUringOperationKind.SendGather)
+            kind is < IoUringOperationKind.SendGather or > IoUringOperationKind.PollWrite)
         {
             throw new ArgumentOutOfRangeException(nameof(kind));
         }

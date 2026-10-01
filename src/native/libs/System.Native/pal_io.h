@@ -928,6 +928,8 @@ typedef enum
                                   // each selecting one buffer, until cancelled, EOF, or an error occurs; every
                                   // completion but the last one carries IORING_CQE_F_MORE in its Flags
     IoRingOp_SendMsg = 10,       // gather socket send; Buffer points to an owned native msghdr
+    IoRingOp_PollRead = 11,
+    IoRingOp_PollWrite = 12,
 } IoRingOp;
 
 /**

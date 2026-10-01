@@ -10,16 +10,73 @@ using System.Threading;
 namespace System.Net.Sockets
 {
     // Experimental completion-based socket operations over shared, sharded io_uring rings.
-    // Each ring has one issuer; callbacks run on Thread Pool workers. Returning false leaves
-    // the caller to use the existing SocketAsyncEngine path.
+    // Each ring has one issuer; callbacks run on Thread Pool workers. Operations without a
+    // completion-based adapter use the ordered queues with io_uring readiness notifications.
     internal sealed partial class SocketAsyncContext
     {
         private IoRingBoundHandle? _ioUringBinding;
+        private bool _ioUringReadinessRegistered;
         private IoUringBufferOperation? _cachedIoUringReceiveOperation;
         private IoUringBufferOperation? _cachedIoUringSendOperation;
         private IoUringBufferListSendOperation? _cachedIoUringBufferListSendOperation;
         private IoUringAddressOperation? _cachedIoUringAcceptOperation;
         private IoUringAddressOperation? _cachedIoUringConnectOperation;
+
+        private sealed class IoUringPollOperation : IoUringOperation
+        {
+            private readonly SocketAsyncContext _context;
+            private readonly bool _isRead;
+            private int _active;
+
+            public IoUringPollOperation(SocketAsyncContext context, bool isRead)
+            {
+                _context = context;
+                _isRead = isRead;
+            }
+
+            protected override unsafe IoUringRequest Request =>
+                new IoUringRequest(_isRead ? IoUringOperationKind.PollRead : IoUringOperationKind.PollWrite, null, 0);
+
+            public void Start()
+            {
+                if (Interlocked.CompareExchange(ref _active, 1, 0) != 0)
+                {
+                    return;
+                }
+
+                try
+                {
+                    _context.IoUringBinding.Enqueue(this);
+                }
+                catch (ObjectDisposedException)
+                {
+                    Notify(SocketError.OperationAborted);
+                }
+                catch (OutOfMemoryException)
+                {
+                    Notify(SocketError.NoBufferSpaceAvailable);
+                }
+            }
+
+            protected override void OnCompleted(int result, uint flags, long sequence)
+            {
+                CompleteOperation();
+                Notify(result >= 0 ? SocketError.Success : SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error));
+            }
+
+            private void Notify(SocketError error)
+            {
+                Volatile.Write(ref _active, 0);
+                if (_isRead)
+                {
+                    _context._receiveQueue.HandleIoUringReadiness(_context, error);
+                }
+                else
+                {
+                    _context._sendQueue.HandleIoUringReadiness(_context, error);
+                }
+            }
+        }
 
         private IoRingBoundHandle IoUringBinding
         {
@@ -47,13 +104,18 @@ namespace System.Net.Sockets
         private bool TryReceiveViaIoUring(Memory<byte> buffer, SocketFlags flags, Action<int, Memory<byte>, SocketFlags, SocketError> callback,
             CancellationToken cancellationToken)
         {
-            if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None || buffer.Length == 0)
+            if (!System.Threading.IoUring.IsSupported || !_socket.IsSocket || flags != SocketFlags.None || buffer.Length == 0)
             {
                 return false;
             }
 
             IoUringBufferOperation operation = Interlocked.Exchange(ref _cachedIoUringReceiveOperation, null)
                 ?? new IoUringBufferOperation(this, isReceive: true);
+            if (!_receiveQueue.TryStartNativeOperation())
+            {
+                Interlocked.CompareExchange(ref _cachedIoUringReceiveOperation, operation, null);
+                return false;
+            }
             return operation.TrySubmit(buffer, 0, buffer.Length, 0, callback, cancellationToken);
         }
 
@@ -98,6 +160,7 @@ namespace System.Net.Sockets
                     {
                         MemoryHandle pin = _pin;
                         Return();
+                        CompleteQueue();
                         pin.Dispose();
                     }
                 }
@@ -150,8 +213,21 @@ namespace System.Net.Sockets
                 int bytesAlreadyTransferred = _bytesAlreadyTransferred;
                 CompleteOperation();
                 Return();
+                CompleteQueue();
                 pin.Dispose();
                 callback(bytesAlreadyTransferred, Memory<byte>.Empty, SocketFlags.None, error);
+            }
+
+            private void CompleteQueue()
+            {
+                if (_isReceive)
+                {
+                    _context._receiveQueue.CompleteNativeOperation();
+                }
+                else
+                {
+                    _context._sendQueue.CompleteNativeOperation();
+                }
             }
 
             private void Return()
@@ -178,26 +254,36 @@ namespace System.Net.Sockets
         private bool TrySendViaIoUring(Memory<byte> buffer, int offset, int count, SocketFlags flags, int bytesSent,
             Action<int, Memory<byte>, SocketFlags, SocketError> callback, CancellationToken cancellationToken)
         {
-            if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
+            if (!System.Threading.IoUring.IsSupported || !_socket.IsSocket || flags != SocketFlags.None)
             {
                 return false;
             }
 
             IoUringBufferOperation operation = Interlocked.Exchange(ref _cachedIoUringSendOperation, null)
                 ?? new IoUringBufferOperation(this, isReceive: false);
+            if (!_sendQueue.TryStartNativeOperation())
+            {
+                Interlocked.CompareExchange(ref _cachedIoUringSendOperation, operation, null);
+                return false;
+            }
             return operation.TrySubmit(buffer, offset, count, bytesSent, callback, cancellationToken);
         }
 
         private bool TrySendViaIoUring(IList<ArraySegment<byte>> buffers, int bufferIndex, int offset, SocketFlags flags,
             int bytesSent, Action<int, Memory<byte>, SocketFlags, SocketError> callback)
         {
-            if (!System.Threading.IoUring.IsSupported || flags != SocketFlags.None)
+            if (!System.Threading.IoUring.IsSupported || !_socket.IsSocket || flags != SocketFlags.None)
             {
                 return false;
             }
 
             IoUringBufferListSendOperation operation = Interlocked.Exchange(ref _cachedIoUringBufferListSendOperation, null)
                 ?? new IoUringBufferListSendOperation(this);
+            if (!_sendQueue.TryStartNativeOperation())
+            {
+                Interlocked.CompareExchange(ref _cachedIoUringBufferListSendOperation, operation, null);
+                return false;
+            }
             return operation.TrySubmit(buffers, bufferIndex, offset, bytesSent, callback);
         }
 
@@ -255,6 +341,7 @@ namespace System.Net.Sockets
                     if (!submitted)
                     {
                         Return();
+                        _context._sendQueue.CompleteNativeOperation();
                     }
                 }
             }
@@ -322,6 +409,7 @@ namespace System.Net.Sockets
                 int bytesSent = _bytesSent;
                 CompleteOperation();
                 Return();
+                _context._sendQueue.CompleteNativeOperation();
                 callback(bytesSent, Memory<byte>.Empty, SocketFlags.None, error);
             }
 
@@ -359,13 +447,18 @@ namespace System.Net.Sockets
 
             IoUringAddressOperation operation = Interlocked.Exchange(ref _cachedIoUringAcceptOperation, null)
                 ?? new IoUringAddressOperation(this, isAccept: true);
+            if (!_receiveQueue.TryStartNativeOperation())
+            {
+                Interlocked.CompareExchange(ref _cachedIoUringAcceptOperation, operation, null);
+                return false;
+            }
             return operation.TrySubmit(socketAddress, callback, null, cancellationToken);
         }
 
         /// <summary>
         /// Attempts to complete a Connect (with no data to send alongside it - TCP Fast Open-style
         /// connect-with-data always falls back to the existing path) via io_uring instead of the
-        /// existing non-blocking-connect-then-epoll-wait sequence. See
+        /// existing non-blocking-connect-then-readiness-wait sequence. See
         /// <see cref="TryReceiveViaIoUring"/> for the general submission/callback contract.
         /// </summary>
         private bool TryConnectViaIoUring(Memory<byte> socketAddress, Action<int, Memory<byte>, SocketFlags, SocketError> callback,
@@ -378,6 +471,11 @@ namespace System.Net.Sockets
 
             IoUringAddressOperation operation = Interlocked.Exchange(ref _cachedIoUringConnectOperation, null)
                 ?? new IoUringAddressOperation(this, isAccept: false);
+            if (!_sendQueue.TryStartNativeOperation())
+            {
+                Interlocked.CompareExchange(ref _cachedIoUringConnectOperation, operation, null);
+                return false;
+            }
             return operation.TrySubmit(socketAddress, null, callback, cancellationToken);
         }
 
@@ -431,6 +529,7 @@ namespace System.Net.Sockets
                         MemoryHandle pin = _pin;
                         Return();
                         pin.Dispose();
+                        CompleteQueue();
                     }
                 }
             }
@@ -451,14 +550,27 @@ namespace System.Net.Sockets
 
                 if (_isAccept)
                 {
+                    CompleteQueue();
                     acceptCallback!((IntPtr)(result >= 0 ? result : -1),
                         result >= 0 ? address.Slice(0, addressLength) : address, error);
                 }
                 else
                 {
                     _context._socket.RegisterConnectResult(error);
-                    _context._socket.SetBlocking();
+                    CompleteQueue();
                     connectCallback!(0, address, SocketFlags.None, error);
+                }
+            }
+
+            private void CompleteQueue()
+            {
+                if (_isAccept)
+                {
+                    _context._receiveQueue.CompleteNativeOperation();
+                }
+                else
+                {
+                    _context._sendQueue.CompleteNativeOperation();
                 }
             }
 

@@ -2,13 +2,89 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.DotNet.RemoteExecutor;
 using Xunit;
 
 namespace System.Net.Sockets.Tests
 {
     public class SocketBlockingModeTransitionTests
     {
+        [ConditionalTheory(typeof(IoUringTests), nameof(IoUringTests.IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task AcceptAsync_SetsCloseOnExec(bool pending)
+        {
+            using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            listener.Listen(1);
+            using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            if (!pending)
+            {
+                client.Connect(listener.LocalEndPoint!);
+            }
+            Task<Socket> accept = listener.AcceptAsync();
+            Assert.Equal(!pending, accept.IsCompleted);
+            if (pending)
+            {
+                client.Connect(listener.LocalEndPoint!);
+            }
+            using Socket accepted = await accept.WaitAsync(TestSettings.PassingTestTimeout);
+            int flags = Interop.Sys.Fcntl.GetFD(accepted.SafeHandle);
+            Assert.NotEqual(-1, flags);
+            Assert.Equal(1, flags & 1); // FD_CLOEXEC
+        }
+
+        [ConditionalFact(typeof(IoUringTests), nameof(IoUringTests.IsSupported))]
+        public void ConnectAsync_QueuedSendPreservesNonBlockingMode()
+        {
+            RemoteInvokeOptions options = new RemoteInvokeOptions();
+            options.StartInfo.Environment["DOTNET_USE_IO_URING"] = "1";
+            options.StartInfo.Environment["DOTNET_IORING_THREAD_COUNT"] = "1";
+            RemoteExecutor.Invoke(() =>
+            {
+                ThreadPool.GetMinThreads(out _, out int minIo);
+                ThreadPool.GetMaxThreads(out _, out int maxIo);
+                Assert.True(ThreadPool.SetMinThreads(1, minIo));
+                Assert.True(ThreadPool.SetMaxThreads(1, maxIo));
+                using ManualResetEventSlim workerStarted = new ManualResetEventSlim();
+                using ManualResetEventSlim releaseWorker = new ManualResetEventSlim();
+                Task worker = Task.Run(() =>
+                {
+                    workerStarted.Set();
+                    releaseWorker.Wait();
+                });
+                Assert.True(workerStarted.Wait(TestSettings.PassingTestTimeout));
+
+                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                listener.Listen(1);
+                using Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                try
+                {
+                    Task connect = client.ConnectAsync(listener.LocalEndPoint!);
+                    using Socket accepted = listener.Accept();
+                    Assert.False(connect.IsCompleted);
+                    Task<int> send = client.SendAsync(new byte[] { 42 }.AsMemory(), SocketFlags.None).AsTask();
+                    Assert.False(send.IsCompleted);
+                    releaseWorker.Set();
+                    Assert.True(connect.Wait(TestSettings.PassingTestTimeout));
+                    Assert.True(send.Wait(TestSettings.PassingTestTimeout));
+                    Assert.Equal(1, send.Result);
+                    Assert.True(IsSocketNonBlocking(client));
+                    byte[] buffer = new byte[1];
+                    Assert.Equal(1, accepted.Receive(buffer));
+                    Assert.Equal(42, buffer[0]);
+                }
+                finally
+                {
+                    releaseWorker.Set();
+                    Assert.True(worker.Wait(TestSettings.PassingTestTimeout));
+                }
+            }, options).Dispose();
+        }
+
         private static bool IsSocketNonBlocking(Socket socket)
         {
             int rv = Interop.Sys.Fcntl.GetIsNonBlocking(socket.SafeHandle, out bool isNonBlocking);

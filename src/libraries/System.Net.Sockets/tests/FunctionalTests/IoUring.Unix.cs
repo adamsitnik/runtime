@@ -2,6 +2,7 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -15,6 +16,80 @@ namespace System.Net.Sockets.Tests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Initialization_FailedBufferRegistrationClosesRing()
+        {
+            RemoteInvokeOptions options = CreateOptions(3);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "3";
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.False(IoUring.IsSupported);
+                foreach (string descriptor in System.IO.Directory.EnumerateFiles("/proc/self/fd"))
+                {
+                    Assert.NotEqual("anon_inode:[io_uring]", new System.IO.FileInfo(descriptor).LinkTarget);
+                }
+            }, options).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Initialization_DoesNotFlowCallerExecutionContext()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                int contextChanges = 0;
+                AsyncLocal<object> local = new AsyncLocal<object>(change =>
+                {
+                    if (change.ThreadContextChanged && change.CurrentValue is not null)
+                    {
+                        Interlocked.Increment(ref contextChanges);
+                    }
+                });
+                local.Value = new object();
+                try
+                {
+                    Assert.True(IoUring.IsSupported);
+                    Assert.Equal(0, Volatile.Read(ref contextChanges));
+                }
+                finally
+                {
+                    local.Value = null;
+                }
+            }, CreateOptions(3)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void DatagramReceive_PreservesTruncationFlag(bool pending)
+        {
+            RemoteExecutor.Invoke(async pendingText =>
+            {
+                using Socket receiver = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                receiver.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                using SocketAsyncEventArgs args = new SocketAsyncEventArgs();
+                args.SetBuffer(new byte[1]);
+                TaskCompletionSource completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                args.Completed += (_, _) => completion.SetResult();
+                bool shouldPend = bool.Parse(pendingText);
+                if (!shouldPend)
+                {
+                    Assert.Equal(2, sender.SendTo(new byte[] { 42, 43 }, receiver.LocalEndPoint!));
+                }
+                bool isPending = receiver.ReceiveAsync(args);
+                Assert.Equal(shouldPend, isPending);
+                if (shouldPend)
+                {
+                    Assert.Equal(2, sender.SendTo(new byte[] { 42, 43 }, receiver.LocalEndPoint!));
+                    await completion.Task.WaitAsync(TestSettings.PassingTestTimeout);
+                }
+                Assert.Equal(SocketError.Success, args.SocketError);
+                Assert.Equal(1, args.BytesTransferred);
+                Assert.Equal(42, args.MemoryBuffer.Span[0]);
+                Assert.Equal(SocketFlags.Truncated, args.SocketFlags & SocketFlags.Truncated);
+            }, pending.ToString(), CreateOptions(1)).Dispose();
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SendVector
@@ -819,10 +894,11 @@ namespace System.Net.Sockets.Tests
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(false)]
         [InlineData(true)]
-        public void SocketAsyncEngine_FallbackRejectedWhenIoUringEnabled(bool useIoUring)
+        public void SocketAsyncEngine_PeekUsesSelectedReadinessBackend(bool useIoUring)
         {
             RemoteInvokeOptions options = CreateOptions(1);
             options.StartInfo.Environment["DOTNET_USE_IO_URING"] = useIoUring ? "1" : "0";
+            options.StartInfo.Environment["DOTNET_SYSTEM_NET_SOCKETS_THREAD_COUNT"] = "1";
             RemoteExecutor.Invoke(async enabledText =>
             {
                 bool enabled = bool.Parse(enabledText);
@@ -831,25 +907,87 @@ namespace System.Net.Sockets.Tests
                 using (sender)
                 using (receiver)
                 {
-                    if (enabled)
-                    {
-                        await Assert.ThrowsAsync<InvalidOperationException>(ReceiveWithPeek);
-                    }
-                    else
-                    {
-                        await ReceiveWithPeek();
-                    }
+                    byte[] buffer = new byte[1];
+                    Task<int> pending = receiver.ReceiveAsync(buffer.AsMemory(), SocketFlags.Peek).AsTask();
+                    Assert.False(pending.IsCompleted);
+                    Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                    Assert.Equal(1, await pending.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(42, buffer[0]);
+                    Assert.Equal(1, receiver.Receive(buffer));
+                    Assert.Equal(42, buffer[0]);
 
-                    async Task ReceiveWithPeek()
-                    {
-                        byte[] buffer = new byte[1];
-                        Task<int> pending = receiver.ReceiveAsync(buffer.AsMemory(), SocketFlags.Peek).AsTask();
-                        Assert.Equal(1, sender.Send(new byte[] { 42 }));
-                        Assert.Equal(1, await pending.WaitAsync(TestSettings.PassingTestTimeout));
-                        Assert.Equal(42, buffer[0]);
-                    }
+                    Type engineType = typeof(Socket).Assembly.GetType("System.Net.Sockets.SocketAsyncEngine", throwOnError: true)!;
+#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
+                    Array engines = (Array)engineType.GetField("s_engines",
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null)!;
+#pragma warning restore IL2075
+                    Assert.Equal(enabled ? 0 : 1, engines.Length);
                 }
             }, useIoUring.ToString(), options).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void SynchronousReceive_DisposeUnblocksPoll(bool closeHandle)
+        {
+            RemoteExecutor.Invoke(closeText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                {
+                    receiver.Blocking = false;
+                    receiver.Blocking = true;
+                    using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
+#pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
+                    System.Reflection.FieldInfo stateField = typeof(SafeHandle).GetField("_state",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+#pragma warning restore IL2075
+                    int initialState = (int)stateField.GetValue(receiver.SafeHandle)!;
+                    SocketError error = SocketError.Success;
+                    Thread reader = new Thread(() =>
+                    {
+                        try
+                        {
+                            receiver.Receive(new byte[1]);
+                        }
+                        catch (SocketException exception)
+                        {
+                            error = exception.SocketErrorCode;
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            error = SocketError.OperationAborted;
+                        }
+                    });
+                    reader.IsBackground = true;
+                    reader.Start();
+                    try
+                    {
+                        // Wait until the blocking poll has acquired its SafeHandle reference.
+                        Assert.True(SpinWait.SpinUntil(
+                            () => (int)stateField.GetValue(receiver.SafeHandle)! > initialState,
+                            TestSettings.PassingTestTimeout));
+                        if (bool.Parse(closeText))
+                        {
+                            receiver.SafeHandle.Dispose();
+                        }
+                        else
+                        {
+                            receiver.Dispose();
+                        }
+
+                        Assert.True(reader.Join(TestSettings.PassingTestTimeout));
+                        Assert.Contains(error, new[] { SocketError.OperationAborted, SocketError.ConnectionAborted });
+                    }
+                    finally
+                    {
+                        sender.Dispose();
+                        reader.Join(TestSettings.PassingTestTimeout);
+                    }
+                }
+            }, closeHandle.ToString(), CreateOptions(1)).Dispose();
         }
 
         [ConditionalTheory(nameof(IsSupported))]
@@ -1695,6 +1833,184 @@ namespace System.Net.Sockets.Tests
                     completed.Task.WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
                 }
             }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Multishot_EmptyDatagramDoesNotEndReceive()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                using Socket receiver = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                using Socket sender = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                receiver.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+                sender.Connect(receiver.LocalEndPoint!);
+                using CancellationTokenSource cancellation = new(TestSettings.PassingTestTimeout);
+                await using IAsyncEnumerator<IMemoryOwner<byte>> reader =
+                    receiver.ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                Task<bool> next = reader.MoveNextAsync().AsTask();
+                Assert.Equal(0, sender.Send(Array.Empty<byte>()));
+                Assert.True(await next.WaitAsync(TestSettings.PassingTestTimeout));
+                using (IMemoryOwner<byte> empty = reader.Current)
+                {
+                    Assert.True(empty.Memory.IsEmpty);
+                }
+                Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                using IMemoryOwner<byte> data = reader.Current;
+                Assert.Equal(new byte[] { 42 }, data.Memory.ToArray());
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData("return")]
+        [InlineData("cancel")]
+        [InlineData("dispose")]
+        public void Multishot_ExhaustedPoolParksUntilReturnOrCancellation(string ending)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "1";
+            RemoteExecutor.Invoke(async ending =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (SemaphoreSlim available = new(0))
+                {
+                    ConcurrentQueue<IMemoryOwner<byte>> buffers = new();
+                    TaskCompletionSource<int> completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    {
+                        if (buffer is not null)
+                        {
+                            buffers.Enqueue(buffer);
+                            available.Release();
+                        }
+                        if (!more)
+                        {
+                            completed.SetResult(result);
+                        }
+                    }, out IoUringOperation operation));
+                    System.Reflection.FieldInfo tokenField = typeof(IoUringOperation).GetField("_nativeToken",
+                        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+                    ulong initialToken = (ulong)tokenField.GetValue(operation)!;
+                    IMemoryOwner<byte>? retained = null;
+                    try
+                    {
+                        Assert.Equal(1, sender.Send(new byte[] { 1 }));
+                        Assert.True(await available.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.True(buffers.TryDequeue(out retained));
+                        Assert.Equal(1, sender.Send(new byte[] { 2 }));
+                        Assert.True(SpinWait.SpinUntil(() => (ulong)tokenField.GetValue(operation)! != initialToken,
+                            TestSettings.PassingTestTimeout));
+                        await Task.Delay(100);
+                        ulong parkedToken = (ulong)tokenField.GetValue(operation)!;
+                        await Task.Delay(200);
+                        Assert.Equal(parkedToken, (ulong)tokenField.GetValue(operation)!);
+                        Assert.False(completed.Task.IsCompleted);
+
+                        IoUringOperation[] waiters = new IoUringOperation[3];
+                        TaskCompletionSource<int>[] waiterCompletions = new TaskCompletionSource<int>[3];
+                        for (int i = 0; i < waiters.Length; i++)
+                        {
+                            TaskCompletionSource<int> waiterCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                            waiterCompletions[i] = waiterCompleted;
+                            Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                            {
+                                buffer?.Dispose();
+                                if (!more)
+                                {
+                                    waiterCompleted.SetResult(result);
+                                }
+                            }, out waiters[i]));
+                        }
+                        System.Reflection.FieldInfo linkedField = typeof(IoUringOperation).GetField("_linked",
+                            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+                        foreach (IoUringOperation waiter in waiters)
+                        {
+                            Assert.True(SpinWait.SpinUntil(() => (bool)linkedField.GetValue(waiter)!,
+                                TestSettings.PassingTestTimeout));
+                        }
+                        foreach (int index in new[] { 1, 0, 2 })
+                        {
+                            waiters[index].RequestCancellation();
+                            Assert.True(await waiterCompletions[index].Task.WaitAsync(TestSettings.PassingTestTimeout) < 0);
+                        }
+
+                        Assert.Equal(1, await receiver.SendAsync(new byte[] { 3 }, SocketFlags.None));
+                        byte[] reply = new byte[1];
+                        Assert.Equal(1, await sender.ReceiveAsync(reply, SocketFlags.None));
+                        Assert.Equal(3, reply[0]);
+
+                        if (ending == "return")
+                        {
+                            retained.Dispose();
+                            Assert.True(await available.WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.True(buffers.TryDequeue(out IMemoryOwner<byte> resumed));
+                            using (resumed)
+                            {
+                                Assert.Equal(new byte[] { 2 }, resumed.Memory.ToArray());
+                            }
+                        }
+                        else if (ending == "dispose")
+                        {
+                            receiver.Dispose();
+                        }
+                        operation.RequestCancellation();
+                        Assert.True(await completed.Task.WaitAsync(TestSettings.PassingTestTimeout) < 0);
+                        if (ending != "return")
+                        {
+                            Assert.Equal(new byte[] { 1 }, retained.Memory.ToArray());
+                        }
+                    }
+                    finally
+                    {
+                        operation.RequestCancellation();
+                        retained?.Dispose();
+                        await completed.Task.WaitAsync(TestSettings.PassingTestTimeout);
+                        while (buffers.TryDequeue(out IMemoryOwner<byte> buffer))
+                        {
+                            buffer.Dispose();
+                        }
+                    }
+                }
+            }, ending, options).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Multishot_DisposeOldLeaseDoesNotReturnReusedBuffer()
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "1";
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_SIZE"] = "128";
+            RemoteExecutor.Invoke(async () =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (CancellationTokenSource cancellation = new CancellationTokenSource(TestSettings.PassingTestTimeout))
+                {
+                    await using IAsyncEnumerator<IMemoryOwner<byte>> reader =
+                        receiver.ReceiveMultishotAsync(cancellation.Token).GetAsyncEnumerator();
+                    sender.Send(new byte[] { 1 });
+                    Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                    IMemoryOwner<byte> first = reader.Current;
+                    first.Dispose();
+                    sender.Send(new byte[] { 2 });
+                    Assert.True(await reader.MoveNextAsync().AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                    using IMemoryOwner<byte> second = reader.Current;
+                    Assert.NotSame(first, second);
+                    first.Dispose();
+                    Assert.Throws<ObjectDisposedException>(() => first.Memory);
+                    sender.Send(new byte[] { 3 });
+                    Task<bool> next = reader.MoveNextAsync().AsTask();
+                    Assert.False(next.IsCompleted);
+                    Assert.Equal(2, second.Memory.Span[0]);
+                    second.Dispose();
+                    Assert.True(await next.WaitAsync(TestSettings.PassingTestTimeout));
+                    using IMemoryOwner<byte> third = reader.Current;
+                    Assert.Equal(3, third.Memory.Span[0]);
+                }
+            }, options).Dispose();
         }
 
         [ConditionalFact(nameof(IsSupported))]

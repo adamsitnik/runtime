@@ -126,6 +126,8 @@ namespace System.Threading
         Receive = 6,
         Send = 7,
         SendGather = 10,
+        PollRead = 11,
+        PollWrite = 12,
     }
     [System.CLSCompliantAttribute(false)]
     public readonly unsafe struct IoUringRequest

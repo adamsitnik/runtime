@@ -113,7 +113,7 @@ namespace System.Threading
         /// <summary>
         /// Attempts to submit an <c>accept(2)</c>-like operation on the listening socket
         /// <paramref name="handle"/>. On completion, <paramref name="onCompleted"/> is invoked with
-        /// either the new connected socket's file descriptor (&gt;= 0) or <c>-errno</c> on failure;
+        /// either the new connected socket's close-on-exec file descriptor (&gt;= 0) or <c>-errno</c> on failure;
         /// <paramref name="sockAddr"/>/<paramref name="sockAddrLen"/> receive the peer's address, and
         /// must remain valid/pinned until then. See <see cref="TrySubmitRecv"/> for the general
         /// submission/lifetime contract.
@@ -139,11 +139,14 @@ namespace System.Threading
         /// completing exactly once like <see cref="TrySubmitRecv"/>. Received data is delivered via
         /// kernel-provided buffers leased from a pool, rather than a caller-supplied buffer:
         /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
-        /// completion, with the raw result (bytes received, <c>0</c> on graceful EOF, or <c>-errno</c> on
+        /// completion, with the raw result (bytes received, <c>0</c> on stream EOF or an empty datagram, or <c>-errno</c> on
         /// failure), the received data (dispose it to return the buffer to the pool;
         /// <see langword="null"/> when no data accompanies this completion), and whether the operation is
         /// still alive and will keep producing further completions. Native submissions can be rearmed
         /// transparently; only the logical operation's last callback reports <see langword="false"/>.
+        /// Empty datagrams have an empty, non-null buffer and do not end the operation.
+        /// If all provided buffers are retained, reception waits until a consumer returns a buffer;
+        /// cancellation and handle disposal still stop the waiting operation.
         /// <paramref name="handle"/> is ref-counted while each native submission is in flight.
         /// Returns <see langword="false"/> if the
         /// operation could not be submitted (in which case <paramref name="operation"/> is

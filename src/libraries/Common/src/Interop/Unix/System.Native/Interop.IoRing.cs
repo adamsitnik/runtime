@@ -22,6 +22,8 @@ internal static partial class Interop
             Cancel = 8,
             RecvMultishot = 9,
             SendMsg = 10,
+            PollRead = 11,
+            PollWrite = 12,
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
@@ -63,6 +65,10 @@ internal static partial class Interop
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsAvailable")]
         internal static partial int IoRingIsAvailable();
+
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_GetSocketType")]
+        internal static partial Error GetIoRingSocketType(SafeHandle socket, out int addressFamily,
+            out int socketType, out int protocolType, out int isListening);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreateSendMessage")]
         internal static unsafe partial byte* IoRingCreateSendMessage(IntPtr socket, IOVector* vectors, int vectorCount);

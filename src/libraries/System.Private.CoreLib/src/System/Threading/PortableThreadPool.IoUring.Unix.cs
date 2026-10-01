@@ -4,6 +4,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 
 namespace System.Threading
@@ -269,114 +270,137 @@ namespace System.Threading
                 int ringCount = GetRingCount();
                 int receiveBufferSize = GetReceiveBufferSize();
                 int receiveBufferCount = GetReceiveBufferCount();
-                var rings = new Ring[ringCount];
-                bool allCreated = true;
+                Ring[] rings = new Ring[ringCount];
+                object initializationLock = new object();
+                int pendingIssuers = 0;
+                bool initializationFinished = false;
+                bool committed = false;
 
-                for (int i = 0; i < ringCount; i++)
+                try
                 {
-                    // The ring itself cannot be created here (on this, the static constructor's own
-                    // thread): IORING_SETUP_SINGLE_ISSUER binds a ring's single fixed owning thread to
-                    // whichever thread calls io_uring_setup(2) - *not* to whichever thread happens to make
-                    // the first io_uring_enter(2) call, as originally (incorrectly) assumed. This was
-                    // confirmed empirically with a standalone native repro: a second thread's very first
-                    // io_uring_enter call on a ring created by another thread fails with -EEXIST
-                    // immediately, even though it is that second thread's first-ever call on the ring. So
-                    // each ring must be created by the same dedicated thread that will go on to be the one
-                    // and only thread ever calling IoRingSubmit/IoRingKick/IoRingWaitForCompletions for it
-                    // - i.e., by a new, dedicated issuer thread, as the very first thing it does.
-                    //
-                    // The handshake below is deliberately written to avoid touching any static member of
-                    // IoUringThreadPool from the new thread: the CLR only allows the thread that is
-                    // currently running a type's static constructor to freely access that type's own
-                    // static members while doing so; any *other* thread's attempt to access them
-                    // (including merely calling one of the type's other static methods, such as
-                    // IssuerLoop) blocks until the constructor completes. The new thread is instead only
-                    // ever given a reference to its own (non-static) Ring instance - assigning that
-                    // object's own instance fields (RingHandle, WakeEventFd) from the new thread is safe,
-                    // since those are not static members of IoUringThreadPool. Only this thread - which is
-                    // allowed to, since it is the one actually running the static constructor - assigns
-                    // s_isEnabled/s_rings themselves, once every ring's handshake completes.
-                    using ManualResetEventSlim readyToRun = new(initialState: false);
-                    var ring = new Ring(i);
-                    bool created = false;
-
-                    var issuerThread = new Thread(() =>
+                    for (int i = 0; i < ringCount; i++)
                     {
-                        // singleIssuer: true - the whole point of this architecture is that only this
-                        // thread (which just called io_uring_setup(2) here, and will be the only thread
-                        // that ever touches this ring from now on) ever touches it, so the kernel can skip
-                        // its internal ring-wide lock.
-                        int result = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, out IntPtr ringHandle);
-                        created = result == 0;
-                        ring.RingHandle = ringHandle;
+                        Ring ring = new Ring(i);
+                        bool ready = false;
+                        bool created = false;
+                        Exception? initializationError = null;
 
-                        if (created)
+                        // SINGLE_ISSUER requires creation on the permanent issuer. Until the
+                        // handshake ends, this thread must not call our static methods: they
+                        // wait for this type initializer, which is waiting for the handshake.
+                        Thread issuerThread = new Thread(() =>
                         {
-                            ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ring.RingHandle);
-                            created = ring.WakeEventFd >= 0;
-                        }
-
-                        if (created)
-                        {
-                            // Registers this ring's provided-buffer group zero for RecvMultishot. Per
-                            // the mandatory HAVE_LINUX_IO_URING_H check (see configure.cmake), a kernel
-                            // that supports io_uring at all also supports this - so a failure here is
-                            // treated exactly like a failure to create the ring or register its eventfd:
-                            // this ring (and, transitively, the whole io_uring integration - see
-                            // s_isEnabled below) is abandoned in favor of the non-io_uring fallback path.
-                            unsafe
+                            try
                             {
-                                byte* bufferStorage = null;
-                                int registerResult = Interop.Sys.IoRingRegisterBufferRing(
-                                    ring.RingHandle, receiveBufferSize, receiveBufferCount, &bufferStorage);
-                                created = registerResult == 0;
+                                // Naming another pthread opens /proc; naming ourselves still
+                                // works when initialization is failing from descriptor exhaustion.
+                                Thread.CurrentThread.Name = $".NET IoUring Issuer #{ring.Index}";
+                                created = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, out IntPtr ringHandle) == 0;
+                                ring.RingHandle = ringHandle;
                                 if (created)
                                 {
-                                    ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, bufferStorage);
+                                    ring.WakeEventFd = Interop.Sys.IoRingRegisterEventFd(ringHandle);
+                                    created = ring.WakeEventFd >= 0;
                                 }
+                                if (created)
+                                {
+                                    unsafe
+                                    {
+                                        byte* storage = null;
+                                        created = Interop.Sys.IoRingRegisterBufferRing(
+                                            ringHandle, receiveBufferSize, receiveBufferCount, &storage) == 0;
+                                        if (created)
+                                        {
+                                            ring.ReceiveBuffers = new ReceiveBufferPool(ring, receiveBufferSize, receiveBufferCount, storage);
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception error)
+                            {
+                                initializationError = error;
+                                created = false;
+                            }
+
+                            bool run;
+                            lock (initializationLock)
+                            {
+                                ready = true;
+                                Monitor.PulseAll(initializationLock);
+                                while (!initializationFinished)
+                                {
+                                    Monitor.Wait(initializationLock);
+                                }
+                                run = committed && created;
+                            }
+
+                            if (!run && ring.RingHandle != IntPtr.Zero)
+                            {
+                                if (Interop.Sys.IoRingClose(ring.RingHandle) != 0)
+                                {
+                                    Environment.FailFast($"io_uring initialization cleanup failed: {Marshal.GetLastPInvokeError()}.");
+                                }
+                                ring.RingHandle = IntPtr.Zero;
+                            }
+
+                            lock (initializationLock)
+                            {
+                                pendingIssuers--;
+                                Monitor.PulseAll(initializationLock);
+                            }
+                            if (run)
+                            {
+                                IssuerLoop(ring);
+                            }
+                        })
+                        {
+                            IsBackground = true,
+                        };
+
+                        lock (initializationLock)
+                        {
+                            pendingIssuers++;
+                            try
+                            {
+                                issuerThread.UnsafeStart();
+                            }
+                            catch
+                            {
+                                pendingIssuers--;
+                                throw;
+                            }
+                            while (!ready)
+                            {
+                                Monitor.Wait(initializationLock);
                             }
                         }
 
-                        readyToRun.Set();
-
-                        if (created)
+                        if (initializationError is not null)
                         {
-                            // IssuerLoop is a member of IoUringThreadPool, so entering it may briefly
-                            // block this thread here until the static constructor - which is waiting on
-                            // readyToRun.Wait() right after starting this thread - observes the Set()
-                            // above and moves on. That is expected, bounded, and not a deadlock: by this
-                            // point the constructor no longer depends on this thread for anything, so it
-                            // (and every other ring's handshake still pending) will finish and return
-                            // almost immediately, unblocking this call.
-                            IssuerLoop(ring);
+                            ExceptionDispatchInfo.Throw(initializationError);
                         }
-                    })
-                    {
-                        IsBackground = true,
-                        Name = $".NET IoUring Issuer #{i}",
-                    };
-                    issuerThread.Start();
-
-                    // Block until this ring's issuer thread has created it (or failed to) before moving
-                    // on to the next ring. This keeps the external contract identical to every other
-                    // io_uring architecture in this codebase: once the static constructor returns,
-                    // IsEnabled/Enqueue are immediately usable with their final, fully-initialized
-                    // values, regardless of which thread(s) actually performed ring creation.
-                    readyToRun.Wait();
-
-                    if (!created)
-                    {
-                        allCreated = false;
-                        break;
+                        if (!created)
+                        {
+                            return;
+                        }
+                        rings[i] = ring;
                     }
 
-                    rings[i] = ring;
-                }
-
-                s_isEnabled = allCreated;
-                if (allCreated)
-                {
                     s_rings = rings;
+                    s_isEnabled = true;
+                    committed = true;
+                }
+                finally
+                {
+                    lock (initializationLock)
+                    {
+                        initializationFinished = true;
+                        Monitor.PulseAll(initializationLock);
+                        while (pendingIssuers != 0)
+                        {
+                            Monitor.Wait(initializationLock);
+                        }
+                    }
                 }
             }
 #pragma warning restore CA1810
@@ -567,7 +591,7 @@ namespace System.Threading
                 Volatile.Read(ref ring.PendingCancellations) is not null ||
                 Volatile.Read(ref ring.PendingClosing) is not null;
 
-            private static void LinkOperation(IoUringOperation operation)
+            private static void LinkOperation(IoUringOperation operation, bool published = true)
             {
                 IoRingBoundHandle binding = operation._binding!;
                 operation._previous = null;
@@ -578,7 +602,7 @@ namespace System.Threading
                 }
                 binding._operations = operation;
                 operation._linked = true;
-                operation._published = true;
+                operation._published = published;
             }
 
             private static void UnlinkOperation(IoUringOperation operation)
@@ -637,8 +661,15 @@ namespace System.Threading
 
                 void StageCancellation(IoUringOperation operation)
                 {
-                    if (!operation._published || !operation._linked)
+                    if (!operation._linked)
                     {
+                        return;
+                    }
+                    if (!operation._published)
+                    {
+                        Debug.Assert(operation is MultishotReceiveOperation);
+                        ring.ReceiveBuffers!.RemoveWaiter((MultishotReceiveOperation)operation);
+                        CompleteUnpublished(ring, operation, operation._nativeToken);
                         return;
                     }
                     ring.CancellationBatch[count++] = new Interop.Sys.IoRingRequest
@@ -702,13 +733,12 @@ namespace System.Threading
                     DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch, workItemBatch);
                     bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
 
-                    // Opportunistic only: a ReceiveBufferLease.Dispose() on any other thread never wakes
-                    // this issuer just to return one buffer - return bits remain set until this thread
-                    // is next awake anyway (e.g. for a completion or submission),
-                    // at which point republishing them costs no syscall (see IoRingReturnBuffers).
+                    // Returns are normally opportunistic. A return wakes the issuer only when
+                    // a receive is parked waiting for a buffer.
                     ring.ReceiveBuffers!.DrainReturns(bufferReturnBatch);
 
-                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty || HasControlWork(ring))
+                    if (moreCompletions || !ring.PendingSubmissions.IsEmpty || HasControlWork(ring) ||
+                        ring.ReceiveBuffers.HasReadyWaiters)
                     {
                         // Something was enqueued while we were draining; go around again immediately
                         // instead of waiting.
@@ -723,7 +753,8 @@ namespace System.Threading
                     // recheck below is what catches that case and avoids a missed wake-up, instead of
                     // relying on the write that thread decided not to do.
                     Interlocked.Exchange(ref ring.WakeSignaled, 0);
-                    if (!ring.PendingSubmissions.IsEmpty || HasControlWork(ring))
+                    if (!ring.PendingSubmissions.IsEmpty || HasControlWork(ring) ||
+                        ring.ReceiveBuffers.HasPendingReturns || ring.ReceiveBuffers.HasReadyWaiters)
                     {
                         continue;
                     }
@@ -744,7 +775,9 @@ namespace System.Threading
                 Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
             {
                 int count = 0;
-                while (count < batch.Length && ring.PendingSubmissions.TryDequeue(out Interop.Sys.IoRingRequest request))
+                while (count < batch.Length &&
+                    (ring.ReceiveBuffers!.TryResume(out Interop.Sys.IoRingRequest request) ||
+                     ring.PendingSubmissions.TryDequeue(out request)))
                 {
                     batch[count++] = request;
                 }
@@ -783,33 +816,24 @@ namespace System.Threading
                     for (int i = 0; i < remaining; i++)
                     {
                         Interop.Sys.IoRingRequest request = remainingPtr[i];
-                        if (request.UserData != 0 &&
-                            PeekOperationToken(ring, request.UserData) is IoUringOperation operation &&
-                            operation.CancellationIsRequested)
+                        if (request.UserData != 0)
                         {
-                            ring.InFlightCount--;
-                            operation.RetireNative();
-                            long sequence = RetainOperationToken(ring, request.UserData);
-                            int canceledResult = -Interop.Sys.ConvertErrorPalToPlatform(Interop.Error.ECANCELED);
-                            if (operation is MultishotReceiveOperation multishot)
+                            IoUringOperation operation = PeekOperationToken(ring, request.UserData);
+                            if (operation.CancellationIsRequested)
                             {
-                                multishot.EnqueueFromIssuer(canceledResult, 0);
-                                ReleaseOperationToken(ring, request.UserData, isFinal: true);
+                                ring.InFlightCount--;
+                                CompleteUnpublished(ring, operation, request.UserData);
+                                continue;
                             }
-                            else
+                            if (operation is MultishotReceiveOperation multishot &&
+                                ring.ReceiveBuffers!.AvailableBuffers == 0)
                             {
-                                ring.CompletionQueue.Enqueue((new Interop.Sys.IoRingCompletion
-                                {
-                                    UserData = request.UserData,
-                                    Result = canceledResult
-                                }, sequence));
-                                ScheduleCompletionProcessing(ring);
+                                ring.InFlightCount--;
+                                ring.ReceiveBuffers.AddWaiter(multishot, in request);
+                                continue;
                             }
                         }
-                        else
-                        {
-                            remainingPtr[kept++] = request;
-                        }
+                        remainingPtr[kept++] = request;
                     }
                     remaining = kept;
                     if (remaining == 0)
@@ -850,6 +874,28 @@ namespace System.Threading
                     {
                         DrainControlWork(ring, completionsBatch, sequenceBatch, workItemBatch);
                     }
+                }
+            }
+
+            private static void CompleteUnpublished(Ring ring, IoUringOperation operation, ulong token)
+            {
+                Debug.Assert(!operation._published && !operation._linked);
+                operation.RetireNative();
+                long sequence = RetainOperationToken(ring, token);
+                int canceledResult = -Interop.Sys.ConvertErrorPalToPlatform(Interop.Error.ECANCELED);
+                if (operation is MultishotReceiveOperation multishot)
+                {
+                    multishot.EnqueueFromIssuer(canceledResult, 0);
+                    ReleaseOperationToken(ring, token, isFinal: true);
+                }
+                else
+                {
+                    ring.CompletionQueue.Enqueue((new Interop.Sys.IoRingCompletion
+                    {
+                        UserData = token,
+                        Result = canceledResult
+                    }, sequence));
+                    ScheduleCompletionProcessing(ring);
                 }
             }
 
@@ -934,6 +980,11 @@ namespace System.Threading
                         // out of order, across two different worker threads.
                         if (operation is MultishotReceiveOperation multishotReceive)
                         {
+                            if ((completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0)
+                            {
+                                Debug.Assert(ring.ReceiveBuffers!.AvailableBuffers > 0);
+                                ring.ReceiveBuffers.AvailableBuffers--;
+                            }
                             multishotReceive.EnqueueFromIssuer(completion.Result, completion.Flags);
                             if (isFinal)
                             {

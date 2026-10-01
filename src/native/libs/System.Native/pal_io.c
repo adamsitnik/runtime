@@ -2334,7 +2334,7 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->opcode = IORING_OP_ACCEPT;
             sqe->addr = (uint64_t)(uintptr_t)request->SockAddr;
             sqe->off = (uint64_t)(uintptr_t)request->SockAddrLen;
-            sqe->accept_flags = (uint32_t)request->Flags;
+            sqe->accept_flags = (uint32_t)request->Flags | SOCK_CLOEXEC;
             break;
         case IoRingOp_Connect:
             // addr = input sockaddr*, off (aliased with addr2) = input addrlen (by value, not a
@@ -2372,6 +2372,11 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 #if defined(IORING_RECVSEND_POLL_FIRST)
             sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
 #endif
+            break;
+        case IoRingOp_PollRead:
+        case IoRingOp_PollWrite:
+            sqe->opcode = IORING_OP_POLL_ADD;
+            sqe->poll_events = request->OpCode == IoRingOp_PollRead ? POLLIN : POLLOUT;
             break;
         case IoRingOp_Cancel:
             // Targets a still-pending request by its own user_data (addr), looked up within this
