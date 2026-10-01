@@ -36,44 +36,66 @@ namespace Microsoft.Win32.SafeHandles
 
             partial void TryQueueAsync(ref bool queued)
             {
-                queued = _operation switch
+                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
                 {
-                    Operation.Read => TrySubmitRead(),
-                    Operation.Write => TrySubmitWrite(),
-                    Operation.ReadScatter => TrySubmitReadScatter(),
-                    Operation.WriteGather => TrySubmitWriteGather(),
-                    _ => false
-                };
+                    return;
+                }
+
+                try
+                {
+                    // Empty lists keep the existing worker path, before any pinning or binding.
+                    if ((_operation == Operation.ReadScatter && _readScatterBuffers!.Count == 0) ||
+                        (_operation == Operation.WriteGather && _writeGatherBuffers!.Count == 0))
+                    {
+                        return;
+                    }
+
+                    if (_operation is Operation.Read or Operation.Write)
+                    {
+                        SubmitSingleSegment();
+                    }
+                    else
+                    {
+                        Debug.Assert(_operation is Operation.ReadScatter or Operation.WriteGather);
+                        SubmitVectors();
+                    }
+                    queued = true;
+                }
+                catch (Exception error)
+                {
+                    // Fault the returned ValueTask through ExecuteInternal, including FileStream
+                    // position correction. Do not retry a failed submission as blocking I/O.
+                    _ioUringSubmissionError = error;
+                }
             }
 
             partial void TryCompleteAsync(ref bool completed, ref long result, ref Exception? exception)
             {
+                if (_ioUringSubmissionError is null && !_completedViaIoUring)
+                {
+                    return;
+                }
+
+                completed = true;
                 try
                 {
+                    // A failed enqueue never published native work; otherwise its terminal CQE
+                    // has already retired. Both paths release partially or fully acquired state here.
+                    ReleaseIoUringState();
                     if (_ioUringSubmissionError is not null)
                     {
-                        completed = true;
-                        ReleaseIoUringState();
                         exception = _ioUringSubmissionError;
                     }
-                    else if (_completedViaIoUring)
+                    else if (_ioUringResult < 0)
                     {
-                        completed = true;
-                        // The kernel already read from / wrote to the pinned buffer(s) directly; release
-                        // the pins/ref now that the operation has fully completed (successfully or not).
-                        ReleaseIoUringState();
-
-                        if (_ioUringResult < 0)
-                        {
-                            exception = new Interop.ErrorInfo(-_ioUringResult).Error == Interop.Error.ECANCELED &&
-                                _cancellationToken.IsCancellationRequested
-                                ? new OperationCanceledException(_cancellationToken)
-                                : Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(-_ioUringResult), _fileHandle.Path);
-                        }
-                        else
-                        {
-                            result = _ioUringResult;
-                        }
+                        exception = new Interop.ErrorInfo(-_ioUringResult).Error == Interop.Error.ECANCELED &&
+                            _cancellationToken.IsCancellationRequested
+                            ? new OperationCanceledException(_cancellationToken)
+                            : Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(-_ioUringResult), _fileHandle.Path);
+                    }
+                    else
+                    {
+                        result = _ioUringResult;
                     }
                 }
                 finally
@@ -169,7 +191,8 @@ namespace Microsoft.Win32.SafeHandles
             /// requested by the most recent submission), advances the write state and attempts to
             /// resubmit an io_uring request for the remainder. Returns true if the result was partial.
             /// <paramref name="completionWorkItem"/> is null when a continuation was accepted, or
-            /// this instance when cancellation or a submission error must be delivered instead.
+            /// this instance when cancellation or a zero-progress write must be delivered instead.
+            /// Submission exceptions propagate to the completion handler.
             /// </summary>
             private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? completionWorkItem)
             {
@@ -190,7 +213,7 @@ namespace Microsoft.Win32.SafeHandles
                         return true;
                     }
 
-                    // The old pin is no longer valid once we reslice; TrySubmitWrite re-pins the
+                    // The old pin is no longer valid once we reslice; SubmitSingleSegment re-pins the
                     // remainder. _context was already captured when the operation was originally queued.
                     _singleSegmentPin.Dispose();
                     _singleSegmentPin = default;
@@ -200,10 +223,7 @@ namespace Microsoft.Win32.SafeHandles
                         _fileHandleRefAdded = false;
                     }
 
-                    if (!TrySubmitWrite())
-                    {
-                        completionWorkItem = this;
-                    }
+                    SubmitSingleSegment();
 
                     return true;
                 }
@@ -232,10 +252,7 @@ namespace Microsoft.Win32.SafeHandles
                         _fileHandleRefAdded = false;
                     }
 
-                    if (!TrySubmitWriteGatherRemainder())
-                    {
-                        completionWorkItem = this;
-                    }
+                    SubmitVectorRequest();
 
                     return true;
                 }
@@ -290,283 +307,70 @@ namespace Microsoft.Win32.SafeHandles
                 }
             }
 
-            private unsafe bool TrySubmitRead()
+            private unsafe void SubmitSingleSegment()
             {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
+                Debug.Assert(_operation is Operation.Read or Operation.Write);
+                Debug.Assert(!_fileHandleRefAdded);
+                _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
+                _singleSegmentPin = _singleSegment.Pin();
 
-                bool refAdded = false;
-                try
-                {
-                    _fileHandle.DangerousAddRef(ref refAdded);
-                    _singleSegmentPin = _singleSegment.Pin();
+                Interop.Sys.IoRingRequest request = default;
+                request.OpCode = _operation == Operation.Read ? Interop.Sys.IoRingOp.Read : Interop.Sys.IoRingOp.Write;
+                request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
+                request.Buffer = (byte*)_singleSegmentPin.Pointer;
+                request.BufferLength = _singleSegment.Length;
 
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.Read;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Buffer = (byte*)_singleSegmentPin.Pointer;
-                    request.BufferLength = _singleSegment.Length;
-
-                    // Completion may run as soon as the request is published.
-                    _fileHandleRefAdded = refAdded;
-                    EnqueueIoUring(in request);
-                    return true;
-                }
-                catch (Exception error)
-                {
-                    _ioUringSubmissionError = error;
-                }
-
-                _singleSegmentPin.Dispose();
-                _singleSegmentPin = default;
-                _fileHandleRefAdded = false;
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
+                // Publish all ownership state before the request can complete on another worker.
+                EnqueueIoUring(in request);
             }
 
-            private unsafe bool TrySubmitWrite()
+            private unsafe void SubmitVectors()
             {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
+                bool write = _operation == Operation.WriteGather;
+                int count = write ? _writeGatherBuffers!.Count : _readScatterBuffers!.Count;
+                Debug.Assert(count > 0);
 
-                bool refAdded = false;
-                try
-                {
-                    _fileHandle.DangerousAddRef(ref refAdded);
-                    _singleSegmentPin = _singleSegment.Pin();
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.Write;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Buffer = (byte*)_singleSegmentPin.Pointer;
-                    request.BufferLength = _singleSegment.Length;
-
-                    _fileHandleRefAdded = refAdded;
-                    EnqueueIoUring(in request);
-                    return true;
-                }
-                catch (Exception error)
-                {
-                    _ioUringSubmissionError = error;
-                }
-
-                _singleSegmentPin.Dispose();
-                _singleSegmentPin = default;
-                _fileHandleRefAdded = false;
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
-            }
-
-            private unsafe bool TrySubmitReadScatter()
-            {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
-
-                Debug.Assert(_readScatterBuffers != null);
-                int count = _readScatterBuffers.Count;
-                if (count == 0)
-                {
-                    return false;
-                }
-
-                bool refAdded = false;
-                MemoryHandle[] pins = new MemoryHandle[count];
-                Interop.Sys.IOVector[] vectors = new Interop.Sys.IOVector[count];
-                GCHandle vectorsHandle = default;
-                int pinned = 0;
-                try
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        Memory<byte> buffer = _readScatterBuffers[i];
-                        MemoryHandle pin = buffer.Pin();
-                        pins[i] = pin;
-                        pinned = i + 1;
-                        vectors[i] = new Interop.Sys.IOVector { Base = (byte*)pin.Pointer, Count = (UIntPtr)buffer.Length };
-                    }
-
-                    vectorsHandle = GCHandle.Alloc(vectors, GCHandleType.Pinned);
-                    _fileHandle.DangerousAddRef(ref refAdded);
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.ReadV;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Vectors = (Interop.Sys.IOVector*)vectorsHandle.AddrOfPinnedObject();
-                    request.VectorCount = count;
-
-                    _vectorPins = pins;
-                    _vectors = vectors;
-                    _vectorsHandle = vectorsHandle;
-                    _fileHandleRefAdded = refAdded;
-                    EnqueueIoUring(in request);
-                    return true;
-                }
-                catch (Exception error)
-                {
-                    _ioUringSubmissionError = error;
-                }
-
-                _vectorPins = null;
-                _vectors = null;
-                _vectorsHandle = default;
-                _fileHandleRefAdded = false;
-                if (vectorsHandle.IsAllocated)
-                {
-                    vectorsHandle.Free();
-                }
-                for (int i = 0; i < pinned; i++)
-                {
-                    pins[i].Dispose();
-                }
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
-            }
-
-            private unsafe bool TrySubmitWriteGather()
-            {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
-
-                Debug.Assert(_writeGatherBuffers != null);
-                int count = _writeGatherBuffers.Count;
-                if (count == 0)
-                {
-                    return false;
-                }
-
-                bool refAdded = false;
-                MemoryHandle[] pins = new MemoryHandle[count];
-                Interop.Sys.IOVector[] vectors = new Interop.Sys.IOVector[count];
-                GCHandle vectorsHandle = default;
-                int pinned = 0;
-                try
-                {
-                    long totalBytesToWrite = 0;
-                    for (int i = 0; i < count; i++)
-                    {
-                        ReadOnlyMemory<byte> buffer = _writeGatherBuffers[i];
-                        totalBytesToWrite += buffer.Length;
-
-                        MemoryHandle pin = buffer.Pin();
-                        pins[i] = pin;
-                        pinned = i + 1;
-                        vectors[i] = new Interop.Sys.IOVector { Base = (byte*)pin.Pointer, Count = (UIntPtr)buffer.Length };
-                    }
-
-                    vectorsHandle = GCHandle.Alloc(vectors, GCHandleType.Pinned);
-                    _fileHandle.DangerousAddRef(ref refAdded);
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.WriteV;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Vectors = (Interop.Sys.IOVector*)vectorsHandle.AddrOfPinnedObject();
-                    request.VectorCount = count;
-
-                    _vectorPins = pins;
-                    _vectors = vectors;
-                    _vectorsHandle = vectorsHandle;
-                    _vectorsOffset = 0;
-                    _remainingBytesToWrite = totalBytesToWrite;
-                    _fileHandleRefAdded = refAdded;
-                    EnqueueIoUring(in request);
-                    return true;
-                }
-                catch (Exception error)
-                {
-                    _ioUringSubmissionError = error;
-                }
-
-                _vectorPins = null;
-                _vectors = null;
-                _vectorsHandle = default;
+                // Store ownership incrementally so the common completion cleanup also handles
+                // a failed allocation or a MemoryManager throwing partway through pinning.
+                _vectorPins = new MemoryHandle[count];
+                _vectors = new Interop.Sys.IOVector[count];
                 _vectorsOffset = 0;
-                _remainingBytesToWrite = 0;
-                _fileHandleRefAdded = false;
-                if (vectorsHandle.IsAllocated)
+                long totalBytes = 0;
+                for (int i = 0; i < count; i++)
                 {
-                    vectorsHandle.Free();
+                    ReadOnlyMemory<byte> buffer = write ? _writeGatherBuffers![i] : _readScatterBuffers![i];
+                    _vectorPins[i] = buffer.Pin();
+                    _vectors[i] = new Interop.Sys.IOVector { Base = (byte*)_vectorPins[i].Pointer, Count = (UIntPtr)buffer.Length };
+                    totalBytes += buffer.Length;
                 }
-                for (int i = 0; i < pinned; i++)
-                {
-                    pins[i].Dispose();
-                }
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
+
+                _remainingBytesToWrite = totalBytes;
+                _vectorsHandle = GCHandle.Alloc(_vectors, GCHandleType.Pinned);
+                SubmitVectorRequest();
             }
 
             /// <summary>
-            /// Resubmits the remaining (not-yet-written) portion of a WriteGather operation. Reuses the
-            /// already-pinned <see cref="_vectorsHandle"/>/<see cref="_vectorPins"/> from the original
-            /// submission (never freed/re-pinned between partial-write retries - only the request's
-            /// window into the same pinned array changes), advanced by
-            /// <see cref="AdvanceVectorsAfterPartialWrite"/>.
+            /// Enqueues the pinned vectors for a read or write. Partial writes reuse the same pins
+            /// and array with a window advanced by <see cref="AdvanceVectorsAfterPartialWrite"/>.
             /// </summary>
-            private unsafe bool TrySubmitWriteGatherRemainder()
+            private unsafe void SubmitVectorRequest()
             {
-                if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
-                {
-                    return false;
-                }
-
                 Debug.Assert(_vectors != null && _vectorPins != null && _vectorsHandle.IsAllocated);
                 int remainingCount = _vectors.Length - _vectorsOffset;
+                Debug.Assert(remainingCount > 0 && !_fileHandleRefAdded);
+                _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
 
-                bool refAdded = false;
-                try
-                {
-                    _fileHandle.DangerousAddRef(ref refAdded);
-
-                    Interop.Sys.IoRingRequest request = default;
-                    request.OpCode = Interop.Sys.IoRingOp.WriteV;
-                    request.Fd = _fileHandle.DangerousGetHandle();
-                    request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                    request.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
-                    request.VectorCount = remainingCount;
-
-                    _fileHandleRefAdded = refAdded;
-                    EnqueueIoUring(in request);
-                    return true;
-                }
-                catch (Exception error)
-                {
-                    _ioUringSubmissionError = error;
-                }
-
-                _fileHandleRefAdded = false;
-                if (refAdded)
-                {
-                    _fileHandle.DangerousRelease();
-                }
-                return false;
+                Interop.Sys.IoRingRequest request = default;
+                request.OpCode = _operation == Operation.ReadScatter ? Interop.Sys.IoRingOp.ReadV : Interop.Sys.IoRingOp.WriteV;
+                request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
+                request.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
+                request.VectorCount = remainingCount;
+                EnqueueIoUring(in request);
             }
 
             /// <summary>
-            /// Releases all pinning/ref-counting state associated with an outstanding (or just-completed)
-            /// io_uring submission. Safe to call even if no io_uring submission is currently outstanding.
+            /// Releases pinning/ref-counting state after an unpublished failure or terminal native
+            /// completion. Partially acquired state is valid; kernel-live state must never be released.
             /// </summary>
             private void ReleaseIoUringState()
             {
@@ -584,6 +388,8 @@ namespace Microsoft.Win32.SafeHandles
                     _vectorPins = null;
                 }
                 _vectors = null;
+                _vectorsOffset = 0;
+                _remainingBytesToWrite = 0;
 
                 _singleSegmentPin.Dispose();
                 _singleSegmentPin = default;

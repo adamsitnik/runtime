@@ -598,12 +598,12 @@ namespace System.Threading
             {
                 IoRingBoundHandle binding = operation._binding!;
                 operation._previous = null;
-                operation._next = binding._operations;
+                operation._next = binding._operationsHead;
                 if (operation._next is not null)
                 {
                     operation._next._previous = operation;
                 }
-                binding._operations = operation;
+                binding._operationsHead = operation;
                 operation._linked = true;
                 operation._published = published;
             }
@@ -616,7 +616,7 @@ namespace System.Threading
                 }
                 if (operation._previous is null)
                 {
-                    operation._binding!._operations = operation._next;
+                    operation._binding!._operationsHead = operation._next;
                 }
                 else
                 {
@@ -640,7 +640,7 @@ namespace System.Threading
                 {
                     IoRingBoundHandle? next = binding._nextClosing;
                     binding._nextClosing = null;
-                    while (binding._operations is IoUringOperation operation)
+                    while (binding._operationsHead is IoUringOperation operation)
                     {
                         StageCancellation(operation);
                     }

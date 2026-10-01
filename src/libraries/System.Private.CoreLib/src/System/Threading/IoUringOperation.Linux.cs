@@ -6,6 +6,44 @@ using System.Runtime.InteropServices;
 
 namespace System.Threading;
 
+// One instance represents a reusable logical operation, not just one SQE. For example, a socket
+// send pins its buffer once, begins one logical use, and can enqueue several native sends as
+// partial completions advance its offset. Cancellation must cover the whole use, while each
+// native request has its own token and retirement fence. Reuse must not let an old cancellation
+// or an intrusive control-list link affect the next use, possibly on another binding/ring.
+//
+// Begin atomically sets Active and advances the generation, rejecting concurrent use. Preparing
+// protects initialization of the binding and token registration: an already-canceled token can
+// invoke RequestCancellation immediately, before Begin has finished. RequestCancellationCore
+// sets CancellationRequested but defers publishing that control record until Preparing clears.
+// Its generation check also prevents an in-progress cancellation attempt from crossing reuse.
+// Binding disposal is observed as cancellation even without an individual token registration.
+//
+// PublishingCancellation covers the interval between setting the cancellation bit and linking
+// the control record. PublishCancellation queues it on the binding's original ring. The issuer
+// owns _previous/_next, _linked and _published; _nextCancellation/_cancellationQueued independently
+// track its cancellation-control record. Unpublished canceled work can be suppressed; published
+// work needs an exact-token cancel and its own terminal CQE. Neither requesting cancellation nor
+// completing the cancel command proves that the kernel has stopped accessing the buffers.
+//
+// AcquireNative/RetireNative enforce at most one native request at a time and balance the binding's
+// accepted-request count. Native retirement occurs on the issuer before worker delivery, so
+// synchronous close need not wait for a blocked worker. PrepareNative owns SENDMSG's native
+// header until retirement; ReleaseNativeHeader frees it on worker delivery or unpublished rollback.
+// The adapter, not this base class, owns the actual data pins and application-visible completion.
+//
+// CompleteFromIoUring records the result/flags/sequence for worker delivery. ExecuteCore releases
+// the retired header and calls the adapter's OnCompleted. A partial send can use
+// EnqueueContinuationCore to publish another native request without ending the logical use or
+// replacing its cancellation registration. TrackSend holds the binding's logical-send count
+// across that gap, so close still knows that unsent bytes remain.
+//
+// On final delivery the adapter calls CompleteOperationCore before returning this object to its
+// cache. It rejects live native work, disposes the token registration (waiting for callbacks),
+// waits for a cancellation publisher, sets Completing to prevent new publishers, and waits for
+// the issuer to retire any queued control record. Only then can it release logical-send tracking,
+// clear the binding and clear the state bits. The generation survives reuse. Abandon follows the
+// same logical cleanup when initial enqueue failed before publication, without a completion callback.
 public abstract partial class IoUringOperation
 {
     private const long Active = 1;

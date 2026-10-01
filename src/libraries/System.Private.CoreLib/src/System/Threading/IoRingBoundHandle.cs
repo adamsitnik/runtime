@@ -42,19 +42,4 @@ public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
     public bool DisposeAndWait() => DisposeAndWaitCore();
 
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
-
-#if !FEATURE_IO_URING
-    private IoRingBoundHandle() => throw new PlatformNotSupportedException();
-
-    private void EnqueueForSubmissionCore(IoUringOperation operation, CancellationToken cancellationToken) =>
-        throw new PlatformNotSupportedException();
-
-    private void DisposeCore()
-    {
-    }
-
-    private bool DisposeAndWaitCore() => throw new PlatformNotSupportedException();
-
-    private void ExecuteCore() => throw new PlatformNotSupportedException();
-#endif
 }

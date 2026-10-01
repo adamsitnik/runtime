@@ -17,6 +17,23 @@ namespace System.Net.Sockets
         private bool _ioUringReadinessRegistered;
         private IoUringBufferOperation? _bufferOperation;
 
+        // Each socket has separate receive and send queues, shared by synchronous calls,
+        // syscall-based async adapters and direct io_uring adapters. Direct kernel I/O must not
+        // bypass earlier work or let a later syscall consume its bytes. TryReserveForIoUringOperation
+        // therefore changes an empty Ready queue to Processing before pinning/enqueueing. The
+        // reservation represents ordering, not SQ publication; failure cleanup must release it too.
+        // Later operations join the normal queue. CompleteIoUringOperation releases the reservation
+        // and dispatches the next operation outside the queue lock, or returns the queue to Ready.
+        //
+        // Not every operation has a direct adapter (for example, addressed/flagged receives).
+        // Those still attempt a nonblocking syscall and enter Waiting on EAGAIN. In io_uring mode,
+        // EnsureIoUringReadiness arms a one-shot POLL_ADD instead of registering with epoll.
+        // HandleIoUringReadiness feeds its result into the existing queue processing path, which
+        // retries the syscall; a readiness completion is not a data-transfer completion.
+        // Synchronous waiters poll themselves, identified by IsWaitingSynchronously, rather than
+        // depending on a ThreadPool callback to unblock. Arming and dispatch run outside the lock
+        // because submission failures may notify the queue immediately and ultimately run user code.
+        // Queue fields stay with the Unix declaration to keep this struct's layout in one partial.
         private partial struct OperationQueue<TOperation>
             where TOperation : AsyncOperation
         {

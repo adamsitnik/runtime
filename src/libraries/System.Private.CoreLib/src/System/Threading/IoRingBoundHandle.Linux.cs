@@ -9,6 +9,46 @@ using Ring = System.Threading.PortableThreadPool.IoUringThreadPool.Ring;
 
 namespace System.Threading;
 
+// A binding gives one numeric file descriptor a stable ring and keeps its SafeHandle wrappers
+// alive while accepted native work can still use that descriptor. Closing an fd alone does not
+// cancel io_uring requests: the kernel holds its own file references. Conversely, releasing our
+// SafeHandle references too early could recycle the fd while a queued request still contains it.
+//
+// For example, a pending Socket.ReceiveAsync pins its buffer and calls EnqueueForSubmission on
+// the socket's cached binding:
+// - GetOrCreate, used on first binding, retains the supplied wrapper before reading its fd.
+//   The registry makes aliases of that same fd share this binding. ReferencesHandle avoids
+//   adding another permanent reference on repeated Bind calls for the same wrapper; distinct
+//   wrappers need distinct references because their SafeHandle reference counts are independent.
+//   The weak registry does not itself keep abandoned bindings alive. Long weak references keep
+//   a finalizer-pending binding discoverable until its references are actually released.
+// - EnqueueForSubmissionCore starts one logical operation, including its cancellation registration.
+//   EnqueueContinuation then acquires native ownership before publishing anything to the ring.
+//   It fills in this binding's fd and creates any native message header. A prepublication failure
+//   rolls back that ownership; accepted work is retired by the issuer, not by the submitting thread.
+// - The issuer suppresses canceled, unpublished work or submits it and waits for its terminal CQE.
+//   ReleaseNative balances AcquireNative at that point. Worker delivery subsequently lets the
+//   socket adapter unpin and complete the receive. Native drain does not require that worker to run.
+//   Partial sends/writes may enqueue another native request within the same logical operation.
+//
+// Cancellation and disposal are requests, not reclamation fences. QueueCancellation routes a
+// targeted cancel to the stored ring. DisposeCore atomically closes admission and queues cancel-all;
+// the issuer walks _operationsHead, its intrusive list of cancelable requests. The low state bits
+// count accepted native requests, including queued requests not yet published to the kernel.
+// Only their retirement drains the binding; a cancel-command CQE is not sufficient.
+//
+// OnDrained signals a lazily allocated waiter and queues off-issuer cleanup. DisposeAndWaitCore,
+// used by synchronous Socket close, waits only for native drain and can perform that cleanup
+// itself, avoiding a dependency on ThreadPool availability or on application callbacks.
+// AcquireSend/ReleaseSend additionally track logical sends across the native-drained gap between
+// partial completions. HadPendingOperations remembers whether close must remain abortive.
+//
+// ReleaseReference claims cleanup exactly once, removes this registry entry before fd reuse is
+// possible, then balances every retained wrapper through ReleaseHandleReference, outside the
+// registry lock and never on the issuer. A custom ReleaseHandle may reenter DisposeAndWait on the
+// same thread; _releasingThreadId prevents that thread from waiting for itself, while other callers
+// wait for actual release. ExecuteCore performs deferred cleanup; the finalizer covers abandonment.
+// This protects registered wrappers, not external close(fd), nor invalid double-owning wrappers.
 public sealed partial class IoRingBoundHandle
 {
     private const int Closed = int.MinValue;
@@ -16,7 +56,7 @@ public sealed partial class IoRingBoundHandle
     private const int CountMask = HadPendingOperations - 1;
     // Long weak references keep a finalizing binding discoverable until its handle references
     // are retired, without keeping abandoned owners alive indefinitely.
-    private static readonly Dictionary<IntPtr, WeakReference<IoRingBoundHandle>> s_bindings = new();
+    private static readonly Dictionary<nint, WeakReference<IoRingBoundHandle>> s_bindings = new();
 
     private readonly SafeHandle _handle;
     private List<SafeHandle>? _additionalHandles;
@@ -28,11 +68,11 @@ public sealed partial class IoRingBoundHandle
     private ManualResetEventSlim? _drained;
 
     internal readonly Ring _ring;
-    internal readonly IntPtr _fileDescriptor;
-    internal IoUringOperation? _operations;
+    internal readonly nint _fileDescriptor;
+    internal IoUringOperation? _operationsHead;
     internal IoRingBoundHandle? _nextClosing;
 
-    private IoRingBoundHandle(SafeHandle handle, IntPtr fileDescriptor)
+    private IoRingBoundHandle(SafeHandle handle, nint fileDescriptor)
     {
         _handle = handle;
         _fileDescriptor = fileDescriptor;
@@ -59,8 +99,8 @@ public sealed partial class IoRingBoundHandle
         handle.DangerousAddRef(ref added);
         try
         {
-            IntPtr fileDescriptor = handle.DangerousGetHandle();
-            if ((ulong)fileDescriptor.ToInt64() > int.MaxValue)
+            nint fileDescriptor = handle.DangerousGetHandle();
+            if ((nuint)fileDescriptor > int.MaxValue)
             {
                 throw new ArgumentException(SR.Arg_InvalidHandle, nameof(handle));
             }

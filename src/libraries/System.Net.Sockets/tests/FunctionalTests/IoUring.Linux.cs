@@ -4,10 +4,12 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.DotNet.RemoteExecutor;
+using Microsoft.Win32.SafeHandles;
 using Xunit;
 
 namespace System.Net.Sockets.Tests
@@ -16,6 +18,77 @@ namespace System.Net.Sockets.Tests
     {
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void FileSubmission_PinFailureReleasesStateAndAllowsReuse(bool write, bool vector)
+        {
+            RemoteExecutor.Invoke(async (writeText, vectorText) =>
+            {
+                bool isWrite = bool.Parse(writeText);
+                bool isVector = bool.Parse(vectorText);
+                string path = Path.GetTempFileName();
+                try
+                {
+                    File.WriteAllBytes(path, new byte[] { 1, 2, 3 });
+                    using SafeFileHandle handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, FileOptions.Asynchronous);
+                    using TrackingMemoryManager first = new TrackingMemoryManager();
+                    using TrackingMemoryManager failing = new TrackingMemoryManager { ThrowOnPin = true };
+                    using TrackingMemoryManager last = new TrackingMemoryManager();
+                    Memory<byte>[] reads = [first.Memory, failing.Memory, last.Memory];
+                    ReadOnlyMemory<byte>[] writes = [first.Memory, failing.Memory, last.Memory];
+                    first.GetSpan()[0] = 41;
+                    failing.GetSpan()[0] = 42;
+                    last.GetSpan()[0] = 43;
+
+                    // Queueing must return a task, not throw; failure must not run blocking fallback I/O.
+                    Task failed = QueueIo();
+                    InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(() => failed);
+                    Assert.Equal("Pin failed.", error.Message);
+                    Assert.Equal(isVector ? 1 : 0, first.PinCount);
+                    Assert.Equal(first.PinCount, first.UnpinCount);
+                    Assert.Equal(0, failing.PinCount);
+                    Assert.Equal(0, last.PinCount);
+                    Assert.Equal(new byte[] { 1, 2, 3 }, File.ReadAllBytes(path));
+
+                    failing.ThrowOnPin = false;
+                    await QueueIo();
+                    Assert.Equal(first.PinCount, first.UnpinCount);
+                    Assert.Equal(failing.PinCount, failing.UnpinCount);
+                    Assert.Equal(last.PinCount, last.UnpinCount);
+                    if (isWrite)
+                    {
+                        Assert.Equal(isVector ? new byte[] { 41, 42, 43 } : new byte[] { 42, 2, 3 }, File.ReadAllBytes(path));
+                    }
+                    else
+                    {
+                        Assert.Equal(isVector ? 2 : 1, failing.GetSpan()[0]);
+                        if (isVector)
+                        {
+                            Assert.Equal(1, first.GetSpan()[0]);
+                            Assert.Equal(3, last.GetSpan()[0]);
+                        }
+                    }
+                    handle.Dispose();
+                    Assert.True(handle.IsClosed);
+
+                    Task QueueIo() => (isWrite, isVector) switch
+                    {
+                        (false, false) => RandomAccess.ReadAsync(handle, failing.Memory, 0).AsTask(),
+                        (true, false) => RandomAccess.WriteAsync(handle, failing.Memory, 0).AsTask(),
+                        (false, true) => RandomAccess.ReadAsync(handle, reads, 0).AsTask(),
+                        (true, true) => RandomAccess.WriteAsync(handle, writes, 0).AsTask()
+                    };
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, write.ToString(), vector.ToString(), CreateOptions(1)).Dispose();
+        }
 
         [ConditionalFact(nameof(IsSupported))]
         public void Initialization_FailedBufferRegistrationClosesRing()
