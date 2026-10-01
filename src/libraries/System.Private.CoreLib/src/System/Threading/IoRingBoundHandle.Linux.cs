@@ -13,6 +13,8 @@ namespace System.Threading;
 /// Disposing the binding stops admission and requests cancellation, but does not synchronously
 /// retire outstanding I/O or dispose the caller's handle. Native ownership remains protected
 /// until all accepted requests retire. Bind returns the same binding for a given SafeHandle.
+/// The owner must retain and dispose this binding when disposing its handle; disposing an
+/// arbitrary SafeHandle does not notify the binding.
 /// </remarks>
 [CLSCompliant(false)]
 public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
@@ -68,19 +70,17 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
     }
 
     internal bool IsDisposed => Volatile.Read(ref _state) < 0;
+    internal SafeHandle Handle => _handle;
 
     internal static IoRingBoundHandle GetOrCreate(SafeHandle handle)
     {
-        Interlocked.CompareExchange(ref SafeHandle.s_disposeNotification, OnHandleDisposed, null);
         IoRingBoundHandle binding;
-        bool created = false;
         lock (s_bindings)
         {
             if (!s_bindings.TryGetValue(handle, out binding!))
             {
-                ObjectDisposedException.ThrowIf(handle.IsDisposeRequested, handle);
+                ObjectDisposedException.ThrowIf(handle.IsClosed, handle);
                 binding = new IoRingBoundHandle(handle);
-                created = true;
                 try
                 {
                     s_bindings.Add(handle, binding);
@@ -93,39 +93,9 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
             }
         }
 
-        // Disposal publishes its state before looking up the association. A bind which
-        // publishes after that lookup must observe disposal here and close itself.
-        if (handle.IsDisposeRequested)
-        {
-            if (created)
-            {
-                binding.DisposeAndWait();
-            }
-            else
-            {
-                binding.Dispose();
-            }
-        }
         ObjectDisposedException.ThrowIf(binding.IsDisposed, handle);
         return binding;
     }
-
-    private static void OnHandleDisposed(SafeHandle handle)
-    {
-        if (s_bindings.TryGetValue(handle, out IoRingBoundHandle? binding))
-        {
-            binding.Dispose();
-            // An idle SafeHandle.Dispose must still release its native resource before
-            // returning (for example, a file's exclusive lock). Pending I/O drains later.
-            if ((Volatile.Read(ref binding._state) & CountMask) == 0)
-            {
-                binding.ReleaseReference();
-            }
-        }
-    }
-
-    internal static bool TryGet(SafeHandle handle, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out IoRingBoundHandle? binding) =>
-        s_bindings.TryGetValue(handle, out binding);
 
     /// <summary>Enqueues an operation for submission by this handle's issuer.</summary>
     /// <param name="operation">The operation whose buffers remain valid through terminal completion.</param>
@@ -247,7 +217,9 @@ public sealed class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         PortableThreadPool.IoUringThreadPool.RequestClose(_ring, this);
         if (state == 0)
         {
-            OnDrained();
+            // Idle disposal must release the owner's reference synchronously, for example
+            // so closing a file releases its exclusive lock before returning.
+            ReleaseReference();
         }
         GC.SuppressFinalize(this);
     }

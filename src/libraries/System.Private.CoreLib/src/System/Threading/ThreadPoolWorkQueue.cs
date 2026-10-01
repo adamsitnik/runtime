@@ -1714,8 +1714,7 @@ namespace System.Threading
         /// Queues multiple work items at once, as if by calling
         /// <see cref="UnsafeQueueUserWorkItem(IThreadPoolWorkItem, bool)"/> for each one, but consolidating
         /// the underlying bookkeeping (worker-request accounting, logging checks) to a single pass over
-        /// the batch rather than one pass per item. Intended for callers - such as the io_uring driver in
-        /// <see cref="PortableThreadPool.IoUringThreadPool"/> - that naturally produce several ready
+        /// the batch rather than one pass per item. Intended for callers that naturally produce several ready
         /// continuations at once and would otherwise call the single-item overload in a loop.
         /// </summary>
         internal static void UnsafeQueueUserWorkItems(ReadOnlySpan<IThreadPoolWorkItem> callBacks, bool preferLocal) =>

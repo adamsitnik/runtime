@@ -92,10 +92,6 @@ namespace System.Runtime.InteropServices
 
         public bool IsClosed => (_state & StateBits.Closed) == StateBits.Closed;
 
-        internal static Action<SafeHandle>? s_disposeNotification;
-
-        internal bool IsDisposeRequested => (_state & StateBits.Disposed) != 0;
-
         public abstract bool IsInvalid { get; }
 
         public void Close() => Dispose();
@@ -250,13 +246,6 @@ namespace System.Runtime.InteropServices
                     newState |= StateBits.Disposed;
                 }
             } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
-
-            if (disposeOrFinalizeOperation && Volatile.Read(ref s_disposeNotification) is Action<SafeHandle> notification)
-            {
-                int lastError = Marshal.GetLastPInvokeError();
-                notification(this);
-                Marshal.SetLastPInvokeError(lastError);
-            }
 
             // If we get here we successfully decremented the ref count. Additionally we
             // may have decremented it to zero and set the handle state as closed. In

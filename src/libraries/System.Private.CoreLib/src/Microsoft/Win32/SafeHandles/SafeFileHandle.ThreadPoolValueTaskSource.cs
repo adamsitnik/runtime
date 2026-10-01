@@ -48,6 +48,7 @@ namespace Microsoft.Win32.SafeHandles
             private IReadOnlyList<Memory<byte>>? _readScatterBuffers;
             private IReadOnlyList<ReadOnlyMemory<byte>>? _writeGatherBuffers;
 
+#if FEATURE_IO_URING
             // io_uring completion state. When _completedViaIoUring is true, ExecuteInternal finalizes
             // the operation using _ioUringResult instead of performing a blocking syscall.
             private bool _completedViaIoUring;
@@ -67,6 +68,7 @@ namespace Microsoft.Win32.SafeHandles
             // and the number of bytes still left to write across the remaining vectors.
             private int _vectorsOffset;
             private long _remainingBytesToWrite;
+#endif
 
             internal ThreadPoolValueTaskSource(SafeFileHandle fileHandle)
             {
@@ -109,6 +111,7 @@ namespace Microsoft.Win32.SafeHandles
                 Exception? exception = null;
                 try
                 {
+#if FEATURE_IO_URING
                     if (_ioUringSubmissionError is not null)
                     {
                         ReleaseIoUringState();
@@ -132,8 +135,10 @@ namespace Microsoft.Win32.SafeHandles
                             result = _ioUringResult;
                         }
                     }
+                    else
+#endif
                     // This is the operation's last chance to be canceled.
-                    else if (_cancellationToken.IsCancellationRequested)
+                    if (_cancellationToken.IsCancellationRequested)
                     {
                         exception = new OperationCanceledException(_cancellationToken);
                     }
@@ -185,9 +190,11 @@ namespace Microsoft.Win32.SafeHandles
                     _singleSegment = default;
                     _readScatterBuffers = null;
                     _writeGatherBuffers = null;
+#if FEATURE_IO_URING
                     _completedViaIoUring = false;
                     _ioUringResult = 0;
                     _ioUringSubmissionError = null;
+#endif
                 }
 
                 if (exception == null)
@@ -212,6 +219,7 @@ namespace Microsoft.Win32.SafeHandles
                 }
             }
 
+#if FEATURE_IO_URING
             /// <summary>
             /// Performs completion bookkeeping on a worker and continues partial writes.
             /// </summary>
@@ -231,7 +239,7 @@ namespace Microsoft.Win32.SafeHandles
             private bool EnqueueIoUring(in Interop.Sys.IoRingRequest request)
             {
                 FileIoUringOperation operation = _ioUringOperation ??=
-                    new FileIoUringOperation(this, IoUring.Bind(_fileHandle));
+                    new FileIoUringOperation(this, _fileHandle.IoUringBinding);
                 operation.Enqueue(in request);
                 return true;
             }
@@ -419,6 +427,8 @@ namespace Microsoft.Win32.SafeHandles
                 }
             }
 
+#endif
+
             private void QueueToThreadPool()
             {
                 _context = ExecutionContext.Capture();
@@ -436,7 +446,9 @@ namespace Microsoft.Win32.SafeHandles
                 _strategy = strategy;
                 _context = ExecutionContext.Capture();
 
+#if FEATURE_IO_URING
                 if (!TrySubmitRead())
+#endif
                 {
                     ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: true);
                 }
@@ -455,7 +467,9 @@ namespace Microsoft.Win32.SafeHandles
                 _strategy = strategy;
                 _context = ExecutionContext.Capture();
 
+#if FEATURE_IO_URING
                 if (!TrySubmitWrite())
+#endif
                 {
                     ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: true);
                 }
@@ -473,7 +487,9 @@ namespace Microsoft.Win32.SafeHandles
                 _cancellationToken = cancellationToken;
                 _context = ExecutionContext.Capture();
 
+#if FEATURE_IO_URING
                 if (!TrySubmitReadScatter())
+#endif
                 {
                     ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: true);
                 }
@@ -491,7 +507,9 @@ namespace Microsoft.Win32.SafeHandles
                 _cancellationToken = cancellationToken;
                 _context = ExecutionContext.Capture();
 
+#if FEATURE_IO_URING
                 if (!TrySubmitWriteGather())
+#endif
                 {
                     ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: true);
                 }
@@ -499,6 +517,7 @@ namespace Microsoft.Win32.SafeHandles
                 return new ValueTask(this, _source.Version);
             }
 
+#if FEATURE_IO_URING
             private unsafe bool TrySubmitRead()
             {
                 if (!PortableThreadPool.IoUringThreadPool.IsEnabled)
@@ -813,6 +832,8 @@ namespace Microsoft.Win32.SafeHandles
                     _fileHandleRefAdded = false;
                 }
             }
+
+#endif
 
             private enum Operation : byte
             {

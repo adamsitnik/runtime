@@ -84,10 +84,12 @@ namespace System.Net.Sockets
 
         private static SocketAsyncEngine[] CreateEngines()
         {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
             if (IoUring.IsSupported)
             {
                 return [];
             }
+#endif
 
             int engineCount = GetEngineCount();
 
@@ -128,10 +130,12 @@ namespace System.Net.Sockets
         //
         public static bool TryRegisterSocket(IntPtr socketHandle, SocketAsyncContext context, out SocketAsyncEngine? engine, out Interop.Error error)
         {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
             if (IoUring.IsSupported)
             {
                 throw new InvalidOperationException(SR.net_sockets_io_uring_epoll_fallback);
             }
+#endif
 
             int engineIndex = Math.Abs(Interlocked.Increment(ref s_allocateFromEngine) % s_engines.Length);
             SocketAsyncEngine nextEngine = s_engines[engineIndex];

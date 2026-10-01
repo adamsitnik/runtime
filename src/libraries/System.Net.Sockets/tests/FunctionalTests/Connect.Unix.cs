@@ -11,7 +11,9 @@ namespace System.Net.Sockets.Tests
 {
     public class SocketBlockingModeTransitionTests
     {
-        [ConditionalTheory(typeof(IoUringTests), nameof(IoUringTests.IsSupported))]
+        public static bool IsIoUringSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
+
+        [ConditionalTheory(nameof(IsIoUringSupported))]
         [InlineData(false)]
         [InlineData(true)]
         public async Task AcceptAsync_SetsCloseOnExec(bool pending)
@@ -36,7 +38,7 @@ namespace System.Net.Sockets.Tests
             Assert.Equal(1, flags & 1); // FD_CLOEXEC
         }
 
-        [ConditionalFact(typeof(IoUringTests), nameof(IoUringTests.IsSupported))]
+        [ConditionalFact(nameof(IsIoUringSupported))]
         public void ConnectAsync_QueuedSendPreservesNonBlockingMode()
         {
             RemoteInvokeOptions options = new RemoteInvokeOptions();

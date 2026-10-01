@@ -15,7 +15,7 @@ namespace System.Net.Sockets
         /// <summary>
         /// Streams received data as an <see cref="IAsyncEnumerable{T}"/>, backed by a single persistent
         /// multishot io_uring receive submitted for the enumeration - see
-        /// <see cref="System.Threading.IoUring.TrySubmitRecvMultishot"/>. Unlike repeatedly calling
+        /// <see cref="IoUringOperation.CreateReceiveMultishot"/>. Unlike repeatedly calling
         /// <see cref="ReceiveAsync(Memory{byte}, CancellationToken)"/> in a loop, there is normally one
         /// submission for as long as the caller keeps enumerating: the kernel delivers data into
         /// its own pool of buffers as it arrives, without this socket needing to re-arm a new read after
@@ -74,17 +74,15 @@ namespace System.Net.Sockets
             TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
             IoUringOperation? operation = null;
             Exception? callbackError = null;
-            if (!IoUring.TrySubmitRecvMultishot(_handle, OnCompleted, out IoUringOperation? submitted))
-            {
-                throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
-            }
+            IoUringOperation submitted = IoUringOperation.CreateReceiveMultishot(OnCompleted);
+            _handle.IoUringBinding.Enqueue(submitted, CancellationToken.None);
 
             // Full fences on both publications prevent an early failing callback and
             // submission from each missing the other's cancellation state.
             Interlocked.Exchange(ref operation, submitted);
             if (Volatile.Read(ref callbackError) is not null)
             {
-                submitted!.RequestCancellation();
+                submitted.RequestCancellation();
             }
 
             using CancellationTokenRegistration registration = cancellationToken.UnsafeRegister(
@@ -177,10 +175,8 @@ namespace System.Net.Sockets
                 }
             }
 
-            if (!System.Threading.IoUring.TrySubmitRecvMultishot(handle, OnCompleted, out System.Threading.IoUringOperation? operation))
-            {
-                throw new InvalidOperationException(SR.net_sockets_multishot_not_supported);
-            }
+            IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
+            handle.IoUringBinding.Enqueue(operation, CancellationToken.None);
 
             // Skip allocating the callback delegate entirely when the token can never be canceled
             // (e.g. CancellationToken.None) - UnsafeRegister would end up being a no-op internally,
@@ -189,7 +185,7 @@ namespace System.Net.Sockets
                 ? cancellationToken.UnsafeRegister(_ =>
                 {
                     Volatile.Write(ref cancellationRequested, true);
-                    operation!.RequestCancellation();
+                    operation.RequestCancellation();
                 }, null)
                 : default;
 
@@ -210,7 +206,7 @@ namespace System.Net.Sockets
                 // eventually stops producing completions for it instead of leaking an in-flight
                 // multishot receive. A no-op if it already completed on its own.
                 Volatile.Write(ref cancellationRequested, true);
-                operation!.RequestCancellation();
+                operation.RequestCancellation();
                 try
                 {
                     // Cancellation is asynchronous. Keep returning unyielded leases until the

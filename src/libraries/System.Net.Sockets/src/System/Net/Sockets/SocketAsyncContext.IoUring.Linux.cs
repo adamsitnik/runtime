@@ -14,7 +14,6 @@ namespace System.Net.Sockets
     // completion-based adapter use the ordered queues with io_uring readiness notifications.
     internal sealed partial class SocketAsyncContext
     {
-        private IoRingBoundHandle? _ioUringBinding;
         private bool _ioUringReadinessRegistered;
         private IoUringBufferOperation? _cachedIoUringReceiveOperation;
         private IoUringBufferOperation? _cachedIoUringSendOperation;
@@ -78,19 +77,7 @@ namespace System.Net.Sockets
             }
         }
 
-        private IoRingBoundHandle IoUringBinding
-        {
-            get
-            {
-                IoRingBoundHandle? binding = Volatile.Read(ref _ioUringBinding);
-                if (binding is null)
-                {
-                    binding = IoUring.Bind(_socket);
-                    binding = Interlocked.CompareExchange(ref _ioUringBinding, binding, null) ?? binding;
-                }
-                return binding;
-            }
-        }
+        private IoRingBoundHandle IoUringBinding => _socket.IoUringBinding;
 
         /// <summary>
         /// Attempts to complete a plain, single-buffer, no-destination-address Receive via io_uring
@@ -234,7 +221,7 @@ namespace System.Net.Sockets
             {
                 _pin = default;
                 _callback = null;
-                // User callbacks (including Unpin) may immediately submit another receive.
+                // User callbacks (including Unpin) may immediately submit another operation.
                 if (_isReceive)
                 {
                     Interlocked.CompareExchange(ref _context._cachedIoUringReceiveOperation, this, null);
@@ -502,7 +489,7 @@ namespace System.Net.Sockets
                     fixed (int* addressLength = _addressLength)
                     {
                         return new IoUringRequest(_isAccept ? IoUringOperationKind.Accept : IoUringOperationKind.Connect,
-                            null, 0, socketAddress: _pin.Pointer, socketAddressLength: addressLength);
+                            _pin.Pointer, 0, addressLength: addressLength);
                     }
                 }
             }

@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
@@ -45,15 +46,14 @@ public readonly unsafe struct IoUringRequest
 
     /// <summary>Initializes a new instance of the <see cref="IoUringRequest"/> struct.</summary>
     /// <param name="kind">One of the enumeration values that specifies the operation.</param>
-    /// <param name="buffer">A pointer to the buffer, or to native iovec entries for a vectored operation.</param>
+    /// <param name="address">A pointer to the buffer, native iovec entries for a vectored operation, or native socket address for accept and connect.</param>
     /// <param name="length">The buffer length, or the number of iovec entries.</param>
     /// <param name="offset">The file offset, or -1 for non-positional operations.</param>
     /// <param name="flags">The native socket flags.</param>
-    /// <param name="socketAddress">A pointer to the native socket address.</param>
-    /// <param name="socketAddressLength">A pointer to the native socket address length.</param>
+    /// <param name="addressLength">A pointer to the native socket address length for accept and connect.</param>
     /// <exception cref="ArgumentOutOfRangeException">The operation, length, or offset is invalid.</exception>
-    public IoUringRequest(IoUringOperationKind kind, void* buffer, int length, long offset = -1,
-        int flags = 0, void* socketAddress = null, int* socketAddressLength = null)
+    public IoUringRequest(IoUringOperationKind kind, void* address, int length, long offset = -1,
+        int flags = 0, int* addressLength = null)
     {
         if (kind is < IoUringOperationKind.Read or > IoUringOperationKind.Send &&
             kind is < IoUringOperationKind.SendGather or > IoUringOperationKind.PollWrite)
@@ -65,20 +65,26 @@ public readonly unsafe struct IoUringRequest
         if (kind is IoUringOperationKind.ReadScatter or IoUringOperationKind.WriteGather or IoUringOperationKind.SendGather)
         {
             ArgumentOutOfRangeException.ThrowIfZero(length);
-            ArgumentNullException.ThrowIfNull(buffer);
+            ArgumentNullException.ThrowIfNull(address);
         }
 
         _nativeRequest.OpCode = (Interop.Sys.IoRingOp)kind;
         _nativeRequest.Offset = offset;
-        _nativeRequest.Buffer = (byte*)buffer;
         _nativeRequest.BufferLength = length;
         _nativeRequest.Flags = flags;
-        _nativeRequest.SockAddr = (byte*)socketAddress;
-        _nativeRequest.SockAddrLen = socketAddressLength;
-        if (kind is IoUringOperationKind.ReadScatter or IoUringOperationKind.WriteGather)
+        if (kind is IoUringOperationKind.Accept or IoUringOperationKind.Connect)
         {
-            _nativeRequest.Vectors = (Interop.Sys.IOVector*)buffer;
+            _nativeRequest.SockAddr = (byte*)address;
+            _nativeRequest.SockAddrLen = addressLength;
+        }
+        else if (kind is IoUringOperationKind.ReadScatter or IoUringOperationKind.WriteGather)
+        {
+            _nativeRequest.Vectors = (Interop.Sys.IOVector*)address;
             _nativeRequest.VectorCount = length;
+        }
+        else
+        {
+            _nativeRequest.Buffer = (byte*)address;
         }
     }
 
@@ -123,6 +129,26 @@ public abstract class IoUringOperation : IThreadPoolWorkItem
     /// <summary>Initializes a new instance of the <see cref="IoUringOperation"/> class.</summary>
     protected IoUringOperation()
     {
+    }
+
+    /// <summary>Creates a multishot receive operation without binding or submitting it.</summary>
+    /// <param name="onCompleted">The ordered callback receiving the native result, an optional owned buffer, and whether further completions will follow.</param>
+    /// <returns>An operation to submit through <see cref="IoRingBoundHandle.Enqueue"/>.</returns>
+    /// <remarks>
+    /// Callbacks run nonconcurrently on ThreadPool workers. The result is the number of bytes received,
+    /// zero on stream EOF or an empty datagram, or a negative errno on failure. Empty datagrams have
+    /// an empty, non-null buffer and do not end the operation.
+    /// The callback owns each delivered buffer and must dispose it when finished, even if the callback throws.
+    /// The final callback reports no further completions. Native requests may be rearmed transparently,
+    /// and reception waits when all provided buffers are retained until a consumer returns a buffer.
+    /// Cancellation and binding disposal stop the operation without revoking delivered buffers.
+    /// The operation supports one logical receive at a time and may be reused after its final callback begins.
+    /// </remarks>
+    /// <exception cref="ArgumentNullException"><paramref name="onCompleted"/> is null.</exception>
+    public static IoUringOperation CreateReceiveMultishot(Action<int, IMemoryOwner<byte>?, bool> onCompleted)
+    {
+        ArgumentNullException.ThrowIfNull(onCompleted);
+        return new PortableThreadPool.IoUringThreadPool.MultishotReceiveOperation(onCompleted);
     }
 
     /// <summary>Gets the request to enqueue for this operation.</summary>

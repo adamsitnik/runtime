@@ -105,8 +105,8 @@ namespace System.Net.Sockets
                 if (shouldClose)
                 {
                     bool canceledOperations = false;
-#if !TARGET_WINDOWS && !TARGET_BROWSER
-                    if (IoUring.TryGetBinding(this, out IoRingBoundHandle? binding))
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                    if (Volatile.Read(ref _ioUringBinding) is IoRingBoundHandle binding)
                     {
                         canceledOperations = binding.DisposeAndWait();
                     }

@@ -14,46 +14,6 @@ namespace System.Threading
         internal static partial class IoUringThreadPool
         {
             /// <summary>
-            /// Attempts to submit a persistent, multishot <c>recv(2)</c>-like read on
-            /// <paramref name="handle"/>, using this fd's ring's provided-buffer pool (see
-            /// <see cref="Ring.ReceiveBuffers"/>). Unlike every other <c>TrySubmit*</c> operation in this
-            /// type, a single submission here keeps producing completions - one per datagram/read the
-            /// kernel has data for - until cancelled (see <paramref name="operation"/>'s
-            /// <see cref="IoUringOperation.RequestCancellation"/>), EOF, or an error occurs.
-            /// <paramref name="onCompleted"/> is invoked, on some Thread Pool worker thread, once per
-            /// completion, with the raw result (bytes received, 0 on stream EOF or an empty datagram, or <c>-errno</c> on
-            /// failure), the received data (as a buffer leased from the pool - dispose it to return it),
-            /// and whether the operation is still alive and will keep producing further completions.
-            /// <paramref name="handle"/> is ref-counted while each native submission is outstanding.
-            /// Returns <see langword="false"/> only if this fd's ring's buffer pool could not be
-            /// initialized (extremely unlikely - see the ring-creation handshake in the static
-            /// constructor of <see cref="IoUringThreadPool"/>, which requires it to succeed at all); in
-            /// that case <paramref name="operation"/> is <see langword="null"/>.
-            /// </summary>
-            public static bool TrySubmitReceiveMultishot(SafeHandle handle, Action<int, IMemoryOwner<byte>?, bool> onCompleted, out IoUringOperation? operation)
-            {
-                Debug.Assert(s_isEnabled);
-
-                IoRingBoundHandle binding = IoUring.Bind(handle);
-                if (binding._ring.ReceiveBuffers is null)
-                {
-                    operation = null;
-                    return false;
-                }
-
-                Interop.Error error = Interop.Sys.GetIoRingSocketType(handle, out _, out int socketType, out _, out _);
-                if (error != Interop.Error.SUCCESS)
-                {
-                    throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
-                }
-                const int DatagramSocketType = 2; // SocketType_SOCK_DGRAM in pal_networking.h.
-                MultishotReceiveOperation multishotOperation = new(binding._ring, onCompleted, socketType == DatagramSocketType);
-                binding.Enqueue(multishotOperation);
-                operation = multishotOperation;
-                return true;
-            }
-
-            /// <summary>
             /// Ring-owned pool of provided buffers (buf_group 0) used by every
             /// <see cref="Interop.Sys.IoRingOp.RecvMultishot"/> request submitted to this ring - see
             /// <see cref="Interop.Sys.IoRingRegisterBufferRing"/>. Backed by natively-allocated,
@@ -275,7 +235,7 @@ namespace System.Threading
             }
 
             /// <summary>
-            /// The <see cref="IoUringOperation"/> behind <see cref="TrySubmitReceiveMultishot"/>.
+            /// The <see cref="IoUringOperation"/> behind <see cref="IoUringOperation.CreateReceiveMultishot"/>.
             /// Also an <see cref="IThreadPoolWorkItem"/> in its own right: draining and delivering
             /// completions from <see cref="_pending"/> (rather than each completion carrying its own,
             /// separately-allocated work item, as every other <see cref="IoUringOperation"/> does) is
@@ -284,17 +244,17 @@ namespace System.Threading
             /// </summary>
             internal sealed class MultishotReceiveOperation : IoUringOperation, IThreadPoolWorkItem
             {
-                private readonly Ring _ring;
+                private Ring _ring = null!;
                 private readonly Action<int, IMemoryOwner<byte>?, bool> _onCompleted;
-                private readonly bool _isDatagram;
+                private bool _isDatagram;
                 internal MultishotReceiveOperation? _previousWaiter;
                 internal MultishotReceiveOperation? _nextWaiter;
                 internal Interop.Sys.IoRingRequest _waitingRequest;
 
                 // Completions reaped by the issuer thread (see EnqueueFromIssuer) but this operation's
                 // own drainer (see Execute) has not yet delivered to _onCompleted. This queue has exactly
-                // one producer by construction: every fd - and so this operation, which is permanently
-                // bound to one fd - is routed to exactly one ring (see GetRing), which in turn has
+                // one producer by construction: each logical operation is bound to one fd and is
+                // routed to exactly one ring (see GetRing), which in turn has
                 // exactly one owning issuer thread. That single-producer guarantee, together with
                 // _dispatchRequested only ever allowing one active drainer at a time (see
                 // EnqueueFromIssuer), is what delivers every completion to _onCompleted in true arrival
@@ -314,22 +274,43 @@ namespace System.Threading
                 // the exact same out-of-order delivery this type exists to avoid.
                 private int _dispatchRequested;
 
-                public MultishotReceiveOperation(Ring ring, Action<int, IMemoryOwner<byte>?, bool> onCompleted, bool isDatagram)
+                public MultishotReceiveOperation(Action<int, IMemoryOwner<byte>?, bool> onCompleted)
                 {
-                    _ring = ring;
                     _onCompleted = onCompleted;
-                    _isDatagram = isDatagram;
                 }
 
                 protected override IoUringRequest Request
                 {
                     get
                     {
-                        Interop.Sys.IoRingRequest request = default;
-                        request.OpCode = Interop.Sys.IoRingOp.RecvMultishot;
-                        request.Offset = -1;
-                        return new IoUringRequest(in request);
+                        // Begin establishes the binding and rejects overlapping reuse before
+                        // request preparation can change the ring or socket semantics.
+                        Debug.Assert(_binding is not null);
+                        Ring ring = _binding._ring;
+                        if (ring.ReceiveBuffers is null)
+                        {
+                            throw new PlatformNotSupportedException();
+                        }
+                        Interop.Error error = Interop.Sys.GetIoRingSocketType(_binding.Handle,
+                            out _, out int socketType, out _, out _);
+                        if (error != Interop.Error.SUCCESS)
+                        {
+                            throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
+                        }
+
+                        const int DatagramSocketType = 2; // SocketType_SOCK_DGRAM in pal_networking.h.
+                        _ring = ring;
+                        _isDatagram = socketType == DatagramSocketType;
+                        return CreateRequest();
                     }
+                }
+
+                private static IoUringRequest CreateRequest()
+                {
+                    Interop.Sys.IoRingRequest request = default;
+                    request.OpCode = Interop.Sys.IoRingOp.RecvMultishot;
+                    request.Offset = -1;
+                    return new IoUringRequest(in request);
                 }
 
                 protected override void OnCompleted(int result, uint flags, long sequence) =>
@@ -418,7 +399,7 @@ namespace System.Threading
                     }
                     try
                     {
-                        EnqueueContinuation(Request);
+                        EnqueueContinuation(CreateRequest());
                         return true;
                     }
                     catch (ObjectDisposedException)
@@ -448,7 +429,7 @@ namespace System.Threading
                         {
                             // CQ pressure can terminate a native submission without reaching EOF.
                             // Transfer the final buffer before rearming, and observe cancellation
-                            // or socket disposal performed by that callback.
+                            // or binding disposal performed by that callback.
                             InvokeCallback(result, buffer, hasMore: true, currentThread);
                             buffer = null;
                             if (TryResubmit(out result))

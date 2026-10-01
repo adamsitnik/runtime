@@ -98,6 +98,33 @@ namespace System.Net.Sockets.Tests
             public UIntPtr Count;
         }
 
+        private sealed class CallbackOperation : IoUringOperation
+        {
+            private readonly IoUringRequest _request;
+            private readonly Action<int> _callback;
+
+            public CallbackOperation(IoUringRequest request, Action<int> callback)
+            {
+                _request = request;
+                _callback = callback;
+            }
+
+            protected override IoUringRequest Request => _request;
+
+            protected override void OnCompleted(int result, uint flags, long sequence)
+            {
+                CompleteOperation();
+                _callback(result);
+            }
+        }
+
+        private static IoUringOperation EnqueueMultishot(IoRingBoundHandle binding, Action<int, IMemoryOwner<byte>?, bool> callback)
+        {
+            IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(callback);
+            binding.Enqueue(operation);
+            return operation;
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(false)]
         [InlineData(true)]
@@ -108,9 +135,10 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (CountingHandle owner = new CountingHandle(receiver.SafeHandle.DangerousGetHandle(), new ReleaseCounter()))
                 {
-                    Assert.Same(binding, IoUring.Bind(receiver.SafeHandle));
+                    IoRingBoundHandle binding = owner.Binding;
+                    Assert.Same(binding, IoUring.Bind(owner));
                     BoundReceiveOperation operation = new BoundReceiveOperation();
                     for (int i = 0; i < 50; i++)
                     {
@@ -152,8 +180,9 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (CountingHandle owner = new CountingHandle(receiver.SafeHandle.DangerousGetHandle(), new ReleaseCounter()))
                 {
+                    IoRingBoundHandle binding = owner.Binding;
                     BoundReceiveOperation[] operations = new BoundReceiveOperation[int.Parse(countText)];
                     object? freeSlots = null;
                     if (bool.Parse(exhaustText))
@@ -186,10 +215,10 @@ namespace System.Net.Sockets.Tests
                             binding.Dispose();
                             break;
                         case 1:
-                            receiver.Dispose();
+                            owner.Close();
                             break;
                         case 2:
-                            receiver.SafeHandle.Dispose();
+                            owner.Dispose();
                             break;
                     }
                     Assert.True(binding.DisposeAndWait());
@@ -213,10 +242,12 @@ namespace System.Net.Sockets.Tests
             }, closeKind.ToString(), count.ToString(), exhaustGenerations.ToString(), CreateOptions(1)).Dispose();
         }
 
-        [ConditionalFact(nameof(IsSupported))]
-        public void Bind_RacingSocketDispose_DoesNotRetainHandle()
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void Receive_RacingSocketDispose_DoesNotRetainHandle(bool disposeHandle)
         {
-            RemoteExecutor.Invoke(async () =>
+            RemoteExecutor.Invoke(async disposeHandleText =>
             {
                 for (int i = 0; i < 100; i++)
                 {
@@ -225,33 +256,46 @@ namespace System.Net.Sockets.Tests
                     using (receiver)
                     {
                         SafeSocketHandle handle = receiver.SafeHandle;
-                        IoRingBoundHandle? binding = null;
                         using Barrier barrier = new Barrier(2);
-                        Task bind = Task.Run(() =>
+                        Task receive = Task.Run(async () =>
                         {
                             barrier.SignalAndWait();
                             try
                             {
-                                binding = IoUring.Bind(handle);
+                                await receiver.ReceiveAsync(new byte[1], SocketFlags.None);
                             }
                             catch (ObjectDisposedException)
+                            {
+                            }
+                            // Close can abort the optimistic syscall before the receive is queued.
+                            catch (SocketException error) when (error.SocketErrorCode is SocketError.OperationAborted or SocketError.ConnectionReset)
                             {
                             }
                         });
                         Task close = Task.Run(() =>
                         {
                             barrier.SignalAndWait();
-                            receiver.Dispose();
+                            if (bool.Parse(disposeHandleText))
+                            {
+                                handle.Dispose();
+                            }
+                            else
+                            {
+                                receiver.Dispose();
+                            }
                         });
-                        await Task.WhenAll(bind, close).WaitAsync(TestSettings.PassingTestTimeout);
-                        Assert.True(handle.IsClosed);
-                        if (binding is not null)
+                        await Task.WhenAll(receive, close).WaitAsync(TestSettings.PassingTestTimeout);
+                        if (bool.Parse(disposeHandleText))
                         {
-                            Assert.Throws<ObjectDisposedException>(() => binding.Enqueue(new BoundReceiveOperation()));
+                            Assert.True(SpinWait.SpinUntil(() => handle.IsClosed, TestSettings.PassingTestTimeout));
+                        }
+                        else
+                        {
+                            Assert.True(handle.IsClosed);
                         }
                     }
                 }
-            }, CreateOptions(3)).Dispose();
+            }, disposeHandle.ToString(), CreateOptions(3)).Dispose();
         }
 
         [ConditionalFact(nameof(IsSupported))]
@@ -259,23 +303,23 @@ namespace System.Net.Sockets.Tests
         {
             RemoteExecutor.Invoke(async () =>
             {
-                List<(Socket Sender, Socket Receiver)> pairs = new List<(Socket, Socket)>();
+                List<(Socket Sender, Socket Receiver, CountingHandle Owner)> pairs = new();
                 try
                 {
                     HashSet<long> rings = new HashSet<long>();
                     for (int i = 0; i < 3; i++)
                     {
                         (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
-                        pairs.Add((sender, receiver));
+                        pairs.Add((sender, receiver, new CountingHandle(receiver.SafeHandle.DangerousGetHandle(), new ReleaseCounter())));
                         rings.Add(receiver.SafeHandle.DangerousGetHandle().ToInt64() % 3);
                     }
                     Assert.True(rings.Count > 1);
                     BoundReceiveOperation operation = new BoundReceiveOperation();
                     for (int iteration = 0; iteration < 30; iteration++)
                     {
-                        foreach ((Socket sender, Socket receiver) in pairs)
+                        foreach ((Socket sender, Socket receiver, CountingHandle owner) in pairs)
                         {
-                            IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
+                            IoRingBoundHandle binding = owner.Binding;
                             using CancellationTokenSource cancellation = new CancellationTokenSource();
                             operation.Prepare();
                             binding.Enqueue(operation, cancellation.Token);
@@ -291,8 +335,9 @@ namespace System.Net.Sockets.Tests
                 }
                 finally
                 {
-                    foreach ((Socket sender, Socket receiver) in pairs)
+                    foreach ((Socket sender, Socket receiver, CountingHandle owner) in pairs)
                     {
+                        owner.Dispose();
                         receiver.Dispose();
                         sender.Dispose();
                     }
@@ -322,7 +367,7 @@ namespace System.Net.Sockets.Tests
                 using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 ReleaseCounter counter = new ReleaseCounter();
                 CountingHandle handle = new CountingHandle(socket.SafeHandle.DangerousGetHandle(), counter);
-                IoRingBoundHandle binding = IoUring.Bind(handle);
+                IoRingBoundHandle binding = handle.Binding;
                 counter.OnRelease = () => binding.DisposeAndWait();
                 await Task.Run(handle.Dispose).WaitAsync(TimeSpan.FromSeconds(10));
                 Assert.Equal(1, counter.Count);
@@ -354,7 +399,7 @@ namespace System.Net.Sockets.Tests
             IntPtr descriptor, ReleaseCounter counter)
         {
             CountingHandle handle = new CountingHandle(descriptor, counter);
-            IoRingBoundHandle binding = IoUring.Bind(handle);
+            IoRingBoundHandle binding = handle.Binding;
             return (new WeakReference(handle), new WeakReference(binding));
         }
 
@@ -368,6 +413,9 @@ namespace System.Net.Sockets.Tests
         {
             private readonly ReleaseCounter _counter;
             private bool _disposeDuringValidation;
+            private readonly object _gate = new();
+            private IoRingBoundHandle? _binding;
+            private bool _disposed;
 
             public CountingHandle(IntPtr descriptor, ReleaseCounter counter, bool disposeDuringValidation = false)
                 : base(new IntPtr(-1), ownsHandle: true)
@@ -387,6 +435,28 @@ namespace System.Net.Sockets.Tests
                         Dispose();
                     }
                     return IsClosed || handle == new IntPtr(-1);
+                }
+            }
+
+            public IoRingBoundHandle Binding
+            {
+                get
+                {
+                    lock (_gate)
+                    {
+                        ObjectDisposedException.ThrowIf(_disposed, this);
+                        return _binding ??= IoUring.Bind(this);
+                    }
+                }
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                lock (_gate)
+                {
+                    _disposed = true;
+                    _binding?.DisposeAndWait();
+                    base.Dispose(disposing);
                 }
             }
 
@@ -418,6 +488,7 @@ namespace System.Net.Sockets.Tests
                     await Task.Run(() =>
                     {
                         binding.Enqueue(operation);
+                        binding.DisposeAndWait();
                         receiver.Dispose();
                     }).WaitAsync(TestSettings.PassingTestTimeout);
                     Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
@@ -659,6 +730,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle))
                 {
                     sender.SendBufferSize = 4096;
                     GCHandle dataPin = GCHandle.Alloc(data, GCHandleType.Pinned);
@@ -675,7 +747,8 @@ namespace System.Net.Sockets.Tests
                         TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
                         unsafe
                         {
-                            Assert.True(IoUring.TrySubmitSendV(sender.SafeHandle, (void*)vectorsPin.AddrOfPinnedObject(), count, 0, result =>
+                            binding.Enqueue(new CallbackOperation(
+                                new IoUringRequest(IoUringOperationKind.SendGather, (void*)vectorsPin.AddrOfPinnedObject(), count), result =>
                             {
                                 Interlocked.Increment(ref callbacks);
                                 completion.TrySetResult(result);
@@ -699,6 +772,7 @@ namespace System.Net.Sockets.Tests
                     finally
                     {
                         // Drain kernel ownership before unpinning, including on assertion failures.
+                        binding.DisposeAndWait();
                         sender.Dispose();
                         if (vectorsPin.IsAllocated)
                         {
@@ -939,7 +1013,6 @@ namespace System.Net.Sockets.Tests
                 {
                     receiver.Blocking = false;
                     receiver.Blocking = true;
-                    using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
 #pragma warning disable IL2075 // The RemoteExecutor process is untrimmed.
                     System.Reflection.FieldInfo stateField = typeof(SafeHandle).GetField("_state",
                         System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
@@ -1003,12 +1076,13 @@ namespace System.Net.Sockets.Tests
                 listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
                 listener.Listen(1);
                 listener.Blocking = false;
+                using IoRingBoundHandle binding = IoUring.Bind(listener.SafeHandle);
 
                 TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
                 int callerThreadId = Environment.CurrentManagedThreadId;
                 unsafe
                 {
-                    Assert.True(IoUring.TrySubmitAccept(listener.SafeHandle, null, null, 0, result =>
+                    binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Accept, null, 0), result =>
                     {
                         Assert.True(Thread.CurrentThread.IsThreadPoolThread);
                         Assert.NotEqual(callerThreadId, Environment.CurrentManagedThreadId);
@@ -1104,13 +1178,14 @@ namespace System.Net.Sockets.Tests
                 using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 sender.Connect(listener.LocalEndPoint!);
                 using Socket receiver = listener.Accept();
+                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
                 TaskCompletionSource drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 AsyncLocal<int> context = new AsyncLocal<int>();
                 TrackingMemoryManager owner = new TrackingMemoryManager();
                 IoUringOperation? operation = null;
                 bool testing = false;
                 int callbacks = 0;
-                Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                operation = EnqueueMultishot(binding, (result, buffer, more) =>
                 {
                     if (!testing)
                     {
@@ -1134,6 +1209,7 @@ namespace System.Net.Sockets.Tests
                         SynchronizationContext.SetSynchronizationContext(new SynchronizationContext());
                         if (close)
                         {
+                            binding.DisposeAndWait();
                             receiver.Dispose();
                         }
                         else
@@ -1148,7 +1224,7 @@ namespace System.Net.Sockets.Tests
                         Assert.Null(buffer);
                         Assert.False(more);
                     }
-                }, out operation));
+                });
                 operation!.RequestCancellation();
                 await drained.Task.WaitAsync(TestSettings.PassingTestTimeout);
 
@@ -1157,7 +1233,7 @@ namespace System.Net.Sockets.Tests
                 Type operationType = operation.GetType();
                 const System.Reflection.BindingFlags Flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
                 typeof(IoUringOperation).GetMethod("Begin", Flags)!.Invoke(operation,
-                    new object[] { IoUring.Bind(receiver.SafeHandle), CancellationToken.None });
+                    new object[] { binding, CancellationToken.None });
                 System.Reflection.MethodInfo deliver = operationType.GetMethod("Deliver", Flags)!;
 #pragma warning restore IL2075
                 testing = true;
@@ -1189,6 +1265,7 @@ namespace System.Net.Sockets.Tests
                 using Socket receiver = listener.Accept();
                 receiver.Blocking = false;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
+                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
 
                 byte[] received = GC.AllocateArray<byte>(count, pinned: true);
                 byte[] sent = new byte[count];
@@ -1210,7 +1287,7 @@ namespace System.Net.Sockets.Tests
                                     completion.SetResult(result);
                                 }
                                 : completion.SetResult;
-                            Assert.True(IoUring.TrySubmitRecv(receiver.SafeHandle, pointer + i, 1, 0, callback));
+                            binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
                         }
                     }
                 }
@@ -1357,6 +1434,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
                 {
                     receiver.Blocking = false;
                     sender.SendTimeout = TestSettings.PassingTestTimeout;
@@ -1406,7 +1484,7 @@ namespace System.Net.Sockets.Tests
                         {
                             for (int i = 0; i < OperationCount; i++)
                             {
-                                Assert.True(IoUring.TrySubmitRecv(receiver.SafeHandle, pointer + i, 1, 0, callback));
+                                binding.Enqueue(new CallbackOperation(new IoUringRequest(IoUringOperationKind.Receive, pointer + i, 1), callback));
                             }
                         }
                     }
@@ -1766,12 +1844,13 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
                 using (ManualResetEventSlim firstCallback = new())
                 using (ManualResetEventSlim releaseCallback = new())
                 {
                     TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
                     int callbacks = 0;
-                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    IoUringOperation operation = EnqueueMultishot(binding, (result, buffer, more) =>
                     {
                         try
                         {
@@ -1806,7 +1885,7 @@ namespace System.Net.Sockets.Tests
                         {
                             buffer?.Dispose();
                         }
-                    }, out IoUringOperation? operation));
+                    });
                     try
                     {
                         Assert.Equal(1, sender.Send(new byte[] { 0x5A }));
@@ -1818,9 +1897,9 @@ namespace System.Net.Sockets.Tests
                             sent += sender.Send(bytes.AsSpan(sent));
                         }
 
+#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
                         object queue = operation!.GetType().GetField("_pending",
                             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(operation)!;
-#pragma warning disable IL2075 // RemoteExecutor runs this implementation-specific test without trimming.
                         System.Reflection.PropertyInfo count = queue.GetType().GetProperty("Count")!;
 #pragma warning restore IL2075
                         Assert.True(SpinWait.SpinUntil(() => (int)count.GetValue(queue)! > 32, TestSettings.PassingTestTimeout));
@@ -1874,11 +1953,12 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
                 using (SemaphoreSlim available = new(0))
                 {
                     ConcurrentQueue<IMemoryOwner<byte>> buffers = new();
                     TaskCompletionSource<int> completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    IoUringOperation operation = EnqueueMultishot(binding, (result, buffer, more) =>
                     {
                         if (buffer is not null)
                         {
@@ -1889,7 +1969,7 @@ namespace System.Net.Sockets.Tests
                         {
                             completed.SetResult(result);
                         }
-                    }, out IoUringOperation operation));
+                    });
                     System.Reflection.FieldInfo tokenField = typeof(IoUringOperation).GetField("_nativeToken",
                         System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
                     ulong initialToken = (ulong)tokenField.GetValue(operation)!;
@@ -1914,14 +1994,14 @@ namespace System.Net.Sockets.Tests
                         {
                             TaskCompletionSource<int> waiterCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
                             waiterCompletions[i] = waiterCompleted;
-                            Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                            waiters[i] = EnqueueMultishot(binding, (result, buffer, more) =>
                             {
                                 buffer?.Dispose();
                                 if (!more)
                                 {
                                     waiterCompleted.SetResult(result);
                                 }
-                            }, out waiters[i]));
+                            });
                         }
                         System.Reflection.FieldInfo linkedField = typeof(IoUringOperation).GetField("_linked",
                             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
@@ -1953,6 +2033,7 @@ namespace System.Net.Sockets.Tests
                         }
                         else if (ending == "dispose")
                         {
+                            binding.DisposeAndWait();
                             receiver.Dispose();
                         }
                         operation.RequestCancellation();
@@ -2164,13 +2245,14 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
                 using (ManualResetEventSlim firstCallback = new())
                 using (ManualResetEventSlim releaseCallback = new())
                 {
                     AsyncLocal<int> context = new();
                     TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
                     int callbacks = 0;
-                    Assert.True(IoUring.TrySubmitRecvMultishot(receiver.SafeHandle, (result, buffer, more) =>
+                    IoUringOperation operation = EnqueueMultishot(binding, (result, buffer, more) =>
                     {
                         try
                         {
@@ -2199,7 +2281,7 @@ namespace System.Net.Sockets.Tests
                         {
                             buffer?.Dispose();
                         }
-                    }, out IoUringOperation? operation));
+                    });
                     try
                     {
                         sender.Send(new byte[] { 42 });

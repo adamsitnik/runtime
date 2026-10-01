@@ -13,19 +13,7 @@ namespace System.IO.Tests
     {
         protected override bool AsyncHandles => true;
 
-        public static bool IsCancellationSupported
-        {
-            get
-            {
-#if TARGET_WINDOWS
-                return true;
-#elif TARGET_BROWSER
-                return false;
-#else
-                return IoUring.IsSupported;
-#endif
-            }
-        }
+        public static bool IsCancellationSupported => OperatingSystem.IsWindows() || IoUring.IsSupported;
 
         [ConditionalTheory(nameof(IsCancellationSupported))]
         [InlineData(FileAccess.Read)]

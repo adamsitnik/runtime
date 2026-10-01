@@ -15,6 +15,8 @@
     <GeneratePlatformNotSupportedAssemblyMessage Condition="'$(TargetPlatformIdentifier)' == 'browser' or '$(TargetPlatformIdentifier)' == ''">SR.SystemNetSockets_PlatformNotSupported</GeneratePlatformNotSupportedAssemblyMessage>
     <IsApplePlatform Condition="'$(TargetPlatformIdentifier)' == 'osx' or '$(TargetPlatformIdentifier)' == 'ios' or '$(TargetPlatformIdentifier)' == 'tvos'">true</IsApplePlatform>
     <DefineConstants Condition="'$(IsApplePlatform)' == 'true'">$(DefineConstants);SYSTEM_NET_SOCKETS_APPLE_PLATFORM</DefineConstants>
+    <IsLinuxPlatform Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'">true</IsLinuxPlatform>
+    <DefineConstants Condition="'$(IsLinuxPlatform)' == 'true'">$(DefineConstants);SYSTEM_NET_SOCKETS_LINUX_PLATFORM</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' != '' and '$(TargetPlatformIdentifier)' != 'browser'">
@@ -206,11 +208,13 @@
              Link="Common\Interop\Unix\System.Native\Interop.SocketEvent.cs" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix'">
+  <ItemGroup Condition="'$(IsLinuxPlatform)' == 'true'">
+    <Compile Include="System\Net\Sockets\SafeSocketHandle.IoUring.Linux.cs" />
     <Compile Include="System\Net\Sockets\Socket.Multishot.Linux.cs" />
+    <Compile Include="System\Net\Sockets\SocketAsyncContext.IoUring.Linux.cs" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'windows' or '$(TargetPlatformIdentifier)' == 'osx' or '$(TargetPlatformIdentifier)' == 'ios' or '$(TargetPlatformIdentifier)' == 'tvos' or '$(TargetPlatformIdentifier)' == 'wasi'">
+  <ItemGroup Condition="'$(IsLinuxPlatform)' != 'true' and '$(TargetPlatformIdentifier)' != '' and '$(TargetPlatformIdentifier)' != 'browser'">
     <Compile Include="System\Net\Sockets\Socket.Multishot.cs" />
   </ItemGroup>
 
@@ -219,7 +223,6 @@
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Unix.OptionTracking.cs" />
     <Compile Include="System\Net\Sockets\Socket.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.Unix.cs" />
-    <Compile Include="System\Net\Sockets\SocketAsyncContext.IoUring.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncEventArgs.Unix.cs" />
     <Compile Include="System\Net\Sockets\SocketPal.Unix.cs" />
     <Compile Include="$(CommonPath)System\Net\InteropIPAddressExtensions.Unix.cs"
