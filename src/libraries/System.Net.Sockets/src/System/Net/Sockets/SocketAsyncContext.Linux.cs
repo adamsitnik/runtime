@@ -450,8 +450,17 @@ namespace System.Net.Sockets
                     }
                     Debug.Assert(remaining == 0);
 
-                    // MSG_WAITALL does not span native vector limits, and errors can also
-                    // produce a short result. Keep the pins until the logical send finishes.
+                    // MSG_WAITALL covers only the submitted native batch: native SENDMSG caps a
+                    // stream request at IOV_MAX, so a full batch can still leave managed vectors.
+                    // A genuinely short WAITALL result is not limited to peer close either:
+                    // Linux returns accumulated progress when an error follows a partial send.
+                    // The positive CQE alone does not distinguish that from a successful batch.
+                    // Match the epoll TryCompleteSendTo loop by sending the remainder rather than
+                    // treating every positive CQE as final success. Keep pins until the logical
+                    // send finishes, and report accumulated bytes alongside any eventual error.
+                    // SocketAsyncEventArgs preserves BytesTransferred on failure; Task/ValueTask
+                    // wrappers throw instead of returning that count, as they do for epoll.
+                    // https://github.com/torvalds/linux/blob/v6.12/io_uring/net.c#L545-L571
                     if (_vectorIndex < _pinCount)
                     {
                         if (IsCancellationRequested)

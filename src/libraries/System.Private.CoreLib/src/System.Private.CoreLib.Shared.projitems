@@ -2965,6 +2965,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.Unsupported.cs" Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.Unsupported.cs" Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperationKind.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringRequest.cs" />
   </ItemGroup>

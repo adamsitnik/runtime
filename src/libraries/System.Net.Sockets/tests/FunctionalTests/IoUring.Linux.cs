@@ -1002,12 +1002,14 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalTheory(nameof(IsSupported))]
-        [InlineData(2)]
-        [InlineData(1200)]
-        public void GatherSend_WaitAll_CompletesOnceAtNativeVectorLimit(int vectorCount)
+        [InlineData(false, 2)]
+        [InlineData(true, 2)]
+        [InlineData(true, 1200)]
+        public void Send_WaitAll_CompletesOnceAtNativeVectorLimit(bool gather, int vectorCount)
         {
-            RemoteExecutor.Invoke(async countText =>
+            RemoteExecutor.Invoke(async (gatherText, countText) =>
             {
+                bool useGather = bool.Parse(gatherText);
                 int count = int.Parse(countText);
                 int bufferSize = count == 2 ? 1024 * 1024 : 2048;
                 byte[] data = new byte[count * bufferSize];
@@ -1034,24 +1036,21 @@ namespace System.Net.Sockets.Tests
                         unsafe
                         {
                             binding.EnqueueForSubmission(new CallbackOperation(
-                                new IoUringRequest(IoUringOperationKind.SendGather, (void*)vectorsPin.AddrOfPinnedObject(), count), result =>
+                                useGather
+                                    ? new IoUringRequest(IoUringOperationKind.SendGather, (void*)vectorsPin.AddrOfPinnedObject(), count)
+                                    : new IoUringRequest(IoUringOperationKind.Send, (void*)dataPin.AddrOfPinnedObject(), data.Length), result =>
                             {
                                 Interlocked.Increment(ref callbacks);
                                 completion.TrySetResult(result);
                             }));
                         }
 
-                        int expected = Math.Min(count, 1024) * bufferSize;
+                        int expected = useGather ? Math.Min(count, 1024) * bufferSize : data.Length;
                         byte[] received = new byte[expected];
-                        int offset = 0;
-                        while (offset < expected)
-                        {
-                            int read = await receiver.ReceiveAsync(received.AsMemory(offset), SocketFlags.None)
-                                .AsTask().WaitAsync(TestSettings.PassingTestTimeout);
-                            Assert.NotEqual(0, read);
-                            offset += read;
-                        }
+                        using NetworkStream stream = new NetworkStream(receiver, ownsSocket: false);
+                        ValueTask readTask = stream.ReadExactlyAsync(received);
                         Assert.Equal(expected, await completion.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                        await readTask.AsTask().WaitAsync(TestSettings.PassingTestTimeout);
                         Assert.Equal(1, Volatile.Read(ref callbacks));
                         AssertExtensions.SequenceEqual(data.AsSpan(0, expected), received.AsSpan());
                     }
@@ -1067,7 +1066,7 @@ namespace System.Net.Sockets.Tests
                         dataPin.Free();
                     }
                 }
-            }, vectorCount.ToString(), CreateOptions(1)).Dispose();
+            }, gather.ToString(), vectorCount.ToString(), CreateOptions(1)).Dispose();
         }
 
         [ConditionalTheory(nameof(IsSupported))]

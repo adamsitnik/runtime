@@ -77,16 +77,4 @@ public abstract partial class IoUringOperation : IThreadPoolWorkItem
     protected void EnqueueContinuation(IoUringRequest request) => EnqueueContinuationCore(request);
 
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
-
-#if !FEATURE_IO_URING
-    private bool IsCancellationRequestedCore => throw new PlatformNotSupportedException();
-
-    private void RequestCancellationCore() => throw new PlatformNotSupportedException();
-
-    private void CompleteOperationCore() => throw new PlatformNotSupportedException();
-
-    private void EnqueueContinuationCore(IoUringRequest request) => throw new PlatformNotSupportedException();
-
-    private void ExecuteCore() => throw new PlatformNotSupportedException();
-#endif
 }

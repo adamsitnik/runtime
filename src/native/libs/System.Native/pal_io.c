@@ -2356,7 +2356,9 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->opcode = IORING_OP_SEND;
             sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
             sqe->len = (uint32_t)request->BufferLength;
-            sqe->msg_flags = (uint32_t)request->Flags;
+            // Let io_uring retry partial stream sends without a managed completion/resubmission.
+            // As with SENDMSG, a later error can still produce a final short completion.
+            sqe->msg_flags = (uint32_t)request->Flags | MSG_WAITALL | MSG_NOSIGNAL;
             // Sends are submitted only after an optimistic userspace send returned EWOULDBLOCK.
 #if defined(IORING_RECVSEND_POLL_FIRST)
             sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
