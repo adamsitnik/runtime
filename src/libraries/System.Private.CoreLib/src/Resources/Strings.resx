@@ -469,6 +469,9 @@
   <data name="Arg_IOException" xml:space="preserve">
     <value>I/O error occurred.</value>
   </data>
+  <data name="Arg_IoUringConflictingHandleOwner" xml:space="preserve">
+    <value>A different owning handle is already bound to this file descriptor. Use the existing owner or a non-owning wrapper.</value>
+  </data>
   <data name="Arg_KeyNotFound" xml:space="preserve">
     <value>The given key was not present in the dictionary.</value>
   </data>

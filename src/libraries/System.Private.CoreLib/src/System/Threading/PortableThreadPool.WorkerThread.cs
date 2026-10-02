@@ -124,13 +124,8 @@ namespace System.Threading
                 while (true)
                 {
                     bool noSpin = false;
-                    while (true)
+                    while (noSpin ? semaphore.WaitNoSpin(timeoutMs) : semaphore.Wait(timeoutMs))
                     {
-                        if (!(noSpin ? semaphore.WaitNoSpin(timeoutMs) : semaphore.Wait(timeoutMs)))
-                        {
-                            break;
-                        }
-
                         noSpin = WorkerDoWork(threadPoolInstance);
                     }
 

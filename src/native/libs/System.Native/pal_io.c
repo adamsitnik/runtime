@@ -2202,7 +2202,7 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 //
 // Submission and the io_uring_enter(2) syscall that actually asks the kernel to process pending
 // entries are deliberately split into two PAL entrypoints (SystemNative_IoRingSubmit /
-// SystemNative_IoRingKick): filling SQEs and publishing them to the SQ tail only touches this
+// SystemNative_IoRingWaitForCompletions): filling SQEs and publishing them to the SQ tail only touches this
 // ring's local submission-queue bookkeeping. The caller serializes publication, submission,
 // and completion reaping; single-issuer rings use their creating thread for all three.
 
@@ -2334,7 +2334,7 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->opcode = IORING_OP_ACCEPT;
             sqe->addr = (uint64_t)(uintptr_t)request->SockAddr;
             sqe->off = (uint64_t)(uintptr_t)request->SockAddrLen;
-            sqe->accept_flags = (uint32_t)request->Flags;
+            sqe->accept_flags = (uint32_t)request->Flags | SOCK_CLOEXEC;
             break;
         case IoRingOp_Connect:
             // addr = input sockaddr*, off (aliased with addr2) = input addrlen (by value, not a
@@ -2356,7 +2356,9 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->opcode = IORING_OP_SEND;
             sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
             sqe->len = (uint32_t)request->BufferLength;
-            sqe->msg_flags = (uint32_t)request->Flags;
+            // Let io_uring retry partial stream sends without a managed completion/resubmission.
+            // As with SENDMSG, a later error can still produce a final short completion.
+            sqe->msg_flags = (uint32_t)request->Flags | MSG_WAITALL | MSG_NOSIGNAL;
             // Sends are submitted only after an optimistic userspace send returned EWOULDBLOCK.
 #if defined(IORING_RECVSEND_POLL_FIRST)
             sqe->ioprio |= IORING_RECVSEND_POLL_FIRST;
@@ -2372,6 +2374,11 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 #if defined(IORING_RECVSEND_POLL_FIRST)
             sqe->ioprio = IORING_RECVSEND_POLL_FIRST;
 #endif
+            break;
+        case IoRingOp_PollRead:
+        case IoRingOp_PollWrite:
+            sqe->opcode = IORING_OP_POLL_ADD;
+            sqe->poll_events = request->OpCode == IoRingOp_PollRead ? POLLIN : POLLOUT;
             break;
         case IoRingOp_Cancel:
             // Targets a still-pending request by its own user_data (addr), looked up within this
@@ -2572,7 +2579,7 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     *ringHandle = (intptr_t)ring;
     return 0;
 #else
-    (void)submissionQueueDepth, (void)completionQueueDepth;
+    (void)submissionQueueDepth, (void)completionQueueDepth, (void)singleIssuer;
     errno = ENOTSUP;
     return -1;
 #endif
@@ -2625,40 +2632,12 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
     __atomic_store_n(ring->SqTail, sqTail, __ATOMIC_RELEASE);
 
     // The entries above are now published via the SQ tail and visible to the kernel; this
-    // cannot be undone. Deliberately do NOT call io_uring_enter here - see
-    // SystemNative_IoRingKick. Doing the (relatively expensive, and otherwise-unnecessary-to-
-    // serialize) syscall outside of whatever lock protects this enqueue step lets many
-    // threads publish new entries into a shared ring quickly, without each blocking the next
-    // behind a full syscall while holding that lock.
+    // cannot be undone. Keep the fallible io_uring_enter in SystemNative_IoRingWaitForCompletions
+    // separate so an enter failure cannot be mistaken for a failure to publish these requests.
     *submittedCount = queued;
     return 0;
 #else
     (void)ringHandle, (void)requests, (void)requestCount;
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-
-int32_t SystemNative_IoRingKick(intptr_t ringHandle)
-{
-#if HAVE_LINUX_IO_URING_H
-    IoRing* ring = (IoRing*)ringHandle;
-    if (ring == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
-    uint32_t pending = IoRingPendingSubmissions(ring);
-    if (pending == 0)
-    {
-        return 0;
-    }
-
-    // A short submission leaves the remainder in the SQ for the next kick or completion wait.
-    return IoUringEnter(ring->Fd, pending, 0, 0) < 0 ? -1 : 0;
-#else
-    (void)ringHandle;
     errno = ENOTSUP;
     return -1;
 #endif

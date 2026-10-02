@@ -105,6 +105,12 @@ namespace System.Net.Sockets
                 if (shouldClose)
                 {
                     bool canceledOperations = false;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                    if (Volatile.Read(ref _ioUringBinding) is IoRingBoundHandle binding)
+                    {
+                        canceledOperations = binding.DisposeAndWait();
+                    }
+#endif
 
                     // Wait until it's safe.
                     SpinWait sw = default;

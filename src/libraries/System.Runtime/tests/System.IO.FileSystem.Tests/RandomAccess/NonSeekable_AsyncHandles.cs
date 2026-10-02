@@ -13,7 +13,9 @@ namespace System.IO.Tests
     {
         protected override bool AsyncHandles => true;
 
-        [ConditionalTheory(typeof(PlatformDetection), nameof(PlatformDetection.IsWindows))]
+        public static bool IsCancellationSupported => OperatingSystem.IsWindows() || IoUring.IsSupported;
+
+        [ConditionalTheory(nameof(IsCancellationSupported))]
         [InlineData(FileAccess.Read)]
         [InlineData(FileAccess.Write)]
         public async Task CancellationIsSupported(FileAccess access)

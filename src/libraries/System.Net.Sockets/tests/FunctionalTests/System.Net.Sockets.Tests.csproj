@@ -22,7 +22,7 @@
     <Compile Include="DualModeSocketTest.cs" />
     <Compile Include="ExecutionContextFlowTest.cs" />
     <Compile Include="InlineCompletions.Unix.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix'"/>
-    <Compile Include="IoUring.Unix.cs" Condition="'$(TargetOS)' == 'linux'" />
+    <Compile Include="IoUring.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="Connect.Unix.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix'"/>
     <Compile Include="IPPacketInformationTest.cs" />
     <Compile Include="KeepAliveTest.cs" />
@@ -112,6 +112,14 @@
              Link="Common\Interop\Unix\Interop.Libraries.cs" />
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.Fcntl.cs"
              Link="Common\Interop\Unix\System.Native\Interop.Fcntl.cs" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'">
+    <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.AdvanceIOVectors.cs"
+             Link="Common\Interop\Unix\System.Native\Interop.AdvanceIOVectors.cs" />
+    <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.IOVector.cs"
+             Link="Common\Interop\Unix\System.Native\Interop.IOVector.cs" />
+    <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.ResourceLimits.cs"
+             Link="Common\Interop\Unix\System.Native\Interop.ResourceLimits.cs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="$(CommonTestPath)StreamConformanceTests\StreamConformanceTests.csproj" />

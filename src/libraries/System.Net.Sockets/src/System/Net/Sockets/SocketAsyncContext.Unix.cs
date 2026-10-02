@@ -149,7 +149,11 @@ namespace System.Net.Sockets
 #endif
             }
 
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            public OperationResult TryComplete(SocketAsyncContext context, SocketError readinessError = SocketError.Success)
+#else
             public OperationResult TryComplete(SocketAsyncContext context)
+#endif
             {
                 TraceWithContext(context, "Enter");
 
@@ -164,7 +168,21 @@ namespace System.Net.Sockets
                 Debug.Assert(oldState == State.Waiting, $"Unexpected operation state: {(State)oldState}");
 
                 // Try to perform the IO
-                if (DoTryComplete(context))
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                bool completed;
+                if (readinessError != SocketError.Success)
+                {
+                    ErrorCode = readinessError;
+                    completed = true;
+                }
+                else
+                {
+                    completed = DoTryComplete(context);
+                }
+#else
+                bool completed = DoTryComplete(context);
+#endif
+                if (completed)
                 {
                     Debug.Assert(_state is State.Running or State.RunningWithPendingCancellation, "Unexpected operation state");
 
@@ -743,7 +761,7 @@ namespace System.Net.Sockets
             Cancelled = 2
         }
 
-        private struct OperationQueue<TOperation>
+        private partial struct OperationQueue<TOperation>
             where TOperation : AsyncOperation
         {
             // Quick overview:
@@ -785,6 +803,15 @@ namespace System.Net.Sockets
                                             // If this happens, we MUST retry the operation, otherwise we risk
                                             // "losing" the notification and causing the operation to pend indefinitely.
             private AsyncOperation? _tail;   // Queue of pending IO operations to process when data becomes available.
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            // A direct io_uring request occupies this direction without being linked into _tail.
+            // Reserve its queue position so later queued or synchronous operations cannot overtake it.
+            private bool _ioUringOperationPending;
+            // One-shot POLL_ADD wakes syscall-based adapters after EAGAIN, without using epoll.
+            private IoUringPollOperation? _readinessOperation;
+            // Deliver poll failures to the queued operation instead of retrying as if it were ready.
+            private SocketError _readinessError;
+#endif
 
             // The _queueLock is used to ensure atomic access to the queue state above.
             // The lock is only ever held briefly, to read and/or update queue state, and
@@ -794,6 +821,7 @@ namespace System.Net.Sockets
             private LockToken Lock() => new LockToken(_queueLock);
 
             public bool IsNextOperationSynchronous_Speculative => _isNextOperationSynchronous;
+
 
             public void Init()
             {
@@ -844,9 +872,18 @@ namespace System.Net.Sockets
                     return false;
                 }
 
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                if (IoUring.IsSupported && Volatile.Read(ref _readinessOperation) is null)
+                {
+                    Interlocked.CompareExchange(ref _readinessOperation,
+                        new IoUringPollOperation(context, typeof(TOperation) == typeof(ReadOperation)), null);
+                }
+#endif
+
                 while (true)
                 {
                     bool doAbort = false;
+                    bool enqueued = false;
                     using (Lock())
                     {
                         switch (_state)
@@ -892,7 +929,8 @@ namespace System.Net.Sockets
                                     operation.CancellationRegistration = cancellationToken.UnsafeRegister(s => ((TOperation)s!).TryCancel(), operation);
                                 }
 
-                                return true;
+                                enqueued = true;
+                                break;
 
                             case QueueState.Stopped:
                                 Debug.Assert(_tail == null);
@@ -903,6 +941,15 @@ namespace System.Net.Sockets
                                 Environment.FailFast("unexpected queue state");
                                 break;
                         }
+                    }
+
+                    if (enqueued)
+                    {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                        // Poll submission and failure notification must run outside the queue lock.
+                        EnsureIoUringReadiness();
+#endif
+                        return true;
                     }
 
                     if (doAbort)
@@ -977,7 +1024,11 @@ namespace System.Net.Sockets
                             break;
 
                         case QueueState.Processing:
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                            Debug.Assert(_tail != null || _ioUringOperationPending, "State == Processing but queue is empty!");
+#else
                             Debug.Assert(_tail != null, "State == Processing but queue is empty!");
+#endif
                             _sequenceNumber++;
                             Trace(context, $"Exit (currently processing)");
                             return null;
@@ -1033,6 +1084,9 @@ namespace System.Net.Sockets
                 SocketAsyncContext context = op.AssociatedContext;
 
                 int observedSequenceNumber;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                SocketError readinessError;
+#endif
                 using (Lock())
                 {
                     Trace(context, $"Enter");
@@ -1049,13 +1103,21 @@ namespace System.Net.Sockets
                         Debug.Assert(_tail != null, "Unexpected empty queue while processing I/O");
                         Debug.Assert(op == _tail.Next, "Operation is not at head of queue???");
                         observedSequenceNumber = _sequenceNumber;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                        readinessError = _readinessError;
+                        _readinessError = SocketError.Success;
+#endif
                     }
                 }
 
                 OperationResult result;
                 while (true)
                 {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                    result = op.TryComplete(context, readinessError);
+#else
                     result = op.TryComplete(context);
+#endif
                     if (result != OperationResult.Pending)
                     {
                         break;
@@ -1063,6 +1125,7 @@ namespace System.Net.Sockets
 
                     // Check for retry and reset queue state.
 
+                    bool waiting = false;
                     using (Lock())
                     {
                         if (_state == QueueState.Stopped)
@@ -1081,14 +1144,26 @@ namespace System.Net.Sockets
                                 // So, we need to retry the operation.
                                 Debug.Assert(observedSequenceNumber - _sequenceNumber < 10000, "Very large sequence number increase???");
                                 observedSequenceNumber = _sequenceNumber;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                                readinessError = _readinessError;
+                                _readinessError = SocketError.Success;
+#endif
                             }
                             else
                             {
                                 _state = QueueState.Waiting;
                                 Trace(context, $"Exit (received EAGAIN)");
-                                return OperationResult.Pending;
+                                waiting = true;
                             }
                         }
+                    }
+                    if (waiting)
+                    {
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                        // Poll submission and failure notification must run outside the queue lock.
+                        EnsureIoUringReadiness();
+#endif
+                        return OperationResult.Pending;
                     }
                 }
 
@@ -1129,6 +1204,7 @@ namespace System.Net.Sockets
 
                 Debug.Assert(result != OperationResult.Pending);
                 return result;
+
             }
 
             public void CancelAndContinueProcessing(TOperation op)
@@ -1166,7 +1242,11 @@ namespace System.Net.Sockets
                             }
 
                             // We're the first op in the queue.
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                            if (_state == QueueState.Processing && !_ioUringOperationPending)
+#else
                             if (_state == QueueState.Processing)
+#endif
                             {
                                 // The queue has already handed off execution responsibility to us.
                                 // We need to dispatch to the next op.
@@ -1187,6 +1267,13 @@ namespace System.Net.Sockets
                                     _state = QueueState.Ready;
                                     _sequenceNumber++;
                                 }
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                                else if (IoUring.IsSupported)
+                                {
+                                    _state = QueueState.Processing;
+                                    nextOp = _tail.Next;
+                                }
+#endif
                             }
                         }
                         else
@@ -1226,6 +1313,9 @@ namespace System.Net.Sockets
                     Debug.Assert(_state != QueueState.Stopped);
 
                     _state = QueueState.Stopped;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                    aborted = _ioUringOperationPending;
+#endif
 
                     if (_tail != null)
                     {
@@ -1262,7 +1352,11 @@ namespace System.Net.Sockets
         private OperationQueue<ReadOperation> _receiveQueue;
         private OperationQueue<WriteOperation> _sendQueue;
         private SocketAsyncEngine? _asyncEngine;
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+        private bool IsRegistered => _asyncEngine != null || Volatile.Read(ref _ioUringReadinessRegistered);
+#else
         private bool IsRegistered => _asyncEngine != null;
+#endif
         private bool _isHandleNonBlocking = OperatingSystem.IsWasi(); // WASI sockets are always non-blocking, because we don't have another thread which could be blocked
         /// <summary>An index into <see cref="SocketAsyncEngine"/>'s table of all contexts that are currently <see cref="IsRegistered"/>.</summary>
         internal int GlobalContextIndex = -1;
@@ -1288,6 +1382,15 @@ namespace System.Net.Sockets
         private bool TryRegister(out Interop.Error error)
         {
             Debug.Assert(_isHandleNonBlocking);
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            if (IoUring.IsSupported)
+            {
+                _ = IoUringBinding;
+                Volatile.Write(ref _ioUringReadinessRegistered, true);
+                error = Interop.Error.SUCCESS;
+                return true;
+            }
+#endif
             lock (_registerLock)
             {
                 if (_asyncEngine == null)
@@ -1334,7 +1437,7 @@ namespace System.Net.Sockets
             // We don't need to synchronize with Register.
             // This method is called when the handle gets released.
             // The Register method will throw ODE when it tries to use the handle at this point.
-            if (IsRegistered)
+            if (_asyncEngine != null)
             {
                 SocketAsyncEngine.UnregisterSocket(this);
             }
@@ -1410,22 +1513,56 @@ namespace System.Net.Sockets
                 while (true)
                 {
                     long waitStart = Stopwatch.GetTimestamp();
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+                    bool pollTimedOut = false;
 
-                    if (!e.Wait(timeout))
+                    if (IoUring.IsSupported && queue.IsWaitingSynchronously(operation))
                     {
-                        timeoutExpired = true;
-                        break;
+                        // Bound each poll's handle reference so direct SafeHandle disposal can
+                        // close the descriptor. Progress must not depend on a ThreadPool worker.
+                        const int PollIntervalMilliseconds = 100;
+                        Interop.Error pollError;
+                        Interop.PollEvents triggered;
+                        try
+                        {
+                            // Validate disposal-requested state even while another I/O retains the handle.
+                            ObjectDisposedException.ThrowIf(_socket.IsIoUringDisposed, _socket);
+                            _ = _socket.IoUringBinding;
+                            pollError = Interop.Sys.Poll(_socket,
+                                typeof(TOperation) == typeof(ReadOperation) ? Interop.PollEvents.POLLIN : Interop.PollEvents.POLLOUT,
+                                timeout < 0 ? PollIntervalMilliseconds : Math.Min(timeout, PollIntervalMilliseconds), out triggered);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            pollError = Interop.Error.ECANCELED;
+                            triggered = Interop.PollEvents.POLLNONE;
+                        }
+                        pollTimedOut = pollError == Interop.Error.SUCCESS && triggered == Interop.PollEvents.POLLNONE;
+                        if (!pollTimedOut)
+                        {
+                            queue.HandleIoUringReadiness(this, SocketPal.GetSocketErrorForErrorCode(pollError));
+                        }
                     }
 
-                    // Reset the event now to avoid lost notifications if the processing is unsuccessful.
-                    e.Reset();
-
-                    // We've been signalled to try to process the operation.
-                    OperationResult result = queue.ProcessQueuedOperation(operation);
-                    if (result == OperationResult.Completed ||
-                        result == OperationResult.Cancelled)
+                    if (!pollTimedOut)
+#endif
                     {
-                        break;
+                        if (!e.Wait(timeout))
+                        {
+                            timeoutExpired = true;
+                            break;
+                        }
+
+                        // Reset the event now to avoid lost notifications if the processing is unsuccessful.
+                        e.Reset();
+
+                        // We've been signalled to try to process the operation.
+                        OperationResult result = queue.ProcessQueuedOperation(operation);
+                        if (result == OperationResult.Completed ||
+                            result == OperationResult.Cancelled)
+                        {
+                            break;
+                        }
                     }
 
                     // Couldn't process the operation.
@@ -1510,14 +1647,14 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            // TODO: io_uring: Add accept cancellation support. Cancellation is intentionally
-            // unsupported while we compare io_uring performance against epoll.
-            if (ready && TryAcceptViaIoUring(socketAddress, callback))
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            if (ready && TryAcceptViaIoUring(socketAddress, callback, cancellationToken))
             {
                 acceptedFd = (IntPtr)(-1);
                 socketAddressLen = 0;
                 return SocketError.IOPending;
             }
+#endif
 
             AcceptOperation operation = RentAcceptOperation();
             operation.Callback = callback;
@@ -1572,13 +1709,15 @@ namespace System.Net.Sockets
             Debug.Assert(socketAddress.Length > 0, $"Unexpected socketAddressLen: {socketAddress.Length}");
             Debug.Assert(callback != null, "Expected non-null callback");
 
-            SetHandleNonBlocking();
-
-            if (buffer.Length == 0 && !_socket.IsDisconnected && TryConnectViaIoUring(socketAddress, callback))
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            if (buffer.Length == 0 && !_socket.IsDisconnected && TryConnectViaIoUring(socketAddress, callback, cancellationToken))
             {
                 sentBytes = 0;
                 return SocketError.IOPending;
             }
+#endif
+
+            SetHandleNonBlocking();
 
             // Connect is different than the usual "readiness" pattern of other operations.
             // We need to initiate the connect before we try to complete it.
@@ -1729,11 +1868,13 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
-            if (ready && TryReceiveViaIoUring(buffer, flags, callback))
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
+            if (ready && TryReceiveViaIoUring(buffer, flags, callback, cancellationToken))
             {
                 bytesReceived = 0;
                 return SocketError.IOPending;
             }
+#endif
 
             BufferMemoryReceiveOperation operation = RentBufferMemoryReceiveOperation();
             operation.SetReceivedFlags = false;
@@ -1766,15 +1907,6 @@ namespace System.Net.Sockets
                 SocketPal.TryCompleteReceiveFrom(_socket, buffer.Span, flags, socketAddress.Span, out socketAddressLen, out bytesReceived, out receivedFlags, out errorCode))
             {
                 return errorCode;
-            }
-
-            if (ready && socketAddress.Length == 0 &&
-                TryReceiveViaIoUring(buffer, flags, callback))
-            {
-                socketAddressLen = 0;
-                bytesReceived = 0;
-                receivedFlags = SocketFlags.None;
-                return SocketError.IOPending;
             }
 
             BufferMemoryReceiveOperation operation = RentBufferMemoryReceiveOperation();
@@ -2090,11 +2222,13 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
             if (ready && socketAddress.Length == 0 &&
-                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback))
+                TrySendViaIoUring(buffer, offset, count, flags, bytesSent, callback, cancellationToken))
             {
                 return SocketError.IOPending;
             }
+#endif
 
             BufferMemorySendOperation operation = RentBufferMemorySendOperation();
             operation.Callback = callback;
@@ -2177,11 +2311,13 @@ namespace System.Net.Sockets
                 return errorCode;
             }
 
+#if SYSTEM_NET_SOCKETS_LINUX_PLATFORM
             if (ready && socketAddress.IsEmpty &&
                 TrySendViaIoUring(buffers, bufferIndex, offset, flags, bytesSent, callback))
             {
                 return SocketError.IOPending;
             }
+#endif
 
             BufferListSendOperation operation = RentBufferListSendOperation();
             operation.Callback = callback;

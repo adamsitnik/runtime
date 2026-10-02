@@ -7,6 +7,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.DotNet.RemoteExecutor;
 using Xunit;
@@ -251,6 +252,49 @@ namespace System.Net.Sockets.Tests
         {
             AssertExtensions.Throws<ArgumentNullException>("handle", () => new Socket(null));
             AssertExtensions.Throws<ArgumentException>("handle", () => new Socket(new SafeSocketHandle((IntPtr)(-1), false)));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        [PlatformSpecific(TestPlatforms.Linux)]
+        public async Task Socket_FromPipeHandle_PendingIoSucceeds(bool send)
+        {
+            (int readFd, int writeFd) = pipe2();
+            using Socket reader = new Socket(new SafeSocketHandle((IntPtr)readFd, ownsHandle: true));
+            using Socket writer = new Socket(new SafeSocketHandle((IntPtr)writeFd, ownsHandle: true));
+            using CancellationTokenSource cancellation = new CancellationTokenSource(TestSettings.PassingTestTimeout);
+            byte[] payload = new byte[send ? 1024 * 1024 : 1];
+            Array.Fill(payload, (byte)42);
+            byte[] received = new byte[payload.Length];
+
+            if (send)
+            {
+                Task<int> pending = writer.SendAsync(payload.AsMemory(), SocketFlags.None, cancellation.Token).AsTask();
+                Assert.False(pending.IsCompleted);
+                Task drain = DrainAsync();
+                await Task.WhenAll(pending, drain).WaitAsync(TestSettings.PassingTestTimeout);
+                Assert.Equal(payload.Length, pending.Result);
+            }
+            else
+            {
+                Task<int> pending = reader.ReceiveAsync(received.AsMemory(), SocketFlags.None, cancellation.Token).AsTask();
+                Assert.False(pending.IsCompleted);
+                Assert.Equal(payload.Length, writer.Send(payload));
+                Assert.Equal(payload.Length, await pending.WaitAsync(TestSettings.PassingTestTimeout));
+            }
+            Assert.Equal(payload, received);
+
+            async Task DrainAsync()
+            {
+                int offset = 0;
+                while (offset < received.Length)
+                {
+                    int count = await reader.ReceiveAsync(received.AsMemory(offset), SocketFlags.None, cancellation.Token);
+                    Assert.NotEqual(0, count);
+                    offset += count;
+                }
+            }
         }
 
         [Theory]
