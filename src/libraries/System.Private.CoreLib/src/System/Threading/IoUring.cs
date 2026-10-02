@@ -26,6 +26,10 @@ namespace System.Threading
 
         /// <summary>Gets the canonical binding of a handle to one io_uring issuer.</summary>
         /// <param name="handle">The handle to bind without transferring its ownership.</param>
+        /// <param name="ownsFileDescriptor">
+        /// <see langword="true"/> if <paramref name="handle"/> owns and closes the underlying file descriptor;
+        /// otherwise, <see langword="false"/> for a borrowed wrapper.
+        /// </param>
         /// <returns>The shared binding for this file descriptor.</returns>
         /// <remarks>
         /// The handle owner must retain the binding, submit operations through
@@ -33,14 +37,20 @@ namespace System.Threading
         /// Disposing the handle alone does not cancel operations or release the binding's handle reference.
         /// Binding disposal requests cancellation but does not end the lifetime of outstanding operation buffers.
         /// Different handle wrappers for the same file descriptor share admission and cancellation.
-        /// Each registered wrapper is retained until native requests drain. This does not transfer descriptor
-        /// ownership or make multiple owning wrappers safe from closing the same descriptor twice.
+        /// The binding retains one handle until native requests drain. If a borrowed handle binds first,
+        /// an owning handle replaces it when that owner binds. Other borrowed wrappers are not retained.
+        /// Until the owner binds, the caller must keep the underlying descriptor open.
+        /// A different owning wrapper for an already-owned descriptor is rejected.
+        /// The caller must accurately describe descriptor ownership; this argument does not change it.
+        /// A handle that runs cleanup on release without closing the descriptor is a borrowed wrapper.
         /// </remarks>
         /// <exception cref="ArgumentNullException"><paramref name="handle"/> is null.</exception>
-        /// <exception cref="ArgumentException"><paramref name="handle"/> is invalid.</exception>
+        /// <exception cref="ArgumentException">
+        /// <paramref name="handle"/> is invalid, or a different owning handle is already bound to its descriptor.
+        /// </exception>
         /// <exception cref="PlatformNotSupportedException">io_uring is unavailable.</exception>
         /// <exception cref="ObjectDisposedException">The handle or its binding has been disposed.</exception>
-        public static IoRingBoundHandle Bind(SafeHandle handle)
+        public static IoRingBoundHandle Bind(SafeHandle handle, bool ownsFileDescriptor)
         {
             ArgumentNullException.ThrowIfNull(handle);
             ObjectDisposedException.ThrowIf(handle.IsClosed, handle);
@@ -54,7 +64,7 @@ namespace System.Threading
 #if FEATURE_IO_URING
             if (IsSupported)
             {
-                return IoRingBoundHandle.GetOrCreate(handle);
+                return IoRingBoundHandle.GetOrCreate(handle, ownsFileDescriptor);
             }
 #endif
             throw new PlatformNotSupportedException();

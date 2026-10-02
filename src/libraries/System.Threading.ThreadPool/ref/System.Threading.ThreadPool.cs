@@ -85,7 +85,7 @@ namespace System.Threading
     public static class IoUring
     {
         public static bool IsSupported { get { throw null; } }
-        public static System.Threading.IoRingBoundHandle Bind(System.Runtime.InteropServices.SafeHandle handle) { throw null; }
+        public static System.Threading.IoRingBoundHandle Bind(System.Runtime.InteropServices.SafeHandle handle, bool ownsFileDescriptor) { throw null; }
     }
     [System.CLSCompliantAttribute(false)]
     public sealed class IoRingBoundHandle : System.IDisposable, System.Threading.IThreadPoolWorkItem

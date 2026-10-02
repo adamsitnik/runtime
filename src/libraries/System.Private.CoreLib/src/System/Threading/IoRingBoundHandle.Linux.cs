@@ -3,23 +3,22 @@
 
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using Ring = System.Threading.PortableThreadPool.IoUringThreadPool.Ring;
 
 namespace System.Threading;
 
-// A binding gives one numeric file descriptor a stable ring and keeps its SafeHandle wrappers
-// alive while accepted native work can still use that descriptor. Closing an fd alone does not
+// A binding gives one numeric file descriptor a stable ring and retains one SafeHandle
+// while accepted native work can still use that descriptor. Closing an fd alone does not
 // cancel io_uring requests: the kernel holds its own file references. Conversely, releasing our
 // SafeHandle references too early could recycle the fd while a queued request still contains it.
 //
 // For example, a pending Socket.ReceiveAsync pins its buffer and calls EnqueueForSubmission on
 // the socket's cached binding:
 // - GetOrCreate, used on first binding, retains the supplied wrapper before reading its fd.
-//   The registry makes aliases of that same fd share this binding. ReferencesHandle avoids
-//   adding another permanent reference on repeated Bind calls for the same wrapper; distinct
-//   wrappers need distinct references because their SafeHandle reference counts are independent.
+//   The registry makes aliases of that same fd share this binding, without retaining each alias.
+//   If a borrowed wrapper bound first, the owning wrapper replaces it when that owner binds.
+//   A different owning wrapper is rejected: one descriptor must not have independent owners.
 //   The weak registry does not itself keep abandoned bindings alive. Long weak references keep
 //   a finalizer-pending binding discoverable until its references are actually released.
 // - EnqueueForSubmissionCore starts one logical operation, including its cancellation registration.
@@ -44,11 +43,11 @@ namespace System.Threading;
 // partial completions. HadPendingOperations remembers whether close must remain abortive.
 //
 // ReleaseReference claims cleanup exactly once, removes this registry entry before fd reuse is
-// possible, then balances every retained wrapper through ReleaseHandleReference, outside the
+// possible, then releases the retained handle reference outside the
 // registry lock and never on the issuer. A custom ReleaseHandle may reenter DisposeAndWait on the
 // same thread; _releasingThreadId prevents that thread from waiting for itself, while other callers
 // wait for actual release. ExecuteCore performs deferred cleanup; the finalizer covers abandonment.
-// This protects registered wrappers, not external close(fd), nor invalid double-owning wrappers.
+// A borrowed handle alone cannot protect against its unregistered owner closing the descriptor.
 public sealed partial class IoRingBoundHandle
 {
     private const int Closed = int.MinValue;
@@ -58,8 +57,8 @@ public sealed partial class IoRingBoundHandle
     // are retired, without keeping abandoned owners alive indefinitely.
     private static readonly Dictionary<nint, WeakReference<IoRingBoundHandle>> s_bindings = new();
 
-    private readonly SafeHandle _handle;
-    private List<SafeHandle>? _additionalHandles;
+    private SafeHandle _handle;
+    private bool _ownsFileDescriptor;
     private int _state;
     private int _referenceReleased = 2;
     private int _releasingThreadId;
@@ -72,9 +71,10 @@ public sealed partial class IoRingBoundHandle
     internal IoUringOperation? _operationsHead;
     internal IoRingBoundHandle? _nextClosing;
 
-    private IoRingBoundHandle(SafeHandle handle, nint fileDescriptor)
+    private IoRingBoundHandle(SafeHandle handle, nint fileDescriptor, bool ownsFileDescriptor)
     {
         _handle = handle;
+        _ownsFileDescriptor = ownsFileDescriptor;
         _fileDescriptor = fileDescriptor;
         _ring = PortableThreadPool.IoUringThreadPool.GetRing(fileDescriptor);
         _referenceReleased = 0;
@@ -90,13 +90,28 @@ public sealed partial class IoRingBoundHandle
     }
 
     internal bool IsDisposed => Volatile.Read(ref _state) < 0;
-    internal SafeHandle Handle => _handle;
 
-    internal static IoRingBoundHandle GetOrCreate(SafeHandle handle)
+    internal int GetSocketType()
     {
-        bool added = false;
+        lock (s_bindings)
+        {
+            // Promotion can release the old borrowed wrapper. Keep it alive through marshalling.
+            ObjectDisposedException.ThrowIf(IsDisposed, this);
+            Interop.Error error = Interop.Sys.GetIoRingSocketType(_handle,
+                out _, out int socketType, out _, out _);
+            if (error != Interop.Error.SUCCESS)
+            {
+                throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
+            }
+            return socketType;
+        }
+    }
+
+    internal static IoRingBoundHandle GetOrCreate(SafeHandle handle, bool ownsFileDescriptor)
+    {
+        handle.DangerousAddRef();
+        SafeHandle? handleToRelease = handle;
         IoRingBoundHandle? unpublishedBinding = null;
-        handle.DangerousAddRef(ref added);
         try
         {
             nint fileDescriptor = handle.DangerousGetHandle();
@@ -111,18 +126,27 @@ public sealed partial class IoRingBoundHandle
                     reference.TryGetTarget(out IoRingBoundHandle? binding))
                 {
                     ObjectDisposedException.ThrowIf(binding.IsDisposed, handle);
-                    if (!binding.ReferencesHandle(handle))
+                    if (ownsFileDescriptor)
                     {
-                        // A borrowed wrapper may have bound first. Retain each wrapper, including
-                        // a subsequently bound owning handle, until all native requests retire.
-                        (binding._additionalHandles ??= new()).Add(handle);
-                        added = false;
+                        if (binding._ownsFileDescriptor && !ReferenceEquals(binding._handle, handle))
+                        {
+                            throw new ArgumentException(SR.Arg_IoUringConflictingHandleOwner, nameof(handle));
+                        }
+
+                        if (!binding._ownsFileDescriptor)
+                        {
+                            // Transfer the acquired reference to the binding before releasing the
+                            // borrowed wrapper. Cleanup observes the replacement under this same lock.
+                            handleToRelease = binding._handle;
+                            binding._handle = handle;
+                            binding._ownsFileDescriptor = true;
+                        }
                     }
                     return binding;
                 }
 
-                unpublishedBinding = new IoRingBoundHandle(handle, fileDescriptor);
-                added = false;
+                unpublishedBinding = new IoRingBoundHandle(handle, fileDescriptor, ownsFileDescriptor);
+                handleToRelease = null;
                 s_bindings[fileDescriptor] = new WeakReference<IoRingBoundHandle>(unpublishedBinding, trackResurrection: true);
                 binding = unpublishedBinding;
                 unpublishedBinding = null;
@@ -131,31 +155,9 @@ public sealed partial class IoRingBoundHandle
         }
         finally
         {
-            if (added)
-            {
-                handle.DangerousRelease();
-            }
+            handleToRelease?.DangerousRelease();
             unpublishedBinding?.DisposeAndWait();
         }
-    }
-
-    private bool ReferencesHandle(SafeHandle handle)
-    {
-        if (ReferenceEquals(_handle, handle))
-        {
-            return true;
-        }
-        if (_additionalHandles is not null)
-        {
-            foreach (SafeHandle registered in _additionalHandles)
-            {
-                if (ReferenceEquals(registered, handle))
-                {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     private void EnqueueForSubmissionCore(IoUringOperation operation, CancellationToken cancellationToken)
@@ -328,7 +330,7 @@ public sealed partial class IoRingBoundHandle
             Volatile.Write(ref _releasingThreadId, Environment.CurrentManagedThreadId);
             try
             {
-                List<SafeHandle>? additionalHandles;
+                SafeHandle handle;
                 lock (s_bindings)
                 {
                     if (s_bindings.TryGetValue(_fileDescriptor, out WeakReference<IoRingBoundHandle>? reference) &&
@@ -338,23 +340,9 @@ public sealed partial class IoRingBoundHandle
                         // and never run an arbitrary ReleaseHandle while holding the registry lock.
                         s_bindings.Remove(_fileDescriptor);
                     }
-                    additionalHandles = _additionalHandles;
-                    _additionalHandles = null;
+                    handle = _handle;
                 }
-
-                Exception? releaseError = null;
-                ReleaseHandleReference(_handle, ref releaseError);
-                if (additionalHandles is not null)
-                {
-                    foreach (SafeHandle handle in additionalHandles)
-                    {
-                        ReleaseHandleReference(handle, ref releaseError);
-                    }
-                }
-                if (releaseError is not null)
-                {
-                    ExceptionDispatchInfo.Throw(releaseError);
-                }
+                handle.DangerousRelease();
             }
             finally
             {
@@ -374,19 +362,6 @@ public sealed partial class IoRingBoundHandle
             {
                 spinner.SpinOnce();
             }
-        }
-    }
-
-    private static void ReleaseHandleReference(SafeHandle handle, ref Exception? releaseError)
-    {
-        try
-        {
-            handle.DangerousRelease();
-        }
-        catch (Exception error)
-        {
-            // Balance the other wrappers' references before propagating a faulty ReleaseHandle.
-            releaseError ??= error;
         }
     }
 

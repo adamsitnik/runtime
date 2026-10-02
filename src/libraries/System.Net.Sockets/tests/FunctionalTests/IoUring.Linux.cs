@@ -211,7 +211,7 @@ namespace System.Net.Sockets.Tests
                 using (CountingHandle owner = new CountingHandle(receiver.SafeHandle.DangerousGetHandle(), new ReleaseCounter()))
                 {
                     IoRingBoundHandle binding = owner.Binding;
-                    Assert.Same(binding, IoUring.Bind(owner));
+                    Assert.Same(binding, IoUring.Bind(owner, ownsFileDescriptor: true));
                     BoundReceiveOperation operation = new BoundReceiveOperation();
                     for (int i = 0; i < 50; i++)
                     {
@@ -427,7 +427,7 @@ namespace System.Net.Sockets.Tests
                 ReleaseCounter counter = new ReleaseCounter();
                 using CountingHandle handle = new CountingHandle(
                     socket.SafeHandle.DangerousGetHandle(), counter, disposeDuringValidation: true);
-                Assert.Throws<ObjectDisposedException>(() => IoUring.Bind(handle));
+                Assert.Throws<ObjectDisposedException>(() => IoUring.Bind(handle, ownsFileDescriptor: true));
                 Assert.Equal(1, counter.Count);
             }, CreateOptions(1)).Dispose();
         }
@@ -477,24 +477,28 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalTheory(nameof(IsSupported))]
-        [InlineData(false)]
-        [InlineData(true)]
-        public void Bind_DistinctWrappersShareBindingAndCancellation(bool bindBorrowedFirst)
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void Bind_DistinctWrappersShareBindingAndCancellation(bool bindBorrowedFirst, bool socketWrapper)
         {
-            RemoteExecutor.Invoke(async borrowedText =>
+            RemoteExecutor.Invoke(async (borrowedText, socketText) =>
             {
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (Microsoft.Win32.SafeHandles.SafeFileHandle borrowed = new(receiver.SafeHandle.DangerousGetHandle(), ownsHandle: false))
+                using (SafeHandle borrowed = bool.Parse(socketText)
+                    ? new SafeSocketHandle(receiver.Handle, ownsHandle: false)
+                    : new SafeFileHandle(receiver.Handle, ownsHandle: false))
                 {
                     bool borrowedFirst = bool.Parse(borrowedText);
-                    using IoRingBoundHandle first = IoUring.Bind(borrowedFirst ? borrowed : receiver.SafeHandle);
-                    using IoRingBoundHandle second = IoUring.Bind(borrowedFirst ? receiver.SafeHandle : borrowed);
+                    using IoRingBoundHandle first = IoUring.Bind(borrowedFirst ? borrowed : receiver.SafeHandle, ownsFileDescriptor: !borrowedFirst);
+                    using IoRingBoundHandle second = IoUring.Bind(borrowedFirst ? receiver.SafeHandle : borrowed, ownsFileDescriptor: borrowedFirst);
                     Assert.Same(first, second);
                     IoRingBoundHandle[] simultaneous = await Task.WhenAll(
-                        Task.Run(() => IoUring.Bind(borrowed)),
-                        Task.Run(() => IoUring.Bind(receiver.SafeHandle)));
+                        Task.Run(() => IoUring.Bind(borrowed, ownsFileDescriptor: false)),
+                        Task.Run(() => IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true)));
                     Assert.All(simultaneous, binding => Assert.Same(first, binding));
 
                     BoundReceiveOperation read = new();
@@ -507,15 +511,209 @@ namespace System.Net.Sockets.Tests
                     Assert.Equal(1, sender.Send(new byte[] { 17 }));
                     Assert.Equal(1, receiver.Receive(new byte[1]));
 
-                    using IoRingBoundHandle rebound = IoUring.Bind(receiver.SafeHandle);
+                    using IoRingBoundHandle rebound = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
                     Assert.NotSame(first, rebound);
-                    Assert.Same(rebound, IoUring.Bind(borrowed));
+                    Assert.Same(rebound, IoUring.Bind(borrowed, ownsFileDescriptor: false));
                 }
-            }, bindBorrowedFirst.ToString(), CreateOptions(1)).Dispose();
+            }, bindBorrowedFirst.ToString(), socketWrapper.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void Bind_OwnerPromotionReleasesBorrowedReferences(bool bindBorrowedFirst, bool socketWrapper)
+        {
+            RemoteExecutor.Invoke(async (borrowedText, socketText) =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (SafeHandle borrowed = bool.Parse(socketText)
+                    ? new SafeSocketHandle(receiver.Handle, ownsHandle: false)
+                    : new SafeFileHandle(receiver.Handle, ownsHandle: false))
+                using (SafeHandle alias = bool.Parse(socketText)
+                    ? new SafeSocketHandle(receiver.Handle, ownsHandle: false)
+                    : new SafeFileHandle(receiver.Handle, ownsHandle: false))
+                {
+                    bool borrowedFirst = bool.Parse(borrowedText);
+                    SafeSocketHandle owner = receiver.SafeHandle;
+                    using IoRingBoundHandle binding = IoUring.Bind(borrowedFirst ? borrowed : owner, ownsFileDescriptor: !borrowedFirst);
+                    Assert.Same(binding, IoUring.Bind(alias, ownsFileDescriptor: false));
+                    BoundReceiveOperation operation = new BoundReceiveOperation();
+                    operation.Prepare();
+                    binding.EnqueueForSubmission(operation);
+
+                    Assert.Same(binding, IoUring.Bind(borrowedFirst ? owner : borrowed, ownsFileDescriptor: borrowedFirst));
+                    Assert.Same(binding, IoUring.Bind(alias, ownsFileDescriptor: false));
+                    borrowed.Dispose();
+                    alias.Dispose();
+                    Assert.True(borrowed.IsClosed);
+                    Assert.True(alias.IsClosed);
+                    Assert.False(operation.Completion.IsCompleted);
+
+                    owner.Dispose();
+                    Assert.False(owner.IsClosed);
+                    binding.DisposeAndWait();
+                    Assert.True(owner.IsClosed);
+                    Assert.Equal(-125, await operation.Completion.WaitAsync(TestSettings.PassingTestTimeout));
+                }
+            }, bindBorrowedFirst.ToString(), socketWrapper.ToString(), CreateOptions(1)).Dispose();
         }
 
         [ConditionalFact(nameof(IsSupported))]
-        public void Bind_AliasReferencesAreBalancedAndReleasedOutsideRegistryLock()
+        public void Bind_ConcurrentOwners_OnlyOneIsRetained()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                using Socket socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                using SafeFileHandle borrowed = new SafeFileHandle(socket.Handle, ownsHandle: false);
+                ReleaseCounter firstCounter = new ReleaseCounter();
+                ReleaseCounter secondCounter = new ReleaseCounter();
+                using CountingHandle first = new CountingHandle(socket.Handle, firstCounter);
+                using CountingHandle second = new CountingHandle(socket.Handle, secondCounter);
+                using IoRingBoundHandle binding = IoUring.Bind(borrowed, ownsFileDescriptor: false);
+                using Barrier barrier = new Barrier(2);
+                Exception?[] errors = await Task.WhenAll(
+                    Task.Run(() =>
+                    {
+                        barrier.SignalAndWait();
+                        return Record.Exception(() => Assert.Same(binding, IoUring.Bind(first, ownsFileDescriptor: true)));
+                    }),
+                    Task.Run(() =>
+                    {
+                        barrier.SignalAndWait();
+                        return Record.Exception(() => Assert.Same(binding, IoUring.Bind(second, ownsFileDescriptor: true)));
+                    }));
+                Assert.Single(errors, error => error is null);
+                Assert.Single(errors, error => error is ArgumentException argument && argument.ParamName == "handle");
+
+                borrowed.Dispose();
+                Assert.True(borrowed.IsClosed);
+                first.Dispose();
+                second.Dispose();
+                Assert.Equal(1, firstCounter.Count + secondCounter.Count);
+                binding.DisposeAndWait();
+                Assert.Equal(1, firstCounter.Count);
+                Assert.Equal(1, secondCounter.Count);
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void Bind_OwnerPromotionRacingMultishotPreparation(bool socketWrapper)
+        {
+            RemoteExecutor.Invoke(async socketText =>
+            {
+                for (int i = 0; i < 30; i++)
+                {
+                    (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                    using (sender)
+                    using (receiver)
+                    using (SafeHandle borrowed = bool.Parse(socketText)
+                        ? new SafeSocketHandle(receiver.Handle, ownsHandle: false)
+                        : new SafeFileHandle(receiver.Handle, ownsHandle: false))
+                    using (IoRingBoundHandle binding = IoUring.Bind(borrowed, ownsFileDescriptor: false))
+                    using (Barrier barrier = new Barrier(2))
+                    {
+                        borrowed.Dispose();
+                        TaskCompletionSource<int> completion = new TaskCompletionSource<int>(
+                            TaskCreationOptions.RunContinuationsAsynchronously);
+                        await Task.WhenAll(
+                            Task.Run(() =>
+                            {
+                                barrier.SignalAndWait();
+                                Assert.Same(binding, IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true));
+                            }),
+                            Task.Run(() =>
+                            {
+                                barrier.SignalAndWait();
+                                EnqueueMultishot(binding, (result, buffer, more) =>
+                                {
+                                    buffer?.Dispose();
+                                    if (!more)
+                                    {
+                                        completion.SetResult(result);
+                                    }
+                                });
+                            })).WaitAsync(TestSettings.PassingTestTimeout);
+                        Assert.True(borrowed.IsClosed);
+                        binding.DisposeAndWait();
+                        Assert.Equal(-125, await completion.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                    }
+                }
+            }, socketWrapper.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void BorrowedSocket_AsyncReceivePreservesOwner(bool bindOwnerFirst)
+        {
+            RemoteExecutor.Invoke(async ownerText =>
+            {
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (SafeSocketHandle borrowedHandle = new SafeSocketHandle(receiver.Handle, ownsHandle: false))
+                using (Socket borrowed = new Socket(borrowedHandle))
+                {
+                    bool ownerFirst = bool.Parse(ownerText);
+                    using IoRingBoundHandle? initialBinding = ownerFirst
+                        ? IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true) : null;
+                    byte[] data = new byte[1];
+                    Task<int> receive = borrowed.ReceiveAsync(data.AsMemory(), SocketFlags.None).AsTask();
+                    Assert.False(receive.IsCompleted);
+                    using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
+                    Assert.Same(binding, IoUring.Bind(borrowedHandle, ownsFileDescriptor: false));
+                    Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                    Assert.Equal(1, await receive.WaitAsync(TestSettings.PassingTestTimeout));
+                    Assert.Equal(42, data[0]);
+                    borrowed.Dispose();
+                    Assert.False(receiver.SafeHandle.IsClosed);
+                    Assert.Equal(1, sender.Send(new byte[] { 43 }));
+                    Assert.Equal(1, receiver.Receive(data));
+                    Assert.Equal(43, data[0]);
+                }
+            }, bindOwnerFirst.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void BorrowedFile_AsyncReadPreservesOwner(bool bindOwnerFirst)
+        {
+            RemoteExecutor.Invoke(async ownerText =>
+            {
+                string path = Path.GetTempFileName();
+                try
+                {
+                    File.WriteAllBytes(path, new byte[] { 42 });
+                    using SafeFileHandle owner = File.OpenHandle(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, FileOptions.Asynchronous);
+                    using SafeFileHandle borrowed = new SafeFileHandle(owner.DangerousGetHandle(), ownsHandle: false);
+                    using IoRingBoundHandle? initialBinding = bool.Parse(ownerText)
+                        ? IoUring.Bind(owner, ownsFileDescriptor: true) : null;
+                    byte[] data = new byte[1];
+                    Assert.Equal(1, await RandomAccess.ReadAsync(borrowed, data, 0));
+                    Assert.Equal(42, data[0]);
+                    using IoRingBoundHandle binding = IoUring.Bind(owner, ownsFileDescriptor: true);
+                    Assert.Same(binding, IoUring.Bind(borrowed, ownsFileDescriptor: false));
+                    borrowed.Dispose();
+                    Assert.False(owner.IsClosed);
+                    Assert.Equal(1, RandomAccess.Read(owner, data, 0));
+                    Assert.Equal(42, data[0]);
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, bindOwnerFirst.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void Bind_OwnerReferenceIsBalancedAndReleasedOutsideRegistryLock()
         {
             RemoteExecutor.Invoke(async () =>
             {
@@ -524,25 +722,24 @@ namespace System.Net.Sockets.Tests
                 ReleaseCounter secondCounter = new();
                 using CountingHandle first = new(socket.Handle, firstCounter);
                 using CountingHandle second = new(socket.Handle, secondCounter);
-                using IoRingBoundHandle binding = IoUring.Bind(first);
-                using IoRingBoundHandle aliasBinding = IoUring.Bind(second);
-                Assert.Same(binding, aliasBinding);
+                using IoRingBoundHandle binding = IoUring.Bind(first, ownsFileDescriptor: true);
+                Assert.Throws<ArgumentException>("handle", () => IoUring.Bind(second, ownsFileDescriptor: true));
                 for (int i = 0; i < 20; i++)
                 {
-                    Assert.Same(binding, IoUring.Bind(second));
+                    Assert.Same(binding, IoUring.Bind(first, ownsFileDescriptor: true));
                 }
 
                 // These wrappers deliberately leave binding disposal to the explicit owner below.
                 first.Dispose();
                 second.Dispose();
                 Assert.Equal(0, firstCounter.Count);
-                Assert.Equal(0, secondCounter.Count);
+                Assert.Equal(1, secondCounter.Count);
                 firstCounter.OnRelease = () =>
                 {
                     binding.DisposeAndWait();
                     Task.Run(() =>
                     {
-                        using IoRingBoundHandle replacement = IoUring.Bind(socket.SafeHandle);
+                        using IoRingBoundHandle replacement = IoUring.Bind(socket.SafeHandle, ownsFileDescriptor: true);
                         Assert.NotSame(binding, replacement);
                     }).WaitAsync(TestSettings.PassingTestTimeout).GetAwaiter().GetResult();
                 };
@@ -590,9 +787,9 @@ namespace System.Net.Sockets.Tests
                     IntPtr descriptor = original.Handle;
                     ReleaseCounter counter = new();
                     using CountingHandle owner = new(descriptor, counter);
-                    using IoRingBoundHandle oldBinding = IoUring.Bind(owner);
+                    using IoRingBoundHandle oldBinding = IoUring.Bind(owner, ownsFileDescriptor: true);
                     using Microsoft.Win32.SafeHandles.SafeFileHandle alias = new(descriptor, ownsHandle: false);
-                    Assert.Same(oldBinding, IoUring.Bind(alias));
+                    Assert.Same(oldBinding, IoUring.Bind(alias, ownsFileDescriptor: false));
                     Socket? replacement = null;
                     IoRingBoundHandle? newBinding = null;
                     counter.OnRelease = () =>
@@ -602,7 +799,7 @@ namespace System.Net.Sockets.Tests
                         Assert.Equal(descriptor.ToInt32(), DuplicateDescriptor(source.Handle.ToInt32(), descriptor.ToInt32()));
                         original.SafeHandle.SetHandleAsInvalid();
                         replacement = new Socket(new SafeSocketHandle(descriptor, ownsHandle: true));
-                        newBinding = IoUring.Bind(replacement.SafeHandle);
+                        newBinding = IoUring.Bind(replacement.SafeHandle, ownsFileDescriptor: true);
                         Assert.NotSame(oldBinding, newBinding);
                     };
                     owner.Dispose();
@@ -610,7 +807,7 @@ namespace System.Net.Sockets.Tests
                     {
                         oldBinding.DisposeAndWait();
                         Assert.NotNull(replacement);
-                        Assert.Same(newBinding, IoUring.Bind(replacement.SafeHandle));
+                        Assert.Same(newBinding, IoUring.Bind(replacement.SafeHandle, ownsFileDescriptor: true));
                         Assert.Equal(1, sender.Send(new byte[] { 31 }));
                         byte[] buffer = new byte[1];
                         Assert.Equal(1, replacement.Receive(buffer));
@@ -653,7 +850,7 @@ namespace System.Net.Sockets.Tests
                     GC.Collect();
                     Assert.True(weak.TryGetTarget(out IoRingBoundHandle? original));
                     using Microsoft.Win32.SafeHandles.SafeFileHandle alias = new(socket.Handle, ownsHandle: false);
-                    using IoRingBoundHandle binding = IoUring.Bind(alias);
+                    using IoRingBoundHandle binding = IoUring.Bind(alias, ownsFileDescriptor: false);
                     Assert.Same(original, binding);
                     binding.DisposeAndWait();
                 }
@@ -731,7 +928,7 @@ namespace System.Net.Sockets.Tests
                     lock (_gate)
                     {
                         ObjectDisposedException.ThrowIf(_disposed, this);
-                        return _binding ??= IoUring.Bind(this);
+                        return _binding ??= IoUring.Bind(this, ownsFileDescriptor: true);
                     }
                 }
             }
@@ -767,7 +964,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
                 {
                     BoundReceiveOperation operation = new BoundReceiveOperation();
                     operation.Prepare();
@@ -943,7 +1140,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle, ownsFileDescriptor: true))
                 using (ManualResetEventSlim delivered = new ManualResetEventSlim())
                 using (ManualResetEventSlim resume = new ManualResetEventSlim())
                 {
@@ -1018,7 +1215,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(sender.SafeHandle, ownsFileDescriptor: true))
                 {
                     sender.SendBufferSize = 4096;
                     GCHandle dataPin = GCHandle.Alloc(data, GCHandleType.Pinned);
@@ -1361,7 +1558,7 @@ namespace System.Net.Sockets.Tests
                 listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
                 listener.Listen(1);
                 listener.Blocking = false;
-                using IoRingBoundHandle binding = IoUring.Bind(listener.SafeHandle);
+                using IoRingBoundHandle binding = IoUring.Bind(listener.SafeHandle, ownsFileDescriptor: true);
 
                 TaskCompletionSource<int> completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
                 int callerThreadId = Environment.CurrentManagedThreadId;
@@ -1463,7 +1660,7 @@ namespace System.Net.Sockets.Tests
                 using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                 sender.Connect(listener.LocalEndPoint!);
                 using Socket receiver = listener.Accept();
-                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
+                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
                 TaskCompletionSource drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 AsyncLocal<int> context = new AsyncLocal<int>();
                 TrackingMemoryManager owner = new TrackingMemoryManager();
@@ -1550,7 +1747,7 @@ namespace System.Net.Sockets.Tests
                 using Socket receiver = listener.Accept();
                 receiver.Blocking = false;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
-                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle);
+                using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
 
                 byte[] received = GC.AllocateArray<byte>(count, pinned: true);
                 byte[] sent = new byte[count];
@@ -1797,7 +1994,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
                 {
                     receiver.Blocking = false;
                     sender.SendTimeout = TestSettings.PassingTestTimeout;
@@ -2207,7 +2404,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
                 using (ManualResetEventSlim firstCallback = new())
                 using (ManualResetEventSlim releaseCallback = new())
                 {
@@ -2316,7 +2513,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
                 using (SemaphoreSlim available = new(0))
                 {
                     ConcurrentQueue<IMemoryOwner<byte>> buffers = new();
@@ -2608,7 +2805,7 @@ namespace System.Net.Sockets.Tests
                 (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
                 using (sender)
                 using (receiver)
-                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle))
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
                 using (ManualResetEventSlim firstCallback = new())
                 using (ManualResetEventSlim releaseCallback = new())
                 {

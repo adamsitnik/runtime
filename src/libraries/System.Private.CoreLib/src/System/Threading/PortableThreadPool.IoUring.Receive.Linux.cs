@@ -291,12 +291,7 @@ namespace System.Threading
                         {
                             throw new PlatformNotSupportedException();
                         }
-                        Interop.Error error = Interop.Sys.GetIoRingSocketType(_binding.Handle,
-                            out _, out int socketType, out _, out _);
-                        if (error != Interop.Error.SUCCESS)
-                        {
-                            throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
-                        }
+                        int socketType = _binding.GetSocketType();
 
                         const int DatagramSocketType = 2; // SocketType_SOCK_DGRAM in pal_networking.h.
                         _ring = ring;

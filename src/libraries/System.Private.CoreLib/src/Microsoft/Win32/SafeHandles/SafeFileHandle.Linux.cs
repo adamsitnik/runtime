@@ -20,7 +20,7 @@ public sealed partial class SafeFileHandle
             {
                 // Prevent first-time binding after disposal, even if another reference keeps IsClosed false.
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _ioUringDisposed), this);
-                binding = IoUring.Bind(this);
+                binding = IoUring.Bind(this, ownsFileDescriptor: OwnsHandle);
                 binding = Interlocked.CompareExchange(ref _ioUringBinding, binding, null) ?? binding;
 
                 // Disposal may have observed no binding before this publication.
