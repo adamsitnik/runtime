@@ -62,7 +62,6 @@ public sealed partial class IoRingBoundHandle
     private int _state;
     private int _referenceReleased = 2;
     private int _releasingThreadId;
-    private int _cleanupQueued;
     private int _pendingSends;
     private ManualResetEventSlim? _drained;
 
@@ -312,10 +311,8 @@ public sealed partial class IoRingBoundHandle
     private void OnDrained()
     {
         Volatile.Read(ref _drained)?.Set();
-        if (Interlocked.Exchange(ref _cleanupQueued, 1) == 0)
-        {
-            ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
-        }
+        // Closed bindings cannot admit more native work, so only the last release queues cleanup.
+        ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
     }
 
     private void ReleaseReference()

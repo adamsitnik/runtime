@@ -434,21 +434,7 @@ namespace System.Net.Sockets
                 if (result >= 0)
                 {
                     _bytesSent += result;
-                    int remaining = result;
-                    while (_vectorIndex < _pinCount)
-                    {
-                        ref Interop.Sys.IOVector vector = ref _vectors[_vectorIndex];
-                        if ((nuint)remaining < vector.Count)
-                        {
-                            vector.Base += remaining;
-                            vector.Count -= (nuint)remaining;
-                            remaining = 0;
-                            break;
-                        }
-                        remaining -= (int)vector.Count;
-                        _vectorIndex++;
-                    }
-                    Debug.Assert(remaining == 0);
+                    _vectorIndex += Interop.Sys.AdvanceIOVectors(_vectors.AsSpan(_vectorIndex, _pinCount - _vectorIndex), result);
 
                     // MSG_WAITALL covers only the submitted native batch: native SENDMSG caps a
                     // stream request at IOV_MAX, so a full batch can still leave managed vectors.

@@ -988,7 +988,7 @@ PALEXPORT uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVecto
  *
  * If singleIssuer is non-zero, requests IORING_SETUP_SINGLE_ISSUER together with
  * IORING_SETUP_DEFER_TASKRUN: from that point on, the kernel requires every
- * SystemNative_IoRingSubmit/SystemNative_IoRingKick/SystemNative_IoRingWaitForCompletions call for
+ * SystemNative_IoRingSubmit/SystemNative_IoRingWaitForCompletions call for
  * this ring to come from a single, fixed OS thread for the ring's entire lifetime - specifically,
  * whichever thread called this function to create it (not merely whichever thread happens to make
  * the first io_uring_enter(2) call afterwards - confirmed empirically, not documented in the man
@@ -1009,7 +1009,7 @@ PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_
 
 /**
  * Fills one SQE per request and publishes them to the ring's kernel-visible submission queue
- * tail, but does *not* call io_uring_enter(2) - see SystemNative_IoRingKick for that. Not
+ * tail, but does *not* call io_uring_enter(2) - see SystemNative_IoRingWaitForCompletions for that. Not
  * thread-safe with itself: the caller must serialize concurrent calls to this function for a
  * given ring (e.g. via a lock), since it touches this ring's local (non-atomic) submission-queue
  * bookkeeping - this mirrors liburing's own documented thread-safety contract for its
@@ -1017,23 +1017,12 @@ PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_
  *
  * Returns 0 on success (with *submittedCount set to the number of requests actually queued
  * into the ring's submission queue - i.e., durably published and guaranteed to eventually
- * produce a matching completion once SystemNative_IoRingKick is called). A return of 0 with
+ * produce a matching completion once SystemNative_IoRingWaitForCompletions submits them). A return of 0 with
  * *submittedCount less than requestCount means the submission queue was full; the caller should
  * retry the remaining requests later. Returns -1 and sets errno only when no requests at all
  * could be queued due to a genuine failure (e.g., an invalid ring handle).
  */
 PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
-
-/**
- * Asks the kernel to start processing any requests already published via
- * SystemNative_IoRingSubmit. The caller must serialize this with submission and completion
- * reaping. For single-issuer rings, all three run on the creating thread.
- *
- * Returns 0 on success; otherwise, returns -1 and sets errno. A failure here does not mean the
- * previously-published requests were lost. Unconsumed entries, including those remaining after
- * a short successful submission, remain pending for a later kick or completion wait.
- */
-PALEXPORT int32_t SystemNative_IoRingKick(intptr_t ringHandle);
 
 /**
  * Creates an eventfd and registers it with the given ring via IORING_REGISTER_EVENTFD: from then
@@ -1098,11 +1087,10 @@ PALEXPORT int32_t SystemNative_EventFdWait(int32_t eventFd, int32_t timeoutMilli
  * is needed only for pending submissions, deferred task-work, or CQ overflow. Other rings
  * conservatively enter on each call. GETEVENTS processes deferred task-work before copying CQEs.
  * The enter also submits any SQEs already published to the SQ tail
- * (e.g. via SystemNative_IoRingSubmit) but not yet asked the kernel to process - the caller does
- * not need to separately call SystemNative_IoRingKick before this to have such entries picked up;
- * calling this instead of Kick+WaitForCompletions separately saves a syscall. Short submissions
- * may require an additional GETEVENTS-only call. The caller must serialize this with submission
- * and kicks, using the creating thread for single-issuer rings.
+ * (e.g. via SystemNative_IoRingSubmit) but not yet asked the kernel to process. Short submissions
+ * may require an additional GETEVENTS-only call. The caller must serialize this with publication,
+ * using the creating thread for single-issuer rings. A failure does not undo publication:
+ * unconsumed SQEs remain pending for a later call.
  *
  * Returns 0 on success (with *completedCount set to the number of completions written into
  * the completions buffer, up to maxCompletions); otherwise, returns -1 and sets errno.

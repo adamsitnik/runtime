@@ -117,10 +117,6 @@ namespace System.Threading
             // very large burst, rather than waiting for the entire burst to be dequeued first.
             private const int MaxRequestsPerSubmitBatch = 256;
 
-            // Set DOTNET_IORING_PARALLELIZED_ENQUEUE=0 to compare with the legacy batched dispatch.
-            private static readonly bool s_useParallelizedEnqueue =
-                AppContextConfigHelper.GetBooleanConfig("System.Threading.ThreadPool.IoUringParallelizedEnqueue", "DOTNET_IORING_PARALLELIZED_ENQUEUE", defaultValue: true);
-
             // Opt-out switch: io_uring integration is used by default on Linux when the kernel supports
             // it. Set DOTNET_USE_IO_URING=0 to fall back to the pre-existing (blocking-call-on-a-
             // ThreadPool-work-item) implementation unconditionally.
@@ -198,7 +194,7 @@ namespace System.Threading
                 // MPSC hand-off from any thread calling Enqueue (for a request whose fd routes to this
                 // ring - see GetRing) to this ring's single dedicated issuer thread (see IssuerLoop). This
                 // ring was created with IORING_SETUP_SINGLE_ISSUER, so only that one thread is permitted
-                // to ever call Interop.Sys.IoRingSubmit/IoRingKick/IoRingWaitForCompletions for it - every
+                // to ever call Interop.Sys.IoRingSubmit/IoRingWaitForCompletions for it - every
                 // other thread must go through this queue instead. Unbounded: Enqueue never blocks or
                 // fails due to this queue being "full".
                 public readonly ConcurrentQueue<Interop.Sys.IoRingRequest> PendingSubmissions = new();
@@ -632,7 +628,7 @@ namespace System.Threading
             }
 
             private static unsafe void DrainControlWork(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch,
-                long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
+                long[] sequenceBatch)
             {
                 int count = 0;
                 IoRingBoundHandle? binding = Interlocked.Exchange(ref ring.PendingClosing, null);
@@ -696,7 +692,7 @@ namespace System.Threading
                         ring.InFlightCount += count;
                         fixed (Interop.Sys.IoRingRequest* requests = ring.CancellationBatch)
                         {
-                            SubmitBatchWithRetry(ring, requests, count, completionsBatch, sequenceBatch, workItemBatch,
+                            SubmitBatchWithRetry(ring, requests, count, completionsBatch, sequenceBatch,
                                 processControl: false);
                         }
                         count = 0;
@@ -724,17 +720,16 @@ namespace System.Threading
                 var submitBatch = new Interop.Sys.IoRingRequest[MaxRequestsPerSubmitBatch];
                 var completionsBatch = new Interop.Sys.IoRingCompletion[MaxCompletionsPerWait];
                 var sequenceBatch = new long[MaxCompletionsPerWait];
-                var workItemBatch = new IThreadPoolWorkItem[MaxCompletionsPerWait];
                 var bufferReturnBatch = new ushort[MaxCompletionsPerWait];
 
                 while (true)
                 {
                     if (HasControlWork(ring))
                     {
-                        DrainControlWork(ring, completionsBatch, sequenceBatch, workItemBatch);
+                        DrainControlWork(ring, completionsBatch, sequenceBatch);
                     }
-                    DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch, workItemBatch);
-                    bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
+                    DrainAndSubmit(ring, submitBatch, completionsBatch, sequenceBatch);
+                    bool moreCompletions = DrainCompletions(ring, completionsBatch, sequenceBatch);
 
                     // Returns are normally opportunistic. A return wakes the issuer only when
                     // a receive is parked waiting for a buffer.
@@ -775,7 +770,7 @@ namespace System.Threading
             /// completion wait submits these SQEs and processes deferred work in the same enter.
             /// </summary>
             private static unsafe void DrainAndSubmit(Ring ring, Interop.Sys.IoRingRequest[] batch,
-                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
+                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch)
             {
                 int count = 0;
                 while (count < batch.Length &&
@@ -793,7 +788,7 @@ namespace System.Threading
                 ring.InFlightCount += count;
                 fixed (Interop.Sys.IoRingRequest* batchPtr = batch)
                 {
-                    SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, sequenceBatch, workItemBatch);
+                    SubmitBatchWithRetry(ring, batchPtr, count, completionsBatch, sequenceBatch);
                 }
             }
 
@@ -807,7 +802,7 @@ namespace System.Threading
             /// thread is the only one that will ever process this ring's queue anyway.
             /// </summary>
             private static unsafe void SubmitBatchWithRetry(Ring ring, Interop.Sys.IoRingRequest* requestsPtr, int count,
-                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch,
+                Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch,
                 bool processControl = true)
             {
                 int remaining = count;
@@ -872,10 +867,10 @@ namespace System.Threading
                     remaining -= submittedCount;
 
                     // This issuer must enter the kernel to consume SQEs; spinning alone cannot make room.
-                    DrainCompletions(ring, completionsBatch, sequenceBatch, workItemBatch);
+                    DrainCompletions(ring, completionsBatch, sequenceBatch);
                     if (processControl && HasControlWork(ring))
                     {
-                        DrainControlWork(ring, completionsBatch, sequenceBatch, workItemBatch);
+                        DrainControlWork(ring, completionsBatch, sequenceBatch);
                     }
                 }
             }
@@ -906,7 +901,7 @@ namespace System.Threading
             /// Drains a bounded number of completions without waiting. Returns true when the budget
             /// was exhausted, so the issuer alternates with submissions rather than parking.
             /// </summary>
-            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch, IThreadPoolWorkItem[] workItemBatch)
+            private static unsafe bool DrainCompletions(Ring ring, Interop.Sys.IoRingCompletion[] completionsBatch, long[] sequenceBatch)
             {
                 int processed = 0;
                 while (processed < MaxCompletionsPerTurn)
@@ -1014,14 +1009,7 @@ namespace System.Threading
                     completions = completionsBatch.AsSpan(0, keepCount);
                     Span<long> sequences = sequenceBatch.AsSpan(0, keepCount);
 
-                    if (s_useParallelizedEnqueue)
-                    {
-                        EnqueueCompletions(ring, completions, sequences);
-                    }
-                    else
-                    {
-                        DispatchBatch(ring, completions, sequences, workItemBatch);
-                    }
+                    EnqueueCompletions(ring, completions, sequences);
                 }
 
                 return true;
@@ -1052,20 +1040,8 @@ namespace System.Threading
             /// <summary>
             /// Resolves a completion's correlation token, completes its operation, and releases the
             /// token's reference taken for this specific completion (see
-            /// <see cref="RetainOperationToken"/>/<see cref="ReleaseOperationToken"/>). A multishot
-            /// operation (e.g. <see cref="Interop.Sys.IoRingOp.RecvMultishot"/>) keeps producing
-            /// completions - every one but the last carries
-            /// <see cref="Interop.Sys.IoRingCompletion.More"/> in its
-            /// <see cref="Interop.Sys.IoRingCompletion.Flags"/> - and since two of its completions can be
-            /// *processed* concurrently (in either order) by independent workers even though they were
-            /// *dequeued* in order, the token cannot simply be freed the instant the final (no-More)
-            /// completion is seen: it is only actually freed once every completion that could ever
-            /// reference it - including that final one - has finished being processed here, regardless of
-            /// the order in which that happens. <paramref name="sequence"/> is this same completion's
-            /// 0-based delivery sequence number (see <see cref="RetainOperationToken"/>), passed through to
-            /// the operation so a multishot one can recover correct delivery order despite the above. This
-            /// is the shared bookkeeping used by both <see cref="DispatchBatch"/> and
-            /// <see cref="CompletionProcessorWorkItem"/>.
+            /// <see cref="RetainOperationToken"/>/<see cref="ReleaseOperationToken"/>).
+            /// Multishot receives use their own ordered drainer instead of this worker path.
             /// </summary>
             private static IThreadPoolWorkItem? CompleteOperation(Ring ring, in Interop.Sys.IoRingCompletion completion, long sequence)
             {
@@ -1198,37 +1174,6 @@ namespace System.Threading
                 {
                     bool removed = ring.OverflowTokens.TryRemove(userData, out _);
                     Debug.Assert(removed);
-                }
-            }
-
-            /// <summary>
-            /// Older completion hand-off path, kept only so it can still be selected (see
-            /// <see cref="s_useParallelizedEnqueue"/>) for comparison against the default
-            /// <see cref="EnqueueCompletions"/>/<see cref="CompletionProcessorWorkItem"/> path. Completes
-            /// the operation associated with each of the given completions, collecting the (non-null)
-            /// returned work items and queuing them all via a single batched
-            /// <see cref="ThreadPool.UnsafeQueueUserWorkItems"/> call instead of once per completion.
-            /// </summary>
-            private static void DispatchBatch(Ring ring, ReadOnlySpan<Interop.Sys.IoRingCompletion> completions, ReadOnlySpan<long> sequences, IThreadPoolWorkItem[] workItemBatch)
-            {
-                int batchCount = 0;
-                for (int i = 0; i < completions.Length; i++)
-                {
-                    // The issuer thread must not run the continuation inline; CompleteOperation only does
-                    // minimal bookkeeping and returns the work item (if any) to be queued, so it can be
-                    // batched together with the other completions drained in this pass.
-                    IThreadPoolWorkItem? workItem = CompleteOperation(ring, in completions[i], sequences[i]);
-                    if (workItem is not null)
-                    {
-                        workItemBatch[batchCount++] = workItem;
-                    }
-                }
-
-                if (batchCount > 0)
-                {
-                    // Also wakes the normal idle-worker primitive for any parked sibling to pick these up.
-                    ThreadPool.UnsafeQueueUserWorkItems(workItemBatch.AsSpan(0, batchCount), preferLocal: false);
-                    Array.Clear(workItemBatch, 0, batchCount);
                 }
             }
 

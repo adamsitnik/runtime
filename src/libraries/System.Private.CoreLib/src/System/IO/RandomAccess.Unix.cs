@@ -231,31 +231,7 @@ namespace System.IO
                     // We need to perform next write where the previous one has finished.
                     fileOffset += bytesWritten;
                     totalBytesToWrite -= bytesWritten;
-                    // We need to try again for the remainder.
-                    while (buffersOffset < buffersCount && bytesWritten > 0)
-                    {
-                        int n = (int)vectors[buffersOffset].Count;
-                        if (n <= bytesWritten)
-                        {
-                            bytesWritten -= n;
-                            buffersOffset++;
-                        }
-                        else
-                        {
-                            // A partial read: the vector needs to point to the new offset.
-                            // But that offset needs to be relative to the previous attempt.
-                            // Example: we have a single buffer with 30 bytes and the first read returned 10.
-                            // The next read should try to read the remaining 20 bytes, but in case it also reads just 10,
-                            // the third attempt should read last 10 bytes (not 20 again).
-                            Interop.Sys.IOVector current = vectors[buffersOffset];
-                            vectors[buffersOffset] = new Interop.Sys.IOVector
-                            {
-                                Base = current.Base + (int)(bytesWritten),
-                                Count = current.Count - (UIntPtr)(bytesWritten)
-                            };
-                            break;
-                        }
-                    }
+                    buffersOffset += Interop.Sys.AdvanceIOVectors(left, bytesWritten);
                 }
             }
             finally

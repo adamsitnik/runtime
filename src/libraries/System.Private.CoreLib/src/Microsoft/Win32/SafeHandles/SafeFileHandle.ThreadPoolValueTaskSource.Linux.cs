@@ -21,11 +21,11 @@ namespace Microsoft.Win32.SafeHandles
             private Exception? _ioUringSubmissionError;
             private FileIoUringOperation? _ioUringOperation;
 
-            // io_uring in-flight pinning/ref-counting state. These are populated only while an io_uring
-            // submission for this instance is outstanding, and are always fully cleaned up (pins
-            // disposed, SafeHandle ref released) before the operation is considered complete/reusable.
+            // Pins and the handle reference span the logical operation, including partial-write
+            // continuations, and are released before this instance can be reused.
             private bool _fileHandleRefAdded;
             private MemoryHandle _singleSegmentPin;
+            private int _singleSegmentOffset;
             private MemoryHandle[]? _vectorPins;
             private Interop.Sys.IOVector[]? _vectors;
             private GCHandle _vectorsHandle;
@@ -50,8 +50,11 @@ namespace Microsoft.Win32.SafeHandles
                         return;
                     }
 
+                    Debug.Assert(!_fileHandleRefAdded);
+                    _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
                     if (_operation is Operation.Read or Operation.Write)
                     {
+                        _singleSegmentPin = _singleSegment.Pin();
                         SubmitSingleSegment();
                     }
                     else
@@ -109,17 +112,16 @@ namespace Microsoft.Win32.SafeHandles
             /// <summary>
             /// Performs completion bookkeeping on a worker and continues partial writes.
             /// </summary>
-            private IThreadPoolWorkItem? CompleteFromIoUring(int result)
+            private bool TryContinueFromIoUring(int result)
             {
-                if (result >= 0 && (_operation == Operation.Write || _operation == Operation.WriteGather)
-                    && TryContinuePartialWrite(result, out IThreadPoolWorkItem? completionWorkItem))
+                if (result >= 0 && TryContinuePartialWrite(ref result))
                 {
-                    return completionWorkItem;
+                    return true;
                 }
 
                 _ioUringResult = result;
                 _completedViaIoUring = true;
-                return this;
+                return false;
             }
 
             private void EnqueueIoUring(in Interop.Sys.IoRingRequest request)
@@ -170,7 +172,7 @@ namespace Microsoft.Win32.SafeHandles
                 {
                     try
                     {
-                        if (_owner.CompleteFromIoUring(result) is null)
+                        if (_owner.TryContinueFromIoUring(result))
                         {
                             return;
                         }
@@ -187,137 +189,67 @@ namespace Microsoft.Win32.SafeHandles
             }
 
             /// <summary>
-            /// If <paramref name="bytesWritten"/> represents a partial write (fewer bytes than were
-            /// requested by the most recent submission), advances the write state and attempts to
-            /// resubmit an io_uring request for the remainder. Returns true if the result was partial.
-            /// <paramref name="completionWorkItem"/> is null when a continuation was accepted, or
-            /// this instance when cancellation or a zero-progress write must be delivered instead.
-            /// Submission exceptions propagate to the completion handler.
+            /// Returns true only when a partial write's continuation was accepted. Otherwise,
+            /// updates the terminal result for cancellation or zero progress as necessary.
             /// </summary>
-            private bool TryContinuePartialWrite(int bytesWritten, out IThreadPoolWorkItem? completionWorkItem)
+            private bool TryContinuePartialWrite(ref int result)
             {
-                completionWorkItem = null;
-
                 if (_operation == Operation.Write)
                 {
-                    if (bytesWritten >= _singleSegment.Length)
+                    if (result >= _singleSegment.Length)
                     {
                         return false;
                     }
 
-                    _singleSegment = _singleSegment.Slice(bytesWritten);
-                    _fileOffset += bytesWritten;
-                    if (StopPartialWrite(bytesWritten))
-                    {
-                        completionWorkItem = this;
-                        return true;
-                    }
-
-                    // The old pin is no longer valid once we reslice; SubmitSingleSegment re-pins the
-                    // remainder. _context was already captured when the operation was originally queued.
-                    _singleSegmentPin.Dispose();
-                    _singleSegmentPin = default;
-                    if (_fileHandleRefAdded)
-                    {
-                        _fileHandle.DangerousRelease();
-                        _fileHandleRefAdded = false;
-                    }
-
-                    SubmitSingleSegment();
-
-                    return true;
+                    // Keep the remaining length for FileStream's incomplete-operation position fixup.
+                    // Slicing does not invalidate the original pin.
+                    _singleSegment = _singleSegment.Slice(result);
+                    _singleSegmentOffset += result;
                 }
-
-                if (_operation == Operation.WriteGather)
+                else if (_operation == Operation.WriteGather)
                 {
-                    _remainingBytesToWrite -= bytesWritten;
+                    _remainingBytesToWrite -= result;
                     if (_remainingBytesToWrite <= 0)
                     {
                         return false;
                     }
 
-                    _fileOffset += bytesWritten;
-                    AdvanceVectorsAfterPartialWrite(bytesWritten);
-                    if (StopPartialWrite(bytesWritten))
-                    {
-                        completionWorkItem = this;
-                        return true;
-                    }
-
-                    // Release just the file-handle ref added for the previous submission; the vector
-                    // pins/array remain valid and are reused (with an adjusted window) for the resubmit.
-                    if (_fileHandleRefAdded)
-                    {
-                        _fileHandle.DangerousRelease();
-                        _fileHandleRefAdded = false;
-                    }
-
-                    SubmitVectorRequest();
-
-                    return true;
+                    _vectorsOffset += Interop.Sys.AdvanceIOVectors(_vectors.AsSpan(_vectorsOffset), result);
                 }
-
-                return false;
-            }
-
-            private bool StopPartialWrite(int bytesWritten)
-            {
-                bool canceled = _ioUringOperation!.CancellationIsRequested;
-                if (!canceled && bytesWritten != 0)
+                else
                 {
                     return false;
                 }
-                _ioUringResult = -Interop.Sys.ConvertErrorPalToPlatform(canceled ? Interop.Error.ECANCELED : Interop.Error.EIO);
-                _completedViaIoUring = true;
-                return true;
-            }
 
-            /// <summary>
-            /// Mirrors the bookkeeping in the blocking <see cref="RandomAccess.WriteGatherAtOffset"/>
-            /// implementation: advances <see cref="_vectorsOffset"/> past any vectors that were fully
-            /// written, and adjusts the base/length of the first partially-written vector in place.
-            /// </summary>
-            private void AdvanceVectorsAfterPartialWrite(int bytesWritten)
-            {
-                Debug.Assert(_vectors != null);
-                Interop.Sys.IOVector[] vectors = _vectors;
-                int count = vectors.Length;
-
-                while (_vectorsOffset < count && bytesWritten > 0)
+                _fileOffset += result;
+                bool canceled = _ioUringOperation!.CancellationIsRequested;
+                if (canceled || result == 0)
                 {
-                    int n = (int)vectors[_vectorsOffset].Count;
-                    if (n <= bytesWritten)
-                    {
-                        bytesWritten -= n;
-                        _vectorsOffset++;
-                    }
-                    else
-                    {
-                        unsafe
-                        {
-                            Interop.Sys.IOVector current = vectors[_vectorsOffset];
-                            vectors[_vectorsOffset] = new Interop.Sys.IOVector
-                            {
-                                Base = current.Base + bytesWritten,
-                                Count = current.Count - (UIntPtr)bytesWritten
-                            };
-                        }
-                        break;
-                    }
+                    result = -Interop.Sys.ConvertErrorPalToPlatform(canceled ? Interop.Error.ECANCELED : Interop.Error.EIO);
+                    return false;
                 }
+
+                if (_operation == Operation.Write)
+                {
+                    SubmitSingleSegment();
+                }
+                else
+                {
+                    SubmitVectorRequest();
+                }
+
+                return true;
             }
 
             private unsafe void SubmitSingleSegment()
             {
                 Debug.Assert(_operation is Operation.Read or Operation.Write);
-                Debug.Assert(!_fileHandleRefAdded);
-                _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
-                _singleSegmentPin = _singleSegment.Pin();
+                Debug.Assert(_fileHandleRefAdded);
 
                 Interop.Sys.IoRingRequest request = default;
                 request.OpCode = _operation == Operation.Read ? Interop.Sys.IoRingOp.Read : Interop.Sys.IoRingOp.Write;
                 request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                request.Buffer = (byte*)_singleSegmentPin.Pointer;
+                request.Buffer = (byte*)_singleSegmentPin.Pointer + _singleSegmentOffset;
                 request.BufferLength = _singleSegment.Length;
 
                 // Publish all ownership state before the request can complete on another worker.
@@ -351,14 +283,13 @@ namespace Microsoft.Win32.SafeHandles
 
             /// <summary>
             /// Enqueues the pinned vectors for a read or write. Partial writes reuse the same pins
-            /// and array with a window advanced by <see cref="AdvanceVectorsAfterPartialWrite"/>.
+            /// and array with a window advanced by <see cref="Interop.Sys.AdvanceIOVectors"/>.
             /// </summary>
             private unsafe void SubmitVectorRequest()
             {
                 Debug.Assert(_vectors != null && _vectorPins != null && _vectorsHandle.IsAllocated);
                 int remainingCount = _vectors.Length - _vectorsOffset;
-                Debug.Assert(remainingCount > 0 && !_fileHandleRefAdded);
-                _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
+                Debug.Assert(remainingCount > 0 && _fileHandleRefAdded);
 
                 Interop.Sys.IoRingRequest request = default;
                 request.OpCode = _operation == Operation.ReadScatter ? Interop.Sys.IoRingOp.ReadV : Interop.Sys.IoRingOp.WriteV;
@@ -393,6 +324,7 @@ namespace Microsoft.Win32.SafeHandles
 
                 _singleSegmentPin.Dispose();
                 _singleSegmentPin = default;
+                _singleSegmentOffset = 0;
 
                 if (_fileHandleRefAdded)
                 {

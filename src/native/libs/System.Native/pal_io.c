@@ -2202,7 +2202,7 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 //
 // Submission and the io_uring_enter(2) syscall that actually asks the kernel to process pending
 // entries are deliberately split into two PAL entrypoints (SystemNative_IoRingSubmit /
-// SystemNative_IoRingKick): filling SQEs and publishing them to the SQ tail only touches this
+// SystemNative_IoRingWaitForCompletions): filling SQEs and publishing them to the SQ tail only touches this
 // ring's local submission-queue bookkeeping. The caller serializes publication, submission,
 // and completion reaping; single-issuer rings use their creating thread for all three.
 
@@ -2579,7 +2579,7 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     *ringHandle = (intptr_t)ring;
     return 0;
 #else
-    (void)submissionQueueDepth, (void)completionQueueDepth;
+    (void)submissionQueueDepth, (void)completionQueueDepth, (void)singleIssuer;
     errno = ENOTSUP;
     return -1;
 #endif
@@ -2632,40 +2632,12 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
     __atomic_store_n(ring->SqTail, sqTail, __ATOMIC_RELEASE);
 
     // The entries above are now published via the SQ tail and visible to the kernel; this
-    // cannot be undone. Deliberately do NOT call io_uring_enter here - see
-    // SystemNative_IoRingKick. Doing the (relatively expensive, and otherwise-unnecessary-to-
-    // serialize) syscall outside of whatever lock protects this enqueue step lets many
-    // threads publish new entries into a shared ring quickly, without each blocking the next
-    // behind a full syscall while holding that lock.
+    // cannot be undone. Keep the fallible io_uring_enter in SystemNative_IoRingWaitForCompletions
+    // separate so an enter failure cannot be mistaken for a failure to publish these requests.
     *submittedCount = queued;
     return 0;
 #else
     (void)ringHandle, (void)requests, (void)requestCount;
-    errno = ENOTSUP;
-    return -1;
-#endif
-}
-
-int32_t SystemNative_IoRingKick(intptr_t ringHandle)
-{
-#if HAVE_LINUX_IO_URING_H
-    IoRing* ring = (IoRing*)ringHandle;
-    if (ring == NULL)
-    {
-        errno = EINVAL;
-        return -1;
-    }
-
-    uint32_t pending = IoRingPendingSubmissions(ring);
-    if (pending == 0)
-    {
-        return 0;
-    }
-
-    // A short submission leaves the remainder in the SQ for the next kick or completion wait.
-    return IoUringEnter(ring->Fd, pending, 0, 0) < 0 ? -1 : 0;
-#else
-    (void)ringHandle;
     errno = ENOTSUP;
     return -1;
 #endif

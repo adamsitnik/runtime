@@ -74,7 +74,7 @@ internal static partial class Interop
         internal static unsafe partial byte* IoRingCreateSendMessage(IntPtr socket, IOVector* vectors, int vectorCount);
 
         // Pass singleIssuer: 1 to request IORING_SETUP_SINGLE_ISSUER + IORING_SETUP_DEFER_TASKRUN: every
-        // subsequent IoRingSubmit/IoRingKick/IoRingWaitForCompletions call for the returned ring must then
+        // subsequent IoRingSubmit/IoRingWaitForCompletions call for the returned ring must then
         // come from the exact same OS thread that called this method (not merely the first thread to call
         // one of those - confirmed empirically) for the ring's whole lifetime, including
         // IoRingWaitForCompletions calls with nothing to submit; any other thread's call fails with
@@ -84,9 +84,6 @@ internal static partial class Interop
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingSubmit", SetLastError = true)]
         internal static unsafe partial int IoRingSubmit(IntPtr ringHandle, IoRingRequest* requests, int requestCount, out int submittedCount);
-
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingKick", SetLastError = true)]
-        internal static partial int IoRingKick(IntPtr ringHandle);
 
         // Creates an eventfd and registers it with the ring (IORING_REGISTER_EVENTFD): the kernel then
         // bumps its counter whenever a CQE is posted. The returned fd is also safe for any other thread

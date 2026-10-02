@@ -19,6 +19,256 @@ namespace System.Net.Sockets.Tests
         public static bool IsSupported => RemoteExecutor.IsSupported && IoUring.IsSupported;
         public static bool IsRemoteExecutorSupported => RemoteExecutor.IsSupported;
 
+        [Theory]
+        [InlineData(new int[0], new[] { 0 }, new[] { 0 })]
+        [InlineData(new[] { 0, 0 }, new[] { 0 }, new[] { 2 })]
+        [InlineData(new[] { 0, 10, 0, 20, 0 }, new[] { 0, 3, 7, 5, 15 }, new[] { 1, 1, 3, 3, 5 })]
+        [InlineData(new[] { 10, 20, 30 }, new[] { 25, 35 }, new[] { 1, 3 })]
+        public unsafe void AdvanceIOVectors_PreservesRemainingWindow(int[] lengths, int[] advances, int[] expectedIndices)
+        {
+            Interop.Sys.IOVector[] vectors = new Interop.Sys.IOVector[lengths.Length];
+            for (int i = 0; i < vectors.Length; i++)
+            {
+                vectors[i].Base = (byte*)0x10000;
+                vectors[i].Count = (nuint)lengths[i];
+            }
+
+            int index = 0;
+            int total = 0;
+            for (int i = 0; i < advances.Length; i++)
+            {
+                index += Interop.Sys.AdvanceIOVectors(vectors.AsSpan(index), advances[i]);
+                total += advances[i];
+                Assert.Equal(expectedIndices[i], index);
+                int consumedPrefix = 0;
+                for (int j = 0; j < index; j++)
+                {
+                    consumedPrefix += lengths[j];
+                }
+                if (index < vectors.Length)
+                {
+                    int offset = total - consumedPrefix;
+                    Assert.Equal((nuint)(0x10000 + offset), (nuint)vectors[index].Base);
+                    Assert.Equal((nuint)(lengths[index] - offset), vectors[index].Count);
+                }
+                else
+                {
+                    Assert.Equal(consumedPrefix, total);
+                }
+            }
+        }
+
+        [Fact]
+        public unsafe void AdvanceIOVectors_AcceptsByteCountsLargerThanInt32()
+        {
+            Interop.Sys.IOVector[] vectors =
+            [
+                new() { Base = (byte*)0x10000, Count = int.MaxValue },
+                new() { Base = (byte*)0x10000, Count = int.MaxValue },
+                new() { Base = (byte*)0x10000, Count = 10 }
+            ];
+            int index = Interop.Sys.AdvanceIOVectors(vectors, 2L * int.MaxValue + 3);
+            Assert.Equal(2, index);
+            Assert.Equal((nuint)0x10003, (nuint)vectors[index].Base);
+            Assert.Equal((nuint)7, vectors[index].Count);
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false, false)]
+        [InlineData(false, true)]
+        [InlineData(true, false)]
+        [InlineData(true, true)]
+        public void FileWrite_PartialCompletionKeepsPinsUntilTerminal(bool vector, bool cancel)
+        {
+            RemoteExecutor.Invoke(async (vectorText, cancelText) =>
+            {
+                bool useVectors = bool.Parse(vectorText);
+                bool cancelWrite = bool.Parse(cancelText);
+                SafeFileHandle.CreateAnonymousPipe(out SafeFileHandle reader, out SafeFileHandle writer,
+                    asyncRead: true, asyncWrite: true);
+                using (reader)
+                using (writer)
+                using (TrackingMemoryManager memory = new TrackingMemoryManager(2 * 1024 * 1024))
+                using (CancellationTokenSource cancellation = new CancellationTokenSource())
+                {
+                    new Random(42).NextBytes(memory.GetSpan());
+                    ReadOnlyMemory<byte>[] buffers = [ReadOnlyMemory<byte>.Empty, memory.Memory, ReadOnlyMemory<byte>.Empty];
+                    Task write = useVectors
+                        ? RandomAccess.WriteAsync(writer, buffers, 0, cancellation.Token).AsTask()
+                        : RandomAccess.WriteAsync(writer, memory.Memory, 0, cancellation.Token).AsTask();
+                    byte[] received = new byte[memory.Memory.Length];
+                    int read = await RandomAccess.ReadAsync(reader, received.AsMemory(0, 4096), 0);
+                    Assert.InRange(read, 1, 4096);
+                    Assert.False(write.IsCompleted);
+                    GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+                    if (cancelWrite)
+                    {
+                        cancellation.Cancel();
+                        OperationCanceledException error = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                            () => write.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(cancellation.Token, error.CancellationToken);
+                    }
+                    else
+                    {
+                        while (read < received.Length)
+                        {
+                            int count = await RandomAccess.ReadAsync(reader, received.AsMemory(read), 0)
+                                .AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                            Assert.True(count > 0);
+                            read += count;
+                        }
+                        await write.WaitAsync(TestSettings.PassingTestTimeout);
+                        AssertExtensions.SequenceEqual(memory.GetSpan(), received.AsSpan());
+                    }
+                    Assert.Equal(1, memory.PinCount);
+                    Assert.Equal(1, memory.UnpinCount);
+
+                    // Drain canceled-write data while reusing the cached source with a new scalar pin.
+                    byte[] next = [42, 43, 44, 45];
+                    byte[] remainder = new byte[received.Length + next.Length];
+                    Task<int> draining = DrainRemainder();
+                    await RandomAccess.WriteAsync(writer, next, 0).AsTask().WaitAsync(TestSettings.PassingTestTimeout);
+                    writer.Dispose();
+                    int drained = await draining.WaitAsync(TestSettings.PassingTestTimeout);
+                    Assert.True(drained >= next.Length);
+                    AssertExtensions.SequenceEqual(next.AsSpan(), remainder.AsSpan(drained - next.Length, next.Length));
+                    AssertExtensions.SequenceEqual(memory.GetSpan().Slice(read, drained - next.Length),
+                        remainder.AsSpan(0, drained - next.Length));
+
+                    async Task<int> DrainRemainder()
+                    {
+                        int total = 0;
+                        int count;
+                        while ((count = await RandomAccess.ReadAsync(reader, remainder.AsMemory(total), 0)) != 0)
+                        {
+                            total += count;
+                        }
+                        return total;
+                    }
+                }
+            }, vector.ToString(), cancel.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void FileStream_PartialWriteFailurePreservesPositionAndPin()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                const int FileSizeLimit = 4096;
+                const int SigXfsz = 25; // Linux file-size-limit signal.
+                string path = Path.GetTempFileName();
+                Assert.Equal(0, Interop.Sys.GetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, out Interop.Sys.RLimit original));
+                using PosixSignalRegistration signal = PosixSignalRegistration.Create((PosixSignal)SigXfsz,
+                    context => context.Cancel = true);
+                try
+                {
+                    using FileStream stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
+                        FileShare.ReadWrite, bufferSize: 1, FileOptions.Asynchronous);
+                    stream.Position = 7;
+                    using TrackingMemoryManager memory = new TrackingMemoryManager(16384);
+                    new Random(42).NextBytes(memory.GetSpan());
+                    Interop.Sys.RLimit limited = original;
+                    limited.CurrentLimit = FileSizeLimit;
+                    Assert.Equal(0, Interop.Sys.SetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, ref limited));
+                    try
+                    {
+                        // The first native write reaches the limit; its continuation fails with EFBIG.
+                        await Assert.ThrowsAsync<ArgumentOutOfRangeException>("value", () =>
+                            stream.WriteAsync(memory.Memory).AsTask().WaitAsync(TestSettings.PassingTestTimeout));
+                    }
+                    finally
+                    {
+                        Assert.Equal(0, Interop.Sys.SetRLimit(Interop.Sys.RlimitResources.RLIMIT_FSIZE, ref original));
+                    }
+                    Assert.Equal(FileSizeLimit, stream.Position);
+                    Assert.Equal(FileSizeLimit, stream.Length);
+                    Assert.Equal(1, memory.PinCount);
+                    Assert.Equal(1, memory.UnpinCount);
+                    AssertExtensions.SequenceEqual(memory.GetSpan().Slice(0, FileSizeLimit - 7),
+                        File.ReadAllBytes(path).AsSpan(7));
+
+                    await stream.WriteAsync(new byte[] { 42, 43 });
+                    Assert.Equal(FileSizeLimit + 2, stream.Position);
+                    AssertExtensions.SequenceEqual(new byte[] { 42, 43 }.AsSpan(),
+                        File.ReadAllBytes(path).AsSpan(FileSizeLimit));
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void FileStream_PinFailureRestoresPosition()
+        {
+            RemoteExecutor.Invoke(async () =>
+            {
+                string path = Path.GetTempFileName();
+                try
+                {
+                    using FileStream stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite,
+                        FileShare.ReadWrite, bufferSize: 1, FileOptions.Asynchronous);
+                    stream.Position = 7;
+                    using TrackingMemoryManager memory = new TrackingMemoryManager(4096) { ThrowOnPin = true };
+                    InvalidOperationException error = await Assert.ThrowsAsync<InvalidOperationException>(
+                        () => stream.WriteAsync(memory.Memory).AsTask());
+                    Assert.Equal("Pin failed.", error.Message);
+                    Assert.Equal(7, stream.Position);
+                    Assert.Equal(0, stream.Length);
+                    memory.ThrowOnPin = false;
+                    await stream.WriteAsync(memory.Memory);
+                    Assert.Equal(7 + memory.Memory.Length, stream.Position);
+                    Assert.Equal(stream.Position, stream.Length);
+                    Assert.Equal(1, memory.PinCount);
+                    Assert.Equal(1, memory.UnpinCount);
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void FileWriteGather_VectorLimitPreservesEmptyBuffersAndOffsets(bool useAsync)
+        {
+            RemoteExecutor.Invoke(async asyncText =>
+            {
+                string path = Path.GetTempFileName();
+                try
+                {
+                    using SafeFileHandle handle = File.OpenHandle(path, FileMode.Open, FileAccess.ReadWrite,
+                        FileShare.ReadWrite, FileOptions.Asynchronous);
+                    byte[] data = new byte[1200 * 1024];
+                    new Random(42).NextBytes(data);
+                    ReadOnlyMemory<byte>[] buffers = new ReadOnlyMemory<byte>[2401];
+                    for (int i = 0; i < 1200; i++)
+                    {
+                        buffers[2 * i + 1] = data.AsMemory(i * 1024, 1024);
+                    }
+                    if (bool.Parse(asyncText))
+                    {
+                        await RandomAccess.WriteAsync(handle, buffers, 7);
+                    }
+                    else
+                    {
+                        RandomAccess.Write(handle, buffers, 7);
+                    }
+                    byte[] actual = File.ReadAllBytes(path);
+                    Assert.Equal(data.Length + 7, actual.Length);
+                    AssertExtensions.SequenceEqual(new byte[7].AsSpan(), actual.AsSpan(0, 7));
+                    AssertExtensions.SequenceEqual(data.AsSpan(), actual.AsSpan(7));
+                }
+                finally
+                {
+                    File.Delete(path);
+                }
+            }, useAsync.ToString(), CreateOptions(1)).Dispose();
+        }
+
         [ConditionalTheory(nameof(IsSupported))]
         [InlineData(false, false)]
         [InlineData(false, true)]
@@ -1654,12 +1904,9 @@ namespace System.Net.Sockets.Tests
             {
                 bool close = bool.Parse(closeText);
                 const int OperationCanceled = 125;
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
                 using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
                 TaskCompletionSource drained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 AsyncLocal<int> context = new AsyncLocal<int>();
@@ -1739,12 +1986,9 @@ namespace System.Net.Sockets.Tests
                 Assert.True(IoUring.IsSupported);
                 int count = int.Parse(countText);
                 bool blockFirst = bool.Parse(blockText);
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
                 receiver.Blocking = false;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
                 using IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true);
@@ -1809,12 +2053,9 @@ namespace System.Net.Sockets.Tests
             RemoteExecutor.Invoke(() =>
             {
                 Assert.True(IoUring.IsSupported);
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
 
                 using TrackingMemoryManager memory = new TrackingMemoryManager();
@@ -1856,12 +2097,9 @@ namespace System.Net.Sockets.Tests
             RemoteExecutor.Invoke(() =>
             {
                 Assert.True(IoUring.IsSupported);
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
 
                 using TrackingMemoryManager firstMemory = new TrackingMemoryManager();
@@ -2184,12 +2422,9 @@ namespace System.Net.Sockets.Tests
             RemoteExecutor.Invoke(() =>
             {
                 Assert.True(IoUring.IsSupported);
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
                 sender.SendTimeout = TestSettings.PassingTestTimeout;
 
                 const int ChunkCount = 5;
@@ -2229,12 +2464,9 @@ namespace System.Net.Sockets.Tests
             RemoteExecutor.Invoke(() =>
             {
                 Assert.True(IoUring.IsSupported);
-                using Socket listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                listener.Bind(new IPEndPoint(IPAddress.Loopback, 0));
-                listener.Listen(1);
-                using Socket sender = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                sender.Connect(listener.LocalEndPoint!);
-                using Socket receiver = listener.Accept();
+                (Socket Sender, Socket Receiver) pair = SocketTestExtensions.CreateConnectedSocketPair();
+                using Socket sender = pair.Sender;
+                using Socket receiver = pair.Receiver;
 
                 byte[] sent = new byte[] { 0x2A };
                 Assert.Equal(1, sender.Send(sent));
@@ -2867,12 +3099,14 @@ namespace System.Net.Sockets.Tests
 
         private sealed class TrackingMemoryManager : MemoryManager<byte>
         {
-            private readonly byte[] _buffer = new byte[1];
+            private readonly byte[] _buffer;
             public int PinCount;
             public int UnpinCount;
             public int DisposeCount;
             public Action? OnUnpin;
             public bool ThrowOnPin;
+
+            public TrackingMemoryManager(int length = 1) => _buffer = new byte[length];
 
             public override Span<byte> GetSpan() => _buffer;
 
@@ -2882,10 +3116,10 @@ namespace System.Net.Sockets.Tests
                 {
                     throw new InvalidOperationException("Pin failed.");
                 }
-                Assert.Equal(0, elementIndex);
+                Assert.InRange(elementIndex, 0, _buffer.Length);
                 GCHandle handle = GCHandle.Alloc(_buffer, GCHandleType.Pinned);
                 Interlocked.Increment(ref PinCount);
-                return new MemoryHandle((void*)handle.AddrOfPinnedObject(), handle, this);
+                return new MemoryHandle((byte*)handle.AddrOfPinnedObject() + elementIndex, handle, this);
             }
 
             public override void Unpin()
