@@ -28,4 +28,10 @@ public enum IoUringOperationKind
     PollRead = 11,
     /// <summary>Waits for a descriptor to become writable.</summary>
     PollWrite = 12,
+    /// <summary>Produces repeated descriptor-readiness notifications.</summary>
+    PollMultishot = 13,
+    /// <summary>Accepts repeated socket connections without shared address output storage.</summary>
+    AcceptMultishot = 14,
+    /// <summary>Sends socket data while retaining the source buffer until the kernel's release notification.</summary>
+    SendZeroCopy = 15,
 }

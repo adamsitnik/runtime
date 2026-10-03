@@ -105,8 +105,21 @@ extern int     getpeereid(int, uid_t *__restrict__, gid_t *__restrict__);
 // The CMake HAVE_LINUX_IO_URING_H check also verifies that __NR_io_uring_setup/enter/register
 // are defined by <sys/syscall.h>, and that IORING_RECV_MULTISHOT/IORING_REGISTER_PBUF_RING/
 // struct io_uring_buf_ring/IOSQE_BUFFER_SELECT (multishot receive with ring-mapped provided
-// buffers) are available, so no fallback definitions are needed here.
+// buffers) are available. Newer operation constants below retain their stable Linux UAPI values
+// so an older build header cannot turn unsupported operations into submission-time failures.
 #include <linux/io_uring.h>
+#ifndef IORING_POLL_ADD_MULTI
+#define IORING_POLL_ADD_MULTI (1U << 0)
+#endif
+#ifndef IORING_ACCEPT_MULTISHOT
+#define IORING_ACCEPT_MULTISHOT (1U << 0)
+#endif
+#ifndef IORING_SEND_ZC_REPORT_USAGE
+#define IORING_SEND_ZC_REPORT_USAGE (1U << 3)
+// IORING_OP_SEND_ZC is an enum member, not a preprocessor symbol. Headers missing
+// REPORT_USAGE may also lack SEND_ZC; its stable opcode value is safe in either case.
+#define IORING_OP_SEND_ZC 47
+#endif
 #include <stdatomic.h>
 #include <sys/eventfd.h>
 #include <poll.h>
@@ -2206,6 +2219,20 @@ int64_t SystemNative_PWriteV(intptr_t fd, IOVector* vectors, int32_t vectorCount
 // ring's local submission-queue bookkeeping. The caller serializes publication, submission,
 // and completion reaping; single-issuer rings use their creating thread for all three.
 
+c_static_assert(sizeof(IoRingRequest) == 80);
+c_static_assert(offsetof(IoRingRequest, OpCode) == 0);
+c_static_assert(offsetof(IoRingRequest, Fd) == 4);
+c_static_assert(offsetof(IoRingRequest, UserData) == 8);
+c_static_assert(offsetof(IoRingRequest, NativeSubmission) == 16);
+c_static_assert(offsetof(IoRingRequest, Offset) == 16);
+c_static_assert(offsetof(IoRingRequest, Buffer) == 24);
+c_static_assert(offsetof(IoRingRequest, BufferLength) == 24 + sizeof(void*));
+c_static_assert(offsetof(IoRingRequest, Vectors) == 24 + 2 * sizeof(void*));
+c_static_assert(offsetof(IoRingRequest, VectorCount) == 24 + 3 * sizeof(void*));
+c_static_assert(offsetof(IoRingRequest, Flags) == 28 + 3 * sizeof(void*));
+c_static_assert(offsetof(IoRingRequest, SockAddr) == 32 + 3 * sizeof(void*));
+c_static_assert(offsetof(IoRingRequest, SockAddrLen) == 32 + 4 * sizeof(void*));
+
 #if HAVE_LINUX_IO_URING_H
 
 typedef struct
@@ -2238,6 +2265,7 @@ typedef struct
     uint32_t* CqTail;
     uint32_t* CqRingMask;
     struct io_uring_cqe* Cqes;
+    uint32_t CqeShift;
     bool HasTaskRunFlag;
 
     // Provided-buffer group zero (SystemNative_IoRingRegisterBufferRing), used by
@@ -2248,6 +2276,9 @@ typedef struct
     uint8_t* BufferStorage;
     uint32_t BufferSize;
     uint32_t BufferCount;
+
+    // Populated on the issuer thread before publication; immutable thereafter.
+    uint64_t SupportedOpcodes[4];
 } IoRing;
 
 static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
@@ -2258,6 +2289,34 @@ static long IoUringSetup(uint32_t entries, struct io_uring_params* params)
 static long IoUringRegister(int fd, unsigned int opcode, void* arg, unsigned int nrArgs)
 {
     return syscall(__NR_io_uring_register, fd, opcode, arg, nrArgs);
+}
+
+static int IoRingProbeSupportedOpcodes(IoRing* ring)
+{
+    const unsigned int operationCount = 256;
+    struct io_uring_probe* probe = calloc(1, sizeof(*probe) + operationCount * sizeof(struct io_uring_probe_op));
+    if (probe == NULL)
+    {
+        errno = ENOMEM;
+        return -1;
+    }
+    if (IoUringRegister(ring->Fd, IORING_REGISTER_PROBE, probe, operationCount) < 0)
+    {
+        int savedErrno = errno;
+        free(probe);
+        errno = savedErrno;
+        return -1;
+    }
+    for (unsigned int i = 0; i < probe->ops_len; i++)
+    {
+        if ((probe->ops[i].flags & IO_URING_OP_SUPPORTED) != 0)
+        {
+            uint32_t opcode = probe->ops[i].op;
+            ring->SupportedOpcodes[opcode / 64] |= UINT64_C(1) << (opcode % 64);
+        }
+    }
+    free(probe);
+    return 0;
 }
 
 static long IoUringEnter(int fd, uint32_t toSubmit, uint32_t minComplete, uint32_t flags)
@@ -2286,13 +2345,44 @@ static bool IoRingNeedsEnter(IoRing* ring, int32_t minComplete)
     return true;
 }
 
-static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
+c_static_assert(sizeof(IoRingSubmission) == 64);
+c_static_assert(sizeof(IoRingSubmission) == sizeof(struct io_uring_sqe));
+c_static_assert(offsetof(IoRingSubmission, Offset) == offsetof(struct io_uring_sqe, off));
+c_static_assert(offsetof(IoRingSubmission, UserData) == offsetof(struct io_uring_sqe, user_data));
+c_static_assert(offsetof(IoRingSubmission, BufferIndex) == offsetof(struct io_uring_sqe, buf_index));
+c_static_assert(offsetof(IoRingSubmission, Address3) == 48);
+
+static bool IoRingSupportsNativeOpcode(int32_t opcode)
+{
+    // These operations use one completion, MORE-delimited multishot poll, or the
+    // SEND_ZC result/notification protocol. Extending this list requires lifetime review.
+    switch (opcode)
+    {
+        case IORING_OP_NOP:
+        case IORING_OP_READ:
+        case IORING_OP_WRITE:
+        case IORING_OP_READV:
+        case IORING_OP_WRITEV:
+        case IORING_OP_FSYNC:
+        case IORING_OP_CONNECT:
+        case IORING_OP_POLL_ADD:
+        case IORING_OP_SEND:
+        case IORING_OP_RECV:
+        case IORING_OP_SENDMSG:
+        case IORING_OP_SEND_ZC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static int IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
 {
     memset(sqe, 0, sizeof(*sqe));
     sqe->fd = (int32_t)request->Fd;
     sqe->user_data = request->UserData;
 
-    switch ((IoRingOp)request->OpCode)
+    switch (request->OpCode)
     {
         case IoRingOp_Read:
             // A negative Offset means "non-positional": io_uring treats an off of -1 for
@@ -2397,10 +2487,126 @@ static void IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->buf_group = 0;
             sqe->msg_flags = (uint32_t)request->Flags;
             break;
+        case IoRingOp_PollMultishot:
+            sqe->opcode = IORING_OP_POLL_ADD;
+            sqe->len = IORING_POLL_ADD_MULTI;
+            // Linux poll32_events uses word-reversed storage on big-endian systems.
+            sqe->poll32_events = (uint32_t)request->Flags;
+#if defined(BIGENDIAN) && BIGENDIAN
+            sqe->poll32_events = (sqe->poll32_events << 16) | (sqe->poll32_events >> 16);
+#endif
+            break;
+        case IoRingOp_AcceptMultishot:
+            sqe->opcode = IORING_OP_ACCEPT;
+            sqe->ioprio = IORING_ACCEPT_MULTISHOT;
+            sqe->accept_flags = (uint32_t)request->Flags | SOCK_CLOEXEC;
+            break;
+        case IoRingOp_SendZeroCopy:
+            sqe->opcode = IORING_OP_SEND_ZC;
+            sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
+            sqe->len = (uint32_t)request->BufferLength;
+            sqe->msg_flags = (uint32_t)request->Flags | MSG_NOSIGNAL;
+            break;
+        case IoRingOp_Native:
+        {
+            const IoRingSubmission* submission = &request->NativeSubmission;
+            if (SystemNative_IoRingValidateSubmission(submission) != 0)
+            {
+                return -1;
+            }
+
+            memcpy(sqe, submission, sizeof(*sqe));
+            sqe->fd = (int32_t)request->Fd;
+            sqe->user_data = request->UserData;
+            if (submission->Opcode == IORING_OP_SEND || submission->Opcode == IORING_OP_SENDMSG ||
+                submission->Opcode == IORING_OP_SEND_ZC)
+            {
+                sqe->msg_flags |= MSG_NOSIGNAL;
+            }
+            break;
+        }
+        default:
+            errno = EINVAL;
+            return -1;
     }
+    return 0;
 }
 
 #endif // HAVE_LINUX_IO_URING_H
+
+int32_t SystemNative_IoRingValidateSubmission(const IoRingSubmission* submission)
+{
+#if HAVE_LINUX_IO_URING_H
+    if (submission == NULL)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!IoRingSupportsNativeOpcode(submission->Opcode))
+    {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    // A drain can block the cancellation needed to finish an earlier request on the shared ring.
+    // Links, skipped completions, and resources owned outside this request are also forbidden.
+    if ((submission->Flags & ~IOSQE_ASYNC) != 0 ||
+        submission->BufferIndex != 0 || submission->Personality != 0 ||
+        submission->SpliceFileDescriptor != 0 || submission->Address3 != 0 || submission->Padding != 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // Ordinary zero-copy socket sends release their buffers through the socket error queue,
+    // not their terminal CQE. Only SEND_ZC provides the notification protocol we own.
+#if defined(MSG_ZEROCOPY)
+    const uint32_t zeroCopyMessageFlag = MSG_ZEROCOPY;
+#else
+    const uint32_t zeroCopyMessageFlag = 0x04000000; // Linux UAPI MSG_ZEROCOPY
+#endif
+    if ((submission->Opcode == IORING_OP_SEND || submission->Opcode == IORING_OP_SENDMSG) &&
+        (submission->OperationFlags & zeroCopyMessageFlag) != 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
+    // RECV_MULTISHOT requires runtime-owned provided buffers and must use its
+    // dedicated operation. Fixed-buffer send also requires separate ownership.
+    uint16_t allowedIoPriority = 0;
+    if (submission->Opcode == IORING_OP_SEND || submission->Opcode == IORING_OP_RECV ||
+        submission->Opcode == IORING_OP_SENDMSG)
+    {
+#if defined(IORING_RECVSEND_POLL_FIRST)
+        allowedIoPriority = IORING_RECVSEND_POLL_FIRST;
+#endif
+    }
+    if (submission->Opcode == IORING_OP_SEND_ZC)
+    {
+        allowedIoPriority = IORING_SEND_ZC_REPORT_USAGE;
+#if defined(IORING_RECVSEND_POLL_FIRST)
+        allowedIoPriority |= IORING_RECVSEND_POLL_FIRST;
+#endif
+    }
+    if ((submission->IoPriority & ~allowedIoPriority) != 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    uint32_t allowedPollFlags = IORING_POLL_ADD_MULTI;
+    if (submission->Opcode == IORING_OP_POLL_ADD && (submission->Length & ~allowedPollFlags) != 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+#else
+    (void)submission;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
 
 uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVector* vectors, int32_t vectorCount)
 {
@@ -2464,11 +2670,16 @@ int32_t SystemNative_IoRingIsAvailable(void)
 
 int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle)
 {
+    return SystemNative_IoRingCreateWithFlags(submissionQueueDepth, completionQueueDepth, singleIssuer, 0, ringHandle);
+}
+
+int32_t SystemNative_IoRingCreateWithFlags(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle)
+{
     assert(ringHandle != NULL);
     *ringHandle = 0;
 
 #if HAVE_LINUX_IO_URING_H
-    if (submissionQueueDepth <= 0)
+    if (submissionQueueDepth <= 0 || (flags & ~IoRingCreateFlags_Cqe32) != 0)
     {
         errno = EINVAL;
         return -1;
@@ -2476,6 +2687,15 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
 
     struct io_uring_params params;
     memset(&params, 0, sizeof(params));
+    if ((flags & IoRingCreateFlags_Cqe32) != 0)
+    {
+#if defined(IORING_SETUP_CQE32)
+        params.flags |= IORING_SETUP_CQE32;
+#else
+        errno = ENOTSUP;
+        return -1;
+#endif
+    }
     if (completionQueueDepth > 0)
     {
         params.flags |= IORING_SETUP_CQSIZE;
@@ -2532,12 +2752,29 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
 
     ring->Fd = (int)fd;
     ring->EventFd = -1;
+    if (IoRingProbeSupportedOpcodes(ring) != 0)
+    {
+        int savedErrno = errno;
+        close(ring->Fd);
+        free(ring);
+        errno = savedErrno;
+        return -1;
+    }
+    ring->CqeShift = (flags & IoRingCreateFlags_Cqe32) != 0 ? 1 : 0;
 #if defined(IORING_SETUP_TASKRUN_FLAG)
     ring->HasTaskRunFlag = (params.flags & IORING_SETUP_TASKRUN_FLAG) != 0;
 #endif
 
     size_t sqRingSize = (size_t)params.sq_off.array + (size_t)params.sq_entries * sizeof(uint32_t);
-    size_t cqRingSize = (size_t)params.cq_off.cqes + (size_t)params.cq_entries * sizeof(struct io_uring_cqe);
+    size_t cqeSize = sizeof(struct io_uring_cqe) << ring->CqeShift;
+    if ((size_t)params.cq_entries > (SIZE_MAX - (size_t)params.cq_off.cqes) / cqeSize)
+    {
+        close(ring->Fd);
+        free(ring);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    size_t cqRingSize = (size_t)params.cq_off.cqes + (size_t)params.cq_entries * cqeSize;
     size_t sqesSize = (size_t)params.sq_entries * sizeof(struct io_uring_sqe);
 
     void* sqRingPtr = mmap(NULL, sqRingSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring->Fd, (off_t)IORING_OFF_SQ_RING);
@@ -2579,7 +2816,24 @@ int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completi
     *ringHandle = (intptr_t)ring;
     return 0;
 #else
-    (void)submissionQueueDepth, (void)completionQueueDepth, (void)singleIssuer;
+    (void)submissionQueueDepth, (void)completionQueueDepth, (void)singleIssuer, (void)flags;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+int32_t SystemNative_IoRingIsOpcodeSupported(intptr_t ringHandle, int32_t opcode)
+{
+#if HAVE_LINUX_IO_URING_H
+    IoRing* ring = (IoRing*)ringHandle;
+    if (ring == NULL || opcode < 0 || opcode > UINT8_MAX)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+    return (ring->SupportedOpcodes[(uint32_t)opcode / 64] & (UINT64_C(1) << ((uint32_t)opcode % 64))) != 0;
+#else
+    (void)ringHandle, (void)opcode;
     errno = ENOTSUP;
     return -1;
 #endif
@@ -2617,7 +2871,14 @@ int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, 
         }
 
         uint32_t index = sqTail & sqMask;
-        IoRingFillSqe(&ring->Sqes[index], &requests[i]);
+        if (IoRingFillSqe(&ring->Sqes[index], &requests[i]) != 0)
+        {
+            if (queued == 0)
+            {
+                return -1;
+            }
+            break;
+        }
         ring->SqArray[index] = index;
 
         sqTail++;
@@ -2922,10 +3183,16 @@ int32_t SystemNative_IoRingWaitForCompletions(intptr_t ringHandle, IoRingComplet
     int32_t count = 0;
     while (cqHead != cqTail && count < maxCompletions)
     {
-        struct io_uring_cqe* cqe = &ring->Cqes[cqHead & cqMask];
+        struct io_uring_cqe* cqe = &ring->Cqes[(cqHead & cqMask) << ring->CqeShift];
         completions[count].UserData = cqe->user_data;
         completions[count].Result = cqe->res;
         completions[count].Flags = cqe->flags;
+        completions[count].Extra1 = 0;
+        completions[count].Extra2 = 0;
+        if (ring->CqeShift != 0)
+        {
+            memcpy(&completions[count].Extra1, cqe + 1, 2 * sizeof(uint64_t));
+        }
 
         cqHead++;
         count++;

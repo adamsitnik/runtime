@@ -8,5 +8,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\System.Net.Primitives\ref\System.Net.Primitives.csproj" />
     <ProjectReference Include="..\..\System.Runtime\ref\System.Runtime.csproj" />
+    <ProjectReference Include="..\..\System.Threading.ThreadPool\ref\System.Threading.ThreadPool.csproj" />
   </ItemGroup>
 </Project>

@@ -1,8 +1,11 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace System.Threading;
 
@@ -30,16 +33,15 @@ namespace System.Threading;
 // accepted-request count. Native retirement occurs on the issuer before worker delivery, so
 // synchronous close need not wait for a blocked worker. PrepareNative owns SENDMSG's native
 // header until retirement; ReleaseNativeHeader frees it on worker delivery or unpublished rollback.
-// The adapter, not this base class, owns the actual data pins and application-visible completion.
+// Managed request descriptors transfer pin management to this base class. Unsafe descriptors
+// retain the caller's explicit native-memory lifetime contract.
 //
-// CompleteFromIoUring records the result/flags/sequence for worker delivery. ExecuteCore releases
-// the retired header and calls the adapter's OnCompleted. A partial send can use
-// EnqueueContinuationCore to publish another native request without ending the logical use or
-// replacing its cancellation registration. TrackSend holds the binding's logical-send count
+// ProcessCompletion returns a continuation decision; only the runtime publishes it and completes
+// the logical use. TrackSend holds the binding's logical-send count
 // across that gap, so close still knows that unsent bytes remain.
 //
-// On final delivery the adapter calls CompleteOperationCore before returning this object to its
-// cache. It rejects live native work, disposes the token registration (waiting for callbacks),
+// On final delivery the runtime calls CompleteOperationCore before notifying the adapter.
+// It rejects live native work, disposes the token registration (waiting for callbacks),
 // waits for a cancellation publisher, sets Completing to prevent new publishers, and waits for
 // the issuer to retire any queued control record. Only then can it release logical-send tracking,
 // clear the binding and clear the state bits. The generation survives reuse. Abandon follows the
@@ -57,9 +59,22 @@ public abstract partial class IoUringOperation
     private long _state;
     private int _nativePending;
     private CancellationTokenRegistration _registration;
-    private int _result;
-    private uint _flags;
-    private long _sequence;
+    private IoUringCompletion _completion;
+    private Exception? _completionError;
+    private bool _stopping;
+    private MemoryHandle _bufferPin;
+    private ReadOnlyMemory<byte> _pinnedBuffer;
+    private bool _hasBufferPin;
+    private bool _providedBufferTaken;
+    private SingleProducerSingleConsumerQueue<IoUringCompletion>? _pending;
+    private int _dispatchRequested;
+    private int _executionClaimed;
+    private int _completionReady;
+    private int _pendingCount;
+    private int _overflowed;
+    private int _unclaimedDescriptor = -1;
+    private int _processingThreadId;
+    private Interop.Sys.IoRingOp _nativeKind;
     private bool _tracksSend;
     private unsafe byte* _messageHeader;
 
@@ -71,12 +86,18 @@ public abstract partial class IoUringOperation
     internal IoUringOperation? _next;
     internal IoUringOperation? _nextCancellation;
     internal int _cancellationQueued;
+    internal IoUringOperation? _previousWaiter;
+    internal IoUringOperation? _nextWaiter;
+    internal Interop.Sys.IoRingRequest _waitingRequest;
 
     private bool IsCancellationRequestedCore =>
         (Volatile.Read(ref _state) & CancellationRequested) != 0 || _binding?.IsDisposed == true;
 
     internal bool CancellationIsRequested => IsCancellationRequested;
     internal bool IsNativePending => Volatile.Read(ref _nativePending) != 0;
+    internal bool RequiresOrderedDelivery { get; private set; }
+    internal bool UsesProvidedBuffers => _nativeKind == Interop.Sys.IoRingOp.RecvMultishot;
+    internal CancellationToken OperationCancellationToken => _registration.Token;
 
     private void RequestCancellationCore()
     {
@@ -144,13 +165,7 @@ public abstract partial class IoUringOperation
         Interlocked.And(ref _state, ~StateMask);
     }
 
-    private void EnqueueContinuationCore(IoUringRequest request)
-    {
-        Debug.Assert(_binding is not null);
-        _binding.EnqueueContinuation(this, in request._nativeRequest);
-    }
-
-    internal IoUringRequest GetRequest() => Request;
+    internal IoUringRequest GetRequest() => PrepareRequest();
 
     internal void TrackSend()
     {
@@ -168,6 +183,9 @@ public abstract partial class IoUringOperation
         }
 
         _binding = binding;
+        _completionError = null;
+        _stopping = false;
+        _overflowed = 0;
         try
         {
             if (cancellationToken.CanBeCanceled)
@@ -233,6 +251,64 @@ public abstract partial class IoUringOperation
         }
     }
 
+    internal unsafe Interop.Sys.IoRingRequest PrepareResources(in IoUringRequest request)
+    {
+        if (!_tracksSend && request._nativeRequest.OpCode is
+            Interop.Sys.IoRingOp.Send or Interop.Sys.IoRingOp.SendMsg or Interop.Sys.IoRingOp.SendZeroCopy)
+        {
+            TrackSend();
+        }
+        RequiresOrderedDelivery |= request.RequiresOrderedDelivery;
+        if (RequiresOrderedDelivery)
+        {
+            _pending ??= new SingleProducerSingleConsumerQueue<IoUringCompletion>();
+        }
+        _nativeKind = request._nativeRequest.OpCode;
+        Interop.Sys.IoRingRequest nativeRequest = request._nativeRequest;
+        if (request._hasBuffer)
+        {
+            if (!_hasBufferPin || !_pinnedBuffer.Equals(request._buffer))
+            {
+                ReleaseBuffer();
+                _bufferPin = request._buffer.Pin();
+                _pinnedBuffer = request._buffer;
+                _hasBufferPin = true;
+            }
+            nativeRequest.Buffer = (byte*)_bufferPin.Pointer + request._bufferOffset;
+        }
+        return nativeRequest;
+    }
+
+    private void ReleaseBuffer()
+    {
+        MemoryHandle pin = _bufferPin;
+        _bufferPin = default;
+        _pinnedBuffer = default;
+        _hasBufferPin = false;
+        pin.Dispose();
+    }
+
+    private Exception? ReleaseResources(Exception? error)
+    {
+        try
+        {
+            OnCompleting();
+        }
+        catch (Exception cleanupError)
+        {
+            error = error is null ? cleanupError : new AggregateException(error, cleanupError);
+        }
+        try
+        {
+            ReleaseBuffer();
+        }
+        catch (Exception cleanupError)
+        {
+            error = error is null ? cleanupError : new AggregateException(error, cleanupError);
+        }
+        return error;
+    }
+
     internal unsafe void ReleaseNativeHeader()
     {
         if (_messageHeader != null)
@@ -242,26 +318,215 @@ public abstract partial class IoUringOperation
         }
     }
 
-    internal void Abandon()
+    internal Exception Abandon(Exception submissionError)
     {
-        ReleaseNativeHeader();
-        CompleteOperation();
+        try
+        {
+            ReleaseNativeHeader();
+            return ReleaseResources(submissionError)!;
+        }
+        finally
+        {
+            CompleteOperationCore();
+        }
     }
 
-    internal IThreadPoolWorkItem CompleteFromIoUring(int result, uint flags, long sequence)
+    internal IThreadPoolWorkItem CompleteFromIoUring(in Interop.Sys.IoRingCompletion completion)
     {
-        _result = result;
-        _flags = flags;
-        _sequence = sequence;
+        _completion = new IoUringCompletion(completion.Result, completion.Flags, completion.Extra1, completion.Extra2);
+        Volatile.Write(ref _completionReady, 1);
         return this;
+    }
+
+    internal void EnqueueFromIssuer(in Interop.Sys.IoRingCompletion completion)
+    {
+        Debug.Assert(_pending is not null);
+        // Stop an accept stream when its consumer falls behind. Cancellation is asynchronous;
+        // completions already produced by the kernel are still drained and their descriptors closed.
+        const int AcceptBacklogLimit = 256;
+        if (Interlocked.Increment(ref _pendingCount) > AcceptBacklogLimit &&
+            _nativeKind == Interop.Sys.IoRingOp.AcceptMultishot)
+        {
+            Volatile.Write(ref _overflowed, 1);
+            RequestCancellationCore();
+        }
+        _pending.Enqueue(new IoUringCompletion(completion.Result, completion.Flags, completion.Extra1, completion.Extra2));
+        // Enqueue may expose a new segment before updating its producer tail. Only expose a
+        // consumable completion after that update, so terminal callbacks can safely change issuers.
+        Interlocked.Increment(ref _completionReady);
+        if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
+        {
+            ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
+        }
     }
 
     private void ExecuteCore()
     {
-        int result = _result;
-        uint flags = _flags;
-        long sequence = _sequence;
-        ReleaseNativeHeader();
-        OnCompleted(result, flags, sequence);
+        Thread currentThread = Thread.CurrentThread;
+        if (!currentThread.IsThreadPoolThread)
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_IoUringThreadPoolRequired);
+        }
+        if (Interlocked.CompareExchange(ref _executionClaimed, 1, 0) != 0)
+        {
+            return;
+        }
+
+        while (true)
+        {
+            while (Volatile.Read(ref _completionReady) != 0)
+            {
+                IoUringCompletion completion;
+                if (RequiresOrderedDelivery)
+                {
+                    Debug.Assert(_pending is not null);
+                    bool dequeued = _pending.TryDequeue(out completion);
+                    Debug.Assert(dequeued);
+                    Interlocked.Decrement(ref _pendingCount);
+                }
+                else
+                {
+                    completion = _completion;
+                }
+                Interlocked.Decrement(ref _completionReady);
+                if (Process(completion))
+                {
+                    // Final notification may already have reused this instance on a different ring.
+                    return;
+                }
+                ExecutionContext.ResetThreadPoolThread(currentThread);
+                currentThread.ResetThreadPoolThread();
+            }
+            Interlocked.Exchange(ref _dispatchRequested, 0);
+            Interlocked.Exchange(ref _executionClaimed, 0);
+            if (Volatile.Read(ref _completionReady) == 0 ||
+                Interlocked.CompareExchange(ref _executionClaimed, 1, 0) != 0)
+            {
+                return;
+            }
+        }
+    }
+
+    private bool Process(IoUringCompletion completion)
+    {
+        if (!completion.HasMore)
+        {
+            ReleaseNativeHeader();
+        }
+
+        _unclaimedDescriptor = _nativeKind == Interop.Sys.IoRingOp.AcceptMultishot && completion.Result >= 0
+            ? completion.Result : -1;
+        IoUringCompletionAction action = default;
+        try
+        {
+            if (!_stopping)
+            {
+                if (Volatile.Read(ref _overflowed) != 0)
+                {
+                    throw new InvalidOperationException(SR.InvalidOperation_IoUringCompletionBacklog);
+                }
+                _processingThreadId = Environment.CurrentManagedThreadId;
+                action = ProcessCompletion(in completion);
+                if (action._kind == 1 && !completion.HasMore ||
+                    action._kind == 2 && completion.HasMore)
+                {
+                    throw new InvalidOperationException(SR.InvalidOperation_IoUringCompletionAction);
+                }
+                if (action._kind == 0)
+                {
+                    _stopping = true;
+                    _completionError = action._error;
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            _completionError = error;
+            _stopping = true;
+        }
+        finally
+        {
+            _processingThreadId = 0;
+            if (_unclaimedDescriptor >= 0)
+            {
+                Interop.Sys.Close((IntPtr)_unclaimedDescriptor);
+                _unclaimedDescriptor = -1;
+            }
+            if (_stopping && UsesProvidedBuffers && (completion.Flags & Interop.Sys.IoRingCompletion.Buffer) != 0 &&
+                !_providedBufferTaken)
+            {
+                _binding!._ring.ReceiveBuffers!.Return((int)(completion.Flags >> Interop.Sys.IoRingCompletion.BufferShift));
+            }
+            _providedBufferTaken = false;
+        }
+
+        if (completion.HasMore)
+        {
+            if (_stopping)
+            {
+                RequestCancellationCore();
+            }
+            return false;
+        }
+
+        if (!_stopping && action._kind == 2)
+        {
+            try
+            {
+                if (IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(OperationCancellationToken);
+                }
+                _binding!.EnqueueContinuation(this, in action._request);
+                return false;
+            }
+            catch (Exception error)
+            {
+                _completionError = error;
+            }
+        }
+
+        Exception? completionError = ReleaseResources(_completionError);
+        _completionError = null;
+        Interlocked.Exchange(ref _dispatchRequested, 0);
+        if (RequiresOrderedDelivery)
+        {
+            Thread currentThread = Thread.CurrentThread;
+            ExecutionContext.ResetThreadPoolThread(currentThread);
+            currentThread.ResetThreadPoolThread();
+        }
+        Interlocked.Exchange(ref _executionClaimed, 0);
+        CompleteOperationCore();
+        OnCompleted(completionError);
+        return true;
+    }
+
+    internal IMemoryOwner<byte>? TakeProvidedBuffer(in IoUringCompletion completion, bool isDatagram)
+    {
+        if ((completion.Flags & Interop.Sys.IoRingCompletion.Buffer) == 0)
+        {
+            return null;
+        }
+        int id = (int)(completion.Flags >> Interop.Sys.IoRingCompletion.BufferShift);
+        if (completion.Result > 0 || completion.Result == 0 && isDatagram)
+        {
+            IMemoryOwner<byte> buffer = _binding!._ring.ReceiveBuffers!.Rent(id, completion.Result);
+            _providedBufferTaken = true;
+            return buffer;
+        }
+        _binding!._ring.ReceiveBuffers!.Return(id);
+        _providedBufferTaken = true;
+        return null;
+    }
+
+    private SafeFileHandle TakeAcceptedHandleCore()
+    {
+        if (_unclaimedDescriptor < 0 || _processingThreadId != Environment.CurrentManagedThreadId)
+        {
+            throw new InvalidOperationException(SR.InvalidOperation_IoUringAcceptedHandleRequired);
+        }
+        SafeFileHandle handle = new((IntPtr)_unclaimedDescriptor, ownsHandle: true);
+        _unclaimedDescriptor = -1;
+        return handle;
     }
 }

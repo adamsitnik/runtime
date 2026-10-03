@@ -24,25 +24,119 @@ internal static partial class Interop
             SendMsg = 10,
             PollRead = 11,
             PollWrite = 12,
+            PollMultishot = 13,
+            AcceptMultishot = 14,
+            SendZeroCopy = 15,
+            Native = 16,
+        }
+
+        // Private staging copy of a 64-byte SQE, not access to a live submission queue.
+        // FileDescriptor and UserData are reserved: native submission overwrites both.
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct IoRingSubmission
+        {
+            public byte Opcode;
+            public byte Flags;
+            public ushort IoPriority;
+            public int FileDescriptor;
+            public ulong Offset;
+            public ulong Address;
+            public uint Length;
+            public uint OperationFlags;
+            public ulong UserData;
+            public ushort BufferIndex;
+            public ushort Personality;
+            public int SpliceFileDescriptor;
+            public ulong Address3;
+            public ulong Padding;
         }
 
         // Mirrors the native IoRingRequest struct in pal_io.h.
         // Fd is a raw file descriptor (not a SafeHandle): the caller is responsible for keeping
         // the owning SafeHandle ref-counted/alive for as long as the request may be in flight.
-        [StructLayout(LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Explicit, Size = 80)]
         internal unsafe struct IoRingRequest
         {
+            [FieldOffset(0)]
             public IoRingOp OpCode;
-            public IntPtr Fd;
-            public long Offset; // -1 for non-positional ops
-            public byte* Buffer; // used by Read/Write/Recv/Send; native msghdr for SendMsg
-            public int BufferLength;
-            public IOVector* Vectors; // used by ReadV/WriteV
-            public int VectorCount;
-            public int Flags; // MSG_* flags for Recv/Send; accept flags for Accept
-            public byte* SockAddr; // used by Accept (output, peer address) / Connect (input, destination address)
-            public int* SockAddrLen; // in/out length of SockAddr
+            [FieldOffset(4)]
+            private int _fileDescriptor;
+            [FieldOffset(8)]
             public ulong UserData;
+            [FieldOffset(16)]
+            private OperationFields _operation;
+            [FieldOffset(16)]
+            public IoRingSubmission NativeSubmission;
+
+            // The descriptor is a native int on every platform; retain IntPtr at call sites.
+            public IntPtr Fd
+            {
+                readonly get => (IntPtr)_fileDescriptor;
+                set => _fileDescriptor = (int)value;
+            }
+
+            public long Offset
+            {
+                readonly get => _operation.Offset;
+                set => _operation.Offset = value;
+            }
+
+            public byte* Buffer
+            {
+                readonly get => _operation.Buffer;
+                set => _operation.Buffer = value;
+            }
+
+            public int BufferLength
+            {
+                readonly get => _operation.BufferLength;
+                set => _operation.BufferLength = value;
+            }
+
+            public IOVector* Vectors
+            {
+                readonly get => _operation.Vectors;
+                set => _operation.Vectors = value;
+            }
+
+            public int VectorCount
+            {
+                readonly get => _operation.VectorCount;
+                set => _operation.VectorCount = value;
+            }
+
+            public int Flags
+            {
+                readonly get => _operation.Flags;
+                set => _operation.Flags = value;
+            }
+
+            public byte* SockAddr
+            {
+                readonly get => _operation.SockAddr;
+                set => _operation.SockAddr = value;
+            }
+
+            public int* SockAddrLen
+            {
+                readonly get => _operation.SockAddrLen;
+                set => _operation.SockAddrLen = value;
+            }
+
+            // Sequential layout follows the runtime pointer size, including builds that do not
+            // define architecture symbols. The payload overlaps NativeSubmission, not the header.
+            [StructLayout(LayoutKind.Sequential)]
+            private struct OperationFields
+            {
+                public long Offset; // -1 for non-positional ops
+                public byte* Buffer; // used by Read/Write/Recv/Send; native msghdr for SendMsg
+                public int BufferLength;
+                public IOVector* Vectors; // used by ReadV/WriteV
+                public int VectorCount;
+                public int Flags; // MSG_* flags for Recv/Send; accept flags for Accept
+                public byte* SockAddr; // output for Accept, input for Connect
+                public int* SockAddrLen;
+            }
         }
 
         // Mirrors the native IoRingCompletion struct in pal_io.h.
@@ -52,6 +146,8 @@ internal static partial class Interop
             // IORING_CQE_F_MORE: this is not the final completion for the request that produced
             // it (e.g. a RecvMultishot request that is still active and will keep completing).
             public const uint More = 1 << 1;
+            // IORING_CQE_F_NOTIF: releases the source buffer after a zero-copy send.
+            public const uint Notification = 1 << 3;
             // IORING_CQE_F_BUFFER: Flags encodes the selected provided-buffer id, shifted left by
             // BufferShift (IORING_CQE_BUFFER_SHIFT) - only set for ops that use provided buffers
             // (RecvMultishot).
@@ -61,6 +157,8 @@ internal static partial class Interop
             public ulong UserData;
             public int Result;
             public uint Flags;
+            public ulong Extra1;
+            public ulong Extra2;
         }
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsAvailable")]
@@ -81,6 +179,20 @@ internal static partial class Interop
         // -EEXIST. Pass 0 for a plain ring that can be freely shared/rotated across threads instead.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreate", SetLastError = true)]
         internal static partial int IoRingCreate(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, out IntPtr ringHandle);
+
+        internal const int IoRingCreateCqe32 = 1;
+
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreateWithFlags", SetLastError = true)]
+        internal static partial int IoRingCreateWithFlags(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, int flags, out IntPtr ringHandle);
+
+        // Cached kernel opcode support, safe to query from any thread while the ring is kept alive.
+        // Not a guarantee for all flags or permission to bypass Native-path validation.
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsOpcodeSupported", SetLastError = true)]
+        internal static partial int IoRingIsOpcodeSupported(IntPtr ringHandle, int opcode);
+
+        // Validate the immutable staging copy before enqueueing, on any thread. Does not probe the kernel.
+        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingValidateSubmission", SetLastError = true)]
+        internal static partial int IoRingValidateSubmission(in IoRingSubmission submission);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingSubmit", SetLastError = true)]
         internal static unsafe partial int IoRingSubmit(IntPtr ringHandle, IoRingRequest* requests, int requestCount, out int submittedCount);

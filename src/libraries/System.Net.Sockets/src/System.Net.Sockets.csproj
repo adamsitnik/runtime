@@ -27,6 +27,7 @@
     <Compile Include="System\Net\Sockets\SocketsTelemetry.cs" />
     <Compile Include="System\Net\Sockets\SocketTaskExtensions.cs" />
     <Compile Include="System\Net\Sockets\IOControlCode.cs" />
+    <Compile Include="System\Net\Sockets\IoUringAcceptOperation.cs" />
     <Compile Include="System\Net\Sockets\IPPacketInformation.cs" />
     <Compile Include="System\Net\Sockets\IPProtectionLevel.cs" />
     <Compile Include="System\Net\Sockets\LingerOption.cs" />
@@ -209,12 +210,14 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(IsLinuxPlatform)' == 'true'">
+    <Compile Include="System\Net\Sockets\IoUringAcceptOperation.Linux.cs" />
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Linux.cs" />
     <Compile Include="System\Net\Sockets\Socket.Multishot.Linux.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(IsLinuxPlatform)' != 'true' and '$(TargetPlatformIdentifier)' != '' and '$(TargetPlatformIdentifier)' != 'browser'">
+    <Compile Include="System\Net\Sockets\IoUringAcceptOperation.Unsupported.cs" />
     <Compile Include="System\Net\Sockets\Socket.Multishot.cs" />
   </ItemGroup>
 

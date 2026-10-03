@@ -930,7 +930,35 @@ typedef enum
     IoRingOp_SendMsg = 10,       // gather socket send; Buffer points to an owned native msghdr
     IoRingOp_PollRead = 11,      // one-shot poll for readable data or a socket error/hangup
     IoRingOp_PollWrite = 12,     // one-shot poll for write readiness or a socket error/hangup
+    IoRingOp_PollMultishot = 13, // persistent poll; Flags is the native poll mask
+    IoRingOp_AcceptMultishot = 14, // persistent accept without peer address output
+    IoRingOp_SendZeroCopy = 15,  // source buffer remains live through the final notification
+    IoRingOp_Native = 16,       // private staged SQE, subject to PAL lifecycle validation
 } IoRingOp;
+
+/**
+ * Private 64-byte SQE staging payload, never a reference to a live kernel SQE.
+ * FileDescriptor and UserData are overwritten from the enclosing request.
+ * Only explicitly supported opcodes/completion protocols may be submitted. All referenced
+ * memory must remain live through the final completion, including zero-copy notifications.
+ */
+typedef struct
+{
+    uint8_t Opcode;
+    uint8_t Flags;
+    uint16_t IoPriority;
+    int32_t FileDescriptor;
+    uint64_t Offset;
+    uint64_t Address;
+    uint32_t Length;
+    uint32_t OperationFlags;
+    uint64_t UserData;
+    uint16_t BufferIndex;
+    uint16_t Personality;
+    int32_t SpliceFileDescriptor;
+    uint64_t Address3;
+    uint64_t Padding;
+} IoRingSubmission;
 
 /**
  * A single io_uring request to be submitted via SystemNative_IoRingSubmit.
@@ -943,18 +971,24 @@ typedef enum
 typedef struct
 {
     int32_t OpCode;      // IoRingOp
-    intptr_t Fd;
-    int64_t Offset;      // file offset for positional ops; -1 for non-positional ops; for
-                          // IoRingOp_Cancel, the target request's UserData instead
-    uint8_t* Buffer;     // used by Read / Write / Recv / Send; native msghdr for SendMsg
-    int32_t BufferLength;
-    IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
-    int32_t VectorCount;
-    int32_t Flags;       // MSG_* flags for IoRingOp_Recv / IoRingOp_Send; accept flags for IoRingOp_Accept
-    uint8_t* SockAddr;   // used by IoRingOp_Accept (output, peer address) / IoRingOp_Connect (input, destination address)
-    int32_t* SockAddrLen; // in/out length of SockAddr: Accept writes the actual peer address length back into it;
-                          // Connect reads it once, by value, as the input address length
+    int32_t Fd;
     uint64_t UserData;   // opaque correlation token, echoed back in the matching IoRingCompletion
+    union
+    {
+        struct
+        {
+            int64_t Offset;      // file offset for positional ops; -1 for non-positional ops; for
+                                 // IoRingOp_Cancel, the target request's UserData instead
+            uint8_t* Buffer;     // used by Read / Write / Recv / Send; native msghdr for SendMsg
+            int32_t BufferLength;
+            IOVector* Vectors;   // used by IoRingOp_ReadV / IoRingOp_WriteV
+            int32_t VectorCount;
+            int32_t Flags;       // MSG_* flags for IoRingOp_Recv / IoRingOp_Send; accept flags for IoRingOp_Accept
+            uint8_t* SockAddr;   // used by IoRingOp_Accept (output, peer address) / IoRingOp_Connect (input, destination address)
+            int32_t* SockAddrLen; // in/out address length for Accept; input address length for Connect
+        };
+        IoRingSubmission NativeSubmission;
+    };
 } IoRingRequest;
 
 /**
@@ -965,6 +999,8 @@ typedef struct
     uint64_t UserData; // matches the UserData of the IoRingRequest that produced this completion
     int32_t Result;    // number of bytes transferred on success, or -errno on failure
     uint32_t Flags;    // raw CQE flags (e.g. IORING_CQE_F_MORE)
+    uint64_t Extra1;   // CQE32 extension, zero for ordinary CQEs
+    uint64_t Extra2;
 } IoRingCompletion;
 
 /**
@@ -1002,10 +1038,33 @@ PALEXPORT uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVecto
  * different threads, both for submission and (over time, as some rotating "driver" role) for
  * reaping completions.
  *
+ * Probes opcode support on the creating thread and caches it for subsequent readers.
+ * A failed probe fails creation rather than publishing a ring with unknown capabilities.
  * Returns 0 on success (with *ringHandle set to an opaque, non-zero handle);
  * otherwise, returns -1 and sets errno.
  */
 PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle);
+
+// Opt-in creation flags; the existing creation entrypoint always uses zero.
+#define IoRingCreateFlags_Cqe32 1
+PALEXPORT int32_t SystemNative_IoRingCreateWithFlags(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle);
+
+/**
+ * Reads cached kernel support for a native opcode. This does not bypass the Native path's
+ * separate lifecycle restrictions.
+ * Returns 1 for supported, 0 for unsupported, or -1 with errno for invalid arguments or missing header support.
+ * Opcode support does not guarantee support for every operation-specific flag.
+ * May be called on any thread while the caller keeps the ring alive; no syscall is performed.
+ */
+PALEXPORT int32_t SystemNative_IoRingIsOpcodeSupported(intptr_t ringHandle, int32_t opcode);
+
+/**
+ * Validates the Native path's opcode and lifecycle restrictions without accessing a ring.
+ * Call before enqueueing an immutable staging copy; the same validation runs at submission.
+ * Does not probe kernel support or verify the lifetime/validity of referenced memory.
+ * Returns 0 on success, or -1 with errno. Missing header support returns ENOTSUP.
+ */
+PALEXPORT int32_t SystemNative_IoRingValidateSubmission(const IoRingSubmission* submission);
 
 /**
  * Fills one SQE per request and publishes them to the ring's kernel-visible submission queue
@@ -1018,9 +1077,9 @@ PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_
  * Returns 0 on success (with *submittedCount set to the number of requests actually queued
  * into the ring's submission queue - i.e., durably published and guaranteed to eventually
  * produce a matching completion once SystemNative_IoRingWaitForCompletions submits them). A return of 0 with
- * *submittedCount less than requestCount means the submission queue was full; the caller should
- * retry the remaining requests later. Returns -1 and sets errno only when no requests at all
- * could be queued due to a genuine failure (e.g., an invalid ring handle).
+ * *submittedCount less than requestCount means the submission queue was full or the next request
+ * failed validation; the caller should retry the remaining requests later. Returns -1 and sets errno
+ * only when no requests at all could be queued due to a genuine failure (e.g., an invalid ring handle).
  */
 PALEXPORT int32_t SystemNative_IoRingSubmit(intptr_t ringHandle, IoRingRequest* requests, int32_t requestCount, int32_t* submittedCount);
 

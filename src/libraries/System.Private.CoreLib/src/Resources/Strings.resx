@@ -120,6 +120,30 @@
   <data name="Acc_CreateAbst" xml:space="preserve">
     <value>Cannot create an abstract class.</value>
   </data>
+  <data name="InvalidOperation_IoUringManagedBufferRequired" xml:space="preserve">
+    <value>The request must use a managed buffer to create a buffer slice.</value>
+  </data>
+  <data name="InvalidOperation_IoUringNativeOffset" xml:space="preserve">
+    <value>Create a new native submission to change its operation-specific offset.</value>
+  </data>
+  <data name="Arg_IoUringZeroCopySendFlags" xml:space="preserve">
+    <value>Use a zero-copy send operation instead of MSG_ZEROCOPY so that buffer-release notifications are tracked.</value>
+  </data>
+  <data name="InvalidOperation_IoUringThreadPoolRequired" xml:space="preserve">
+    <value>io_uring completion work items must be executed by the ThreadPool.</value>
+  </data>
+  <data name="InvalidOperation_IoUringCompletionAction" xml:space="preserve">
+    <value>The completion action is incompatible with the native request lifetime. Continue requires more native completions; resubmission requires the terminal completion.</value>
+  </data>
+  <data name="InvalidOperation_IoUringCompletionBacklog" xml:space="preserve">
+    <value>The multishot accept consumer did not keep up with incoming connections. The operation was canceled and undelivered connections were closed.</value>
+  </data>
+  <data name="InvalidOperation_IoUringAcceptedHandleRequired" xml:space="preserve">
+    <value>No unclaimed descriptor is available from the current multishot accept completion.</value>
+  </data>
+  <data name="Arg_IoUringInvalidSubmission" xml:space="preserve">
+    <value>The native submission requires an ownership or completion protocol that is not permitted on a shared io_uring ring.</value>
+  </data>
   <data name="Acc_CreateAbstEx" xml:space="preserve">
     <value>Cannot create an instance of {0} because it is an abstract class.</value>
   </data>

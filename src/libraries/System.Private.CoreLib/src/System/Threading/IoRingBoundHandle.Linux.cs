@@ -166,30 +166,30 @@ public sealed partial class IoRingBoundHandle
         try
         {
             IoUringRequest request = operation.GetRequest();
-            if (request._nativeRequest.OpCode is Interop.Sys.IoRingOp.Send or Interop.Sys.IoRingOp.SendMsg)
-            {
-                // A partial send can have no native request while its continuation is pending.
-                // Track the logical send so closing in that gap still uses abortive close.
-                operation.TrackSend();
-            }
-            EnqueueContinuation(operation, in request._nativeRequest);
+            EnqueueContinuation(operation, in request);
         }
-        catch
+        catch (Exception error)
         {
-            operation.Abandon();
+            Exception cleanupError = operation.Abandon(error);
+            if (!ReferenceEquals(cleanupError, error))
+            {
+                throw cleanupError;
+            }
             throw;
         }
     }
 
-    internal void EnqueueContinuation(IoUringOperation operation, in Interop.Sys.IoRingRequest request)
+    internal void EnqueueContinuation(IoUringOperation operation, in IoUringRequest request)
     {
+        // Pin/Unpin may execute user code, including synchronous disposal of this binding.
+        // Do not hold a native-drain reservation until those callbacks have returned.
+        Interop.Sys.IoRingRequest nativeRequest = operation.PrepareResources(in request);
         AcquireNative();
         bool acquired = false;
         try
         {
             operation.AcquireNative();
             acquired = true;
-            Interop.Sys.IoRingRequest nativeRequest = request;
             nativeRequest.Fd = _fileDescriptor;
             operation.PrepareNative(ref nativeRequest);
             PortableThreadPool.IoUringThreadPool.Enqueue(_ring, operation, in nativeRequest);

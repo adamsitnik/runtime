@@ -79,6 +79,14 @@ namespace System.Net.Sockets
         [System.Runtime.Versioning.SupportedOSPlatformAttribute("windows")]
         AddressListSort = (long)3355443225,
     }
+    [System.CLSCompliantAttribute(false)]
+    [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
+    public abstract partial class IoUringAcceptOperation : System.Threading.IoUringMultishotOperation<System.Net.Sockets.SafeSocketHandle>
+    {
+        protected IoUringAcceptOperation() { }
+        protected sealed override System.Threading.IoUringRequest PrepareRequest() { throw null; }
+        protected sealed override System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion) { throw null; }
+    }
     public partial struct IPPacketInformation : System.IEquatable<System.Net.Sockets.IPPacketInformation>
     {
         private object _dummy;
@@ -144,7 +152,6 @@ namespace System.Net.Sockets
         public override System.IAsyncResult BeginWrite(byte[] buffer, int offset, int count, System.AsyncCallback? callback, object? state) { throw null; }
         public void Close(int timeout) { }
         public void Close(System.TimeSpan timeout) { }
-        protected override void Dispose(bool disposing) { }
         public override int EndRead(System.IAsyncResult asyncResult) { throw null; }
         public override void EndWrite(System.IAsyncResult asyncResult) { }
         ~NetworkStream() { }
@@ -232,6 +239,7 @@ namespace System.Net.Sockets
         public SafeSocketHandle() : base (default(bool)) { }
         public SafeSocketHandle(nint preexistingHandle, bool ownsHandle) : base (default(bool)) { }
         public override bool IsInvalid { get { throw null; } }
+        protected override void Dispose(bool disposing) { }
         protected override bool ReleaseHandle() { throw null; }
     }
     public enum SelectMode
@@ -400,10 +408,6 @@ namespace System.Net.Sockets
         public System.Threading.Tasks.ValueTask<int> ReceiveAsync(System.Memory<byte> buffer, System.Net.Sockets.SocketFlags socketFlags, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public System.Threading.Tasks.ValueTask<int> ReceiveAsync(System.Memory<byte> buffer, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public bool ReceiveAsync(System.Net.Sockets.SocketAsyncEventArgs e) { throw null; }
-        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
-        public System.Collections.Generic.IAsyncEnumerable<System.Buffers.IMemoryOwner<byte>> ReceiveMultishotAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
-        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
-        public System.Threading.Tasks.Task ReceiveMultishotAsync(System.Action<System.Buffers.IMemoryOwner<byte>> onReceived, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public int ReceiveFrom(byte[] buffer, int offset, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, int size, System.Net.Sockets.SocketFlags socketFlags, ref System.Net.EndPoint remoteEP) { throw null; }
         public int ReceiveFrom(byte[] buffer, ref System.Net.EndPoint remoteEP) { throw null; }
@@ -424,6 +428,10 @@ namespace System.Net.Sockets
         public System.Threading.Tasks.ValueTask<System.Net.Sockets.SocketReceiveMessageFromResult> ReceiveMessageFromAsync(System.Memory<byte> buffer, System.Net.EndPoint remoteEndPoint, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public System.Threading.Tasks.ValueTask<System.Net.Sockets.SocketReceiveMessageFromResult> ReceiveMessageFromAsync(System.Memory<byte> buffer, System.Net.Sockets.SocketFlags socketFlags, System.Net.EndPoint remoteEndPoint, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public bool ReceiveMessageFromAsync(System.Net.Sockets.SocketAsyncEventArgs e) { throw null; }
+        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
+        public System.Threading.Tasks.Task ReceiveMultishotAsync(System.Action<System.Buffers.IMemoryOwner<byte>> onReceived, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
+        [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
+        public System.Collections.Generic.IAsyncEnumerable<System.Buffers.IMemoryOwner<byte>> ReceiveMultishotAsync(System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { throw null; }
         public static void Select(System.Collections.IList? checkRead, System.Collections.IList? checkWrite, System.Collections.IList? checkError, int microSeconds) { }
         public static void Select(System.Collections.IList? checkRead, System.Collections.IList? checkWrite, System.Collections.IList? checkError, System.TimeSpan timeout) { }
         public int Send(byte[] buffer) { throw null; }
