@@ -24,8 +24,7 @@ namespace Microsoft.Win32.SafeHandles
             // Pins and the handle reference span the logical operation, including partial-write
             // continuations, and are released before this instance can be reused.
             private bool _fileHandleRefAdded;
-            private MemoryHandle _singleSegmentPin;
-            private int _singleSegmentOffset;
+            private IoUringRequest _singleSegmentRequest;
             private MemoryHandle[]? _vectorPins;
             private Interop.Sys.IOVector[]? _vectors;
             private GCHandle _vectorsHandle;
@@ -54,7 +53,10 @@ namespace Microsoft.Win32.SafeHandles
                     _fileHandle.DangerousAddRef(ref _fileHandleRefAdded);
                     if (_operation is Operation.Read or Operation.Write)
                     {
-                        _singleSegmentPin = _singleSegment.Pin();
+                        long offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
+                        _singleSegmentRequest = _operation == Operation.Read
+                            ? new IoUringRequest(IoUringOperationKind.Read, MemoryMarshal.AsMemory(_singleSegment), offset)
+                            : new IoUringRequest(IoUringOperationKind.Write, _singleSegment, offset);
                         SubmitSingleSegment();
                     }
                     else
@@ -124,11 +126,11 @@ namespace Microsoft.Win32.SafeHandles
                 return false;
             }
 
-            private void EnqueueIoUring(in Interop.Sys.IoRingRequest request)
+            private void EnqueueIoUring(IoUringRequest request)
             {
                 FileIoUringOperation operation = _ioUringOperation ??=
                     new FileIoUringOperation(this, _fileHandle.IoUringBinding);
-                operation.Enqueue(in request);
+                operation.Enqueue(request);
             }
 
             private sealed class FileIoUringOperation : IoUringOperation
@@ -144,16 +146,12 @@ namespace Microsoft.Win32.SafeHandles
                     _boundHandle = binding;
                 }
 
-                protected override IoUringRequest Request => _request;
+                protected override IoUringRequest PrepareRequest() => _request;
 
-                public void Enqueue(in Interop.Sys.IoRingRequest request)
+                public void Enqueue(IoUringRequest request)
                 {
-                    _request = new IoUringRequest(in request);
-                    if (_active)
-                    {
-                        EnqueueContinuation(_request);
-                    }
-                    else
+                    _request = request;
+                    if (!_active)
                     {
                         _active = true;
                         try
@@ -168,20 +166,19 @@ namespace Microsoft.Win32.SafeHandles
                     }
                 }
 
-                protected override void OnCompleted(int result, uint flags, long sequence)
+                protected override IoUringCompletionAction ProcessCompletion(in IoUringCompletion completion)
                 {
-                    try
-                    {
-                        if (_owner.TryContinueFromIoUring(result))
-                        {
-                            return;
-                        }
-                    }
-                    catch (Exception error)
+                    return _owner.TryContinueFromIoUring(completion.Result)
+                        ? IoUringCompletionAction.Resubmit(_request)
+                        : IoUringCompletionAction.Complete;
+                }
+
+                protected override void OnCompleted(Exception? error)
+                {
+                    if (error is not null)
                     {
                         _owner._ioUringSubmissionError = error;
                     }
-                    CompleteOperation();
                     _active = false;
                     _request = default;
                     ((IThreadPoolWorkItem)_owner).Execute();
@@ -189,7 +186,7 @@ namespace Microsoft.Win32.SafeHandles
             }
 
             /// <summary>
-            /// Returns true only when a partial write's continuation was accepted. Otherwise,
+            /// Returns true when a partial write's continuation has been prepared. Otherwise,
             /// updates the terminal result for cancellation or zero progress as necessary.
             /// </summary>
             private bool TryContinuePartialWrite(ref int result)
@@ -204,7 +201,7 @@ namespace Microsoft.Win32.SafeHandles
                     // Keep the remaining length for FileStream's incomplete-operation position fixup.
                     // Slicing does not invalidate the original pin.
                     _singleSegment = _singleSegment.Slice(result);
-                    _singleSegmentOffset += result;
+                    _singleSegmentRequest = _singleSegmentRequest.SliceBuffer(result, _singleSegment.Length);
                 }
                 else if (_operation == Operation.WriteGather)
                 {
@@ -241,19 +238,13 @@ namespace Microsoft.Win32.SafeHandles
                 return true;
             }
 
-            private unsafe void SubmitSingleSegment()
+            private void SubmitSingleSegment()
             {
                 Debug.Assert(_operation is Operation.Read or Operation.Write);
                 Debug.Assert(_fileHandleRefAdded);
 
-                Interop.Sys.IoRingRequest request = default;
-                request.OpCode = _operation == Operation.Read ? Interop.Sys.IoRingOp.Read : Interop.Sys.IoRingOp.Write;
-                request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
-                request.Buffer = (byte*)_singleSegmentPin.Pointer + _singleSegmentOffset;
-                request.BufferLength = _singleSegment.Length;
-
                 // Publish all ownership state before the request can complete on another worker.
-                EnqueueIoUring(in request);
+                EnqueueIoUring(_singleSegmentRequest.WithOffset(_fileHandle.SupportsRandomAccess ? _fileOffset : -1));
             }
 
             private unsafe void SubmitVectors()
@@ -296,7 +287,7 @@ namespace Microsoft.Win32.SafeHandles
                 request.Offset = _fileHandle.SupportsRandomAccess ? _fileOffset : -1;
                 request.Vectors = (Interop.Sys.IOVector*)_vectorsHandle.AddrOfPinnedObject() + _vectorsOffset;
                 request.VectorCount = remainingCount;
-                EnqueueIoUring(in request);
+                EnqueueIoUring(new IoUringRequest(in request));
             }
 
             /// <summary>
@@ -322,9 +313,7 @@ namespace Microsoft.Win32.SafeHandles
                 _vectorsOffset = 0;
                 _remainingBytesToWrite = 0;
 
-                _singleSegmentPin.Dispose();
-                _singleSegmentPin = default;
-                _singleSegmentOffset = 0;
+                _singleSegmentRequest = default;
 
                 if (_fileHandleRefAdded)
                 {

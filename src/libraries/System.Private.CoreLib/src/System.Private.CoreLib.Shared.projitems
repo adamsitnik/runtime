@@ -2629,6 +2629,9 @@
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.IoRing.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'">
       <Link>Common\Interop\Unix\System.Native\Interop.IoRing.cs</Link>
     </Compile>
+    <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeRingHandle.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'">
+      <Link>Common\Microsoft\Win32\SafeHandles\SafeRingHandle.cs</Link>
+    </Compile>
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.ReadDir.cs">
       <Link>Common\Interop\Unix\System.Native\Interop.ReadDir.cs</Link>
     </Compile>
@@ -2967,10 +2970,15 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoRingBoundHandle.Unsupported.cs" Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUring.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringBufferOperation.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringCompletion.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringCompletionAction.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringMultishotOperation.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.Unsupported.cs" Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperationKind.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringRequest.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringSubmission.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetsWindows)' != 'true'">
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\PreAllocatedOverlapped.PlatformNotSupported.cs" />

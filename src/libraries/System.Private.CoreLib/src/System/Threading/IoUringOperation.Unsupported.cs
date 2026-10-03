@@ -9,9 +9,7 @@ public abstract partial class IoUringOperation
 
     private void RequestCancellationCore() => throw new PlatformNotSupportedException();
 
-    private void CompleteOperationCore() => throw new PlatformNotSupportedException();
-
-    private void EnqueueContinuationCore(IoUringRequest request) => throw new PlatformNotSupportedException();
+    private System.Buffers.IMemoryOwner<byte>? TakeBufferCore() => throw new PlatformNotSupportedException();
 
     private void ExecuteCore() => throw new PlatformNotSupportedException();
 }

@@ -14,8 +14,7 @@ namespace System.Net.Sockets
     {
         /// <summary>
         /// Streams received data as an <see cref="IAsyncEnumerable{T}"/>, backed by a single persistent
-        /// multishot io_uring receive submitted for the enumeration - see
-        /// <see cref="IoUringOperation.CreateReceiveMultishot"/>. Unlike repeatedly calling
+        /// multishot io_uring receive submitted for the enumeration. Unlike repeatedly calling
         /// <see cref="ReceiveAsync(Memory{byte}, CancellationToken)"/> in a loop, there is normally one
         /// submission for as long as the caller keeps enumerating: the kernel delivers data into
         /// its own pool of buffers as it arrives, without this socket needing to re-arm a new read after
@@ -72,70 +71,69 @@ namespace System.Net.Sockets
         {
             cancellationToken.ThrowIfCancellationRequested();
             TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            IoUringOperation? operation = null;
             Exception? callbackError = null;
-            IoUringOperation receiveOperation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
-            _handle.IoUringBinding.EnqueueForSubmission(receiveOperation, cancellationToken);
-
-            // Full fences on both publications prevent an early failing callback and
-            // submission from each missing the other's cancellation state.
-            Interlocked.Exchange(ref operation, receiveOperation);
-            if (Volatile.Read(ref callbackError) is not null)
-            {
-                receiveOperation.RequestCancellation();
-            }
-
+            CallbackReceiveOperation operation = new(SocketType, cancellationToken, OnNext, OnCompleted);
+            _handle.IoUringBinding.EnqueueForSubmission(operation, cancellationToken);
             await completed.Task.ConfigureAwait(false);
 
-            void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
+            void OnNext(IMemoryOwner<byte> buffer)
             {
-                if (buffer is not null)
+                if (cancellationToken.IsCancellationRequested)
                 {
-                    if (callbackError is not null || cancellationToken.IsCancellationRequested)
+                    buffer.Dispose();
+                }
+                else
+                {
+                    try
                     {
-                        buffer.Dispose();
+                        onReceived(buffer);
                     }
-                    else
+                    catch (Exception error)
                     {
-                        try
-                        {
-                            onReceived(buffer);
-                        }
-                        catch (Exception error)
-                        {
-                            Interlocked.Exchange(ref callbackError, error);
-                            Volatile.Read(ref operation)?.RequestCancellation();
-                        }
+                        callbackError = error;
+                        throw;
                     }
                 }
+            }
 
-                if (!hasMore)
+            void OnCompleted(Exception? error)
+            {
+                if (callbackError is not null)
                 {
-                    if (callbackError is not null)
-                    {
-                        completed.TrySetException(callbackError);
-                    }
-                    else if (result < 0)
-                    {
-                        if (cancellationToken.IsCancellationRequested)
-                        {
-                            completed.TrySetCanceled(cancellationToken);
-                        }
-                        else
-                        {
-                            completed.TrySetException(CreateMultishotReceiveException(result));
-                        }
-                    }
-                    else
-                    {
-                        completed.TrySetResult();
-                    }
+                    completed.TrySetException(callbackError);
+                }
+                else if (error is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                {
+                    completed.TrySetCanceled(cancellationToken);
+                }
+                else if (error is not null)
+                {
+                    completed.TrySetException(error);
+                }
+                else
+                {
+                    completed.TrySetResult();
                 }
             }
         }
 
-        private static SocketException CreateMultishotReceiveException(int result) =>
-            new SocketException((int)SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(-result).Error));
+        private sealed class CallbackReceiveOperation : IoUringMultishotReceiveOperation
+        {
+            private readonly Action<IMemoryOwner<byte>> _onNext;
+            private readonly Action<Exception?> _onCompleted;
+
+            public CallbackReceiveOperation(SocketType socketType, CancellationToken cancellationToken,
+                Action<IMemoryOwner<byte>> onNext, Action<Exception?> onCompleted)
+                : base(socketType, cancellationToken)
+            {
+                _onNext = onNext;
+                _onCompleted = onCompleted;
+            }
+
+            protected override void OnNext(IMemoryOwner<byte> result) => _onNext(result);
+
+            protected override void OnCompleted(Exception? error) => _onCompleted(error);
+        }
 
         private async IAsyncEnumerable<IMemoryOwner<byte>> ReceiveMultishotAsyncCore([EnumeratorCancellation] CancellationToken cancellationToken)
         {
@@ -152,28 +150,25 @@ namespace System.Net.Sockets
                 AllowSynchronousContinuations = true,
             });
 
-            void OnCompleted(int result, IMemoryOwner<byte>? buffer, bool hasMore)
+            void OnNext(IMemoryOwner<byte> buffer)
             {
-                if (buffer is not null)
+                if (!channel.Writer.TryWrite(buffer))
                 {
-                    channel.Writer.TryWrite(buffer);
-                }
-
-                if (!hasMore)
-                {
-                    // result == 0 here means graceful EOF - not an error. A negative result while we
-                    // are the ones who requested cancellation is reported as OperationCanceledException
-                    // instead of the raw (usually -ECANCELED) SocketException.
-                    Exception? error = result >= 0
-                        ? null
-                        : Volatile.Read(ref cancellationRequested) || cancellationToken.IsCancellationRequested
-                            ? new OperationCanceledException(cancellationToken)
-                            : CreateMultishotReceiveException(result);
-                    channel.Writer.TryComplete(error);
+                    buffer.Dispose();
                 }
             }
 
-            IoUringOperation operation = IoUringOperation.CreateReceiveMultishot(OnCompleted);
+            void OnCompleted(Exception? error)
+            {
+                if (error is OperationCanceledException &&
+                    (Volatile.Read(ref cancellationRequested) || cancellationToken.IsCancellationRequested))
+                {
+                    error = new OperationCanceledException(cancellationToken);
+                }
+                channel.Writer.TryComplete(error);
+            }
+
+            CallbackReceiveOperation operation = new(SocketType, cancellationToken, OnNext, OnCompleted);
             handle.IoUringBinding.EnqueueForSubmission(operation, cancellationToken);
 
             try

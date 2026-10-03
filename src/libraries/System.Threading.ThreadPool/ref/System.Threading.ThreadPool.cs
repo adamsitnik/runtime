@@ -6,6 +6,117 @@
 
 namespace System.Threading
 {
+    [System.CLSCompliantAttribute(false)]
+    public sealed partial class IoRingBoundHandle : System.IDisposable
+    {
+        internal IoRingBoundHandle() { }
+        public void Dispose() { }
+        public bool DisposeAndWait() { throw null; }
+        public void EnqueueForSubmission(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { }
+        public bool IsOperationSupported(byte opcode) { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public static partial class IoUring
+    {
+        public static bool IsSupported { get { throw null; } }
+        public static System.Threading.IoRingBoundHandle Bind(System.Runtime.InteropServices.SafeHandle handle, bool ownsFileDescriptor) { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public abstract partial class IoUringBufferOperation : System.Threading.IoUringOperation
+    {
+        protected IoUringBufferOperation(System.Threading.IoUringOperationKind kind, System.Memory<byte> buffer, long offset = (long)-1, int flags = 0) { }
+        protected IoUringBufferOperation(System.Threading.IoUringOperationKind kind, System.ReadOnlyMemory<byte> buffer, long offset = (long)-1, int flags = 0) { }
+        protected System.Threading.IoUringRequest Request { get { throw null; } }
+        protected sealed override System.Threading.IoUringRequest PrepareRequest() { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public readonly partial struct IoUringCompletion
+    {
+        private readonly int _dummyPrimitive;
+        public ulong Extra1 { get { throw null; } }
+        public ulong Extra2 { get { throw null; } }
+        public uint Flags { get { throw null; } }
+        public bool HasMore { get { throw null; } }
+        public bool IsNotification { get { throw null; } }
+        public int Result { get { throw null; } }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public readonly partial struct IoUringCompletionAction
+    {
+        private readonly object _dummy;
+        private readonly int _dummyPrimitive;
+        public static System.Threading.IoUringCompletionAction Complete { get { throw null; } }
+        public static System.Threading.IoUringCompletionAction Continue { get { throw null; } }
+        public static System.Threading.IoUringCompletionAction Fail(System.Exception error) { throw null; }
+        public static System.Threading.IoUringCompletionAction Resubmit(System.Threading.IoUringRequest request) { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public abstract partial class IoUringMultishotOperation<T> : System.Threading.IoUringOperation
+    {
+        protected IoUringMultishotOperation() { }
+        protected abstract void OnNext(T result);
+    }
+    [System.CLSCompliantAttribute(false)]
+    public abstract partial class IoUringOperation
+    {
+        protected IoUringOperation() { }
+        protected bool IsCancellationRequested { get { throw null; } }
+        protected abstract void OnCompleted(System.Exception? error);
+        protected virtual void OnCompleting() { }
+        protected virtual void OnCompletionDiscarded(in System.Threading.IoUringCompletion completion) { }
+        protected abstract System.Threading.IoUringRequest PrepareRequest();
+        protected abstract System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion);
+        public void RequestCancellation() { }
+        protected System.Buffers.IMemoryOwner<byte>? TakeBuffer() { throw null; }
+    }
+    public enum IoUringOperationKind
+    {
+        Read = 0,
+        Write = 1,
+        ReadScatter = 2,
+        WriteGather = 3,
+        Accept = 4,
+        Connect = 5,
+        Receive = 6,
+        Send = 7,
+        ReceiveMultishot = 9,
+        SendGather = 10,
+        PollRead = 11,
+        PollWrite = 12,
+        SendZeroCopy = 15,
+    }
+    [System.CLSCompliantAttribute(false)]
+    public readonly partial struct IoUringRequest
+    {
+        private readonly object _dummy;
+        private readonly int _dummyPrimitive;
+        public IoUringRequest(System.Threading.IoUringOperationKind kind, System.Memory<byte> buffer, long offset = (long)-1, int flags = 0) { throw null; }
+        public IoUringRequest(System.Threading.IoUringOperationKind kind, System.ReadOnlyMemory<byte> buffer, long offset = (long)-1, int flags = 0) { throw null; }
+        public unsafe IoUringRequest(System.Threading.IoUringOperationKind kind, void* address, int length, long offset = (long)-1, int flags = 0, int* addressLength = null) { throw null; }
+        public static System.Threading.IoUringRequest CreateUnsafe(in System.Threading.IoUringSubmission submission) { throw null; }
+        public System.Threading.IoUringRequest SliceBuffer(int offset, int length) { throw null; }
+        public System.Threading.IoUringRequest WithOffset(long offset) { throw null; }
+    }
+    [System.CLSCompliantAttribute(false)]
+    public readonly partial struct IoUringSubmission
+    {
+        private readonly int _dummyPrimitive;
+        public unsafe IoUringSubmission(byte opcode, void* address, int length, ulong offset = (ulong)0, uint operationFlags = (uint)0, ushort priority = (ushort)0, System.Threading.IoUringSubmissionOptions options = System.Threading.IoUringSubmissionOptions.None, ulong address3 = (ulong)0) { throw null; }
+        public nint Address { get { throw null; } }
+        public ulong Address3 { get { throw null; } }
+        public int Length { get { throw null; } }
+        public ulong Offset { get { throw null; } }
+        public byte Opcode { get { throw null; } }
+        public uint OperationFlags { get { throw null; } }
+        public System.Threading.IoUringSubmissionOptions Options { get { throw null; } }
+        public ushort Priority { get { throw null; } }
+    }
+    [System.FlagsAttribute]
+    public enum IoUringSubmissionOptions
+    {
+        None = 0,
+        ForceAsync = 16,
+    }
     public partial interface IThreadPoolWorkItem
     {
         void Execute();
@@ -79,53 +190,4 @@ namespace System.Threading
     }
     public delegate void WaitCallback(object? state);
     public delegate void WaitOrTimerCallback(object? state, bool timedOut);
-    // EXPERIMENTAL, PROTOTYPE-ONLY: see the real implementation in
-    // src/libraries/System.Private.CoreLib/src/System/Threading/IoUring.cs for details.
-    [System.CLSCompliantAttribute(false)]
-    public static class IoUring
-    {
-        public static bool IsSupported { get { throw null; } }
-        public static System.Threading.IoRingBoundHandle Bind(System.Runtime.InteropServices.SafeHandle handle, bool ownsFileDescriptor) { throw null; }
-    }
-    [System.CLSCompliantAttribute(false)]
-    public sealed class IoRingBoundHandle : System.IDisposable, System.Threading.IThreadPoolWorkItem
-    {
-        internal IoRingBoundHandle() { }
-        public void Dispose() { }
-        public bool DisposeAndWait() { throw null; }
-        public void EnqueueForSubmission(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default) { }
-        void System.Threading.IThreadPoolWorkItem.Execute() { }
-    }
-    [System.CLSCompliantAttribute(false)]
-    public abstract class IoUringOperation : System.Threading.IThreadPoolWorkItem
-    {
-        protected IoUringOperation() { }
-        protected bool IsCancellationRequested { get { throw null; } }
-        protected abstract System.Threading.IoUringRequest Request { get; }
-        protected void CompleteOperation() { }
-        public static System.Threading.IoUringOperation CreateReceiveMultishot(System.Action<int, System.Buffers.IMemoryOwner<byte>?, bool> onCompleted) { throw null; }
-        protected void EnqueueContinuation(System.Threading.IoUringRequest request) { }
-        protected abstract void OnCompleted(int result, uint flags, long sequence);
-        public void RequestCancellation() { }
-        void System.Threading.IThreadPoolWorkItem.Execute() { }
-    }
-    public enum IoUringOperationKind
-    {
-        Read = 0,
-        Write = 1,
-        ReadScatter = 2,
-        WriteGather = 3,
-        Accept = 4,
-        Connect = 5,
-        Receive = 6,
-        Send = 7,
-        SendGather = 10,
-        PollRead = 11,
-        PollWrite = 12,
-    }
-    [System.CLSCompliantAttribute(false)]
-    public readonly unsafe struct IoUringRequest
-    {
-        public IoUringRequest(System.Threading.IoUringOperationKind kind, void* address, int length, long offset = -1, int flags = 0, int* addressLength = null) { }
-    }
 }
