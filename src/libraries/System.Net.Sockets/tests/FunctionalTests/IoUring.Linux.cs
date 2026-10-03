@@ -455,51 +455,26 @@ namespace System.Net.Sockets.Tests
             private readonly Func<IoUringCompletion, IoUringCompletionAction> _process;
             private readonly Action<Exception?> _completed;
             private readonly Action? _completing;
+            private readonly Action<IoUringCompletion>? _discarded;
 
             public CompletionActionOperation(IoUringRequest request,
-                Func<IoUringCompletion, IoUringCompletionAction> process, Action<Exception?> completed, Action? completing = null)
+                Func<IoUringCompletion, IoUringCompletionAction> process, Action<Exception?> completed,
+                Action? completing = null, Action<IoUringCompletion>? discarded = null)
             {
                 _request = request;
                 _process = process;
                 _completed = completed;
                 _completing = completing;
+                _discarded = discarded;
             }
 
             protected override IoUringRequest PrepareRequest() => _request;
             protected override IoUringCompletionAction ProcessCompletion(in IoUringCompletion completion) => _process(completion);
             protected override void OnCompleted(Exception? error) => _completed(error);
             protected override void OnCompleting() => _completing?.Invoke();
-        }
+            protected override void OnCompletionDiscarded(in IoUringCompletion completion) => _discarded?.Invoke(completion);
 
-        private sealed class TestPollOperation : IoUringPollOperation
-        {
-            private readonly Action<IoUringPollEvents> _onNext;
-            private readonly Action<Exception?> _completed;
-
-            public TestPollOperation(IoUringPollEvents events, Action<IoUringPollEvents> onNext, Action<Exception?> completed)
-                : base(events)
-            {
-                _onNext = onNext;
-                _completed = completed;
-            }
-
-            protected override void OnNext(IoUringPollEvents result) => _onNext(result);
-            protected override void OnCompleted(Exception? error) => _completed(error);
-        }
-
-        private sealed class TestAcceptOperation : IoUringAcceptOperation
-        {
-            private readonly Action<SafeSocketHandle> _onNext;
-            private readonly Action<Exception?> _completed;
-
-            public TestAcceptOperation(Action<SafeSocketHandle> onNext, Action<Exception?> completed)
-            {
-                _onNext = onNext;
-                _completed = completed;
-            }
-
-            protected override void OnNext(SafeSocketHandle result) => _onNext(result);
-            protected override void OnCompleted(Exception? error) => _completed(error);
+            public IMemoryOwner<byte>? TakeCurrentBuffer() => TakeBuffer();
         }
 
         private static IoUringOperation EnqueueMultishot(IoRingBoundHandle binding, Action<int, IMemoryOwner<byte>?, bool> callback)
@@ -507,31 +482,6 @@ namespace System.Net.Sockets.Tests
             IoUringOperation operation = new TestReceiveOperation(callback);
             binding.EnqueueForSubmission(operation);
             return operation;
-        }
-
-        private sealed class TestReceiveOperation : IoUringReceiveOperation
-        {
-            private readonly Action<int, IMemoryOwner<byte>?, bool> _callback;
-            private int _nativeError;
-
-            public TestReceiveOperation(Action<int, IMemoryOwner<byte>?, bool> callback) => _callback = callback;
-
-            protected override void OnNext(IMemoryOwner<byte> result) => _callback(result.Memory.Length, result, true);
-
-            protected override Exception CreateException(int errorCode)
-            {
-                _nativeError = errorCode;
-                return base.CreateException(errorCode);
-            }
-
-            protected override void OnCompleted(Exception? error)
-            {
-                int result = error is OperationCanceledException or ObjectDisposedException ? -125 :
-                    error is OutOfMemoryException ? -12 : -_nativeError;
-                _nativeError = 0;
-                Assert.True(error is null || result < 0, error?.ToString());
-                _callback(result, null, false);
-            }
         }
 
         [ConditionalTheory(nameof(IsSupported))]
@@ -2008,8 +1958,7 @@ namespace System.Net.Sockets.Tests
                 IoUringRequest request;
                 unsafe
                 {
-                    request = new IoUringRequest(IoUringOperationKind.PollMultishot, null, 0,
-                        flags: (int)IoUringPollEvents.Readable);
+                    request = TestPollOperation.CreateRequest(IoUringPollEvents.Readable);
                 }
                 CompletionActionOperation? operation = null;
                 operation = new CompletionActionOperation(request, completion =>
@@ -3543,8 +3492,7 @@ namespace System.Net.Sockets.Tests
                     IoUringRequest poll;
                     unsafe
                     {
-                        poll = new IoUringRequest(IoUringOperationKind.PollMultishot, null, 0,
-                            flags: (int)IoUringPollEvents.Readable);
+                        poll = TestPollOperation.CreateRequest(IoUringPollEvents.Readable);
                     }
                     int callbacks = 0;
                     CompletionActionOperation operation = new(request, completion =>
@@ -3625,8 +3573,7 @@ namespace System.Net.Sockets.Tests
                     IoUringRequest poll;
                     unsafe
                     {
-                        poll = new IoUringRequest(IoUringOperationKind.PollMultishot, null, 0,
-                            flags: (int)IoUringPollEvents.Writable);
+                        poll = TestPollOperation.CreateRequest(IoUringPollEvents.Writable);
                     }
                     CompletionActionOperation? operation = null;
                     operation = new CompletionActionOperation(new IoUringRequest(IoUringOperationKind.Receive, memory.Memory),
@@ -3795,6 +3742,7 @@ namespace System.Net.Sockets.Tests
         [InlineData("throw")]
         [InlineData("dispose")]
         [InlineData("unclaimed")]
+        [InlineData("discard-throws")]
         public void AcceptTermination_ClosesOwnedAndUndeliveredDescriptors(string ending)
         {
             RemoteExecutor.Invoke(async ending =>
@@ -3813,22 +3761,30 @@ namespace System.Net.Sockets.Tests
                 int callbacks = 0;
                 int firstDescriptor = -1;
                 IoUringOperation operation;
-                if (ending == "unclaimed")
+                if (ending is "unclaimed" or "discard-throws")
                 {
                     IoUringRequest request;
                     unsafe
                     {
-                        request = new IoUringRequest(IoUringOperationKind.AcceptMultishot, null, 0);
+                        request = TestAcceptOperation.CreateRequest();
                     }
                     operation = new CompletionActionOperation(request, completion =>
                     {
                         Assert.True(completion.Result >= 0);
+                        using SafeSocketHandle handle = new((IntPtr)completion.Result, ownsHandle: true);
                         Assert.Equal(1, ++callbacks);
                         firstDescriptor = completion.Result;
                         entered.Set();
                         Assert.True(release.Wait(TestSettings.PassingTestTimeout));
                         throw failure;
-                    }, error => completed.SetResult(error));
+                    }, error => completed.SetResult(error), discarded: completion =>
+                    {
+                        TestAcceptOperation.Discard(completion);
+                        if (ending == "discard-throws" && completion.Result >= 0)
+                        {
+                            throw new IOException("Discard callback failed after releasing the descriptor.");
+                        }
+                    });
                 }
                 else
                 {
@@ -3880,9 +3836,11 @@ namespace System.Net.Sockets.Tests
                         return descriptors.Count == Connections;
                     }, TestSettings.PassingTestTimeout));
                     Assert.Equal(Connections, new HashSet<int>(descriptors).Count);
+                    Dictionary<int, string> socketTargets = new();
                     foreach (int descriptor in descriptors)
                     {
                         Assert.True(File.Exists($"/proc/self/fd/{descriptor}"));
+                        socketTargets.Add(descriptor, new FileInfo($"/proc/self/fd/{descriptor}").LinkTarget!);
                     }
                     release.Set();
                     Exception? error = await completed.Task.WaitAsync(TestSettings.PassingTestTimeout);
@@ -3891,6 +3849,13 @@ namespace System.Net.Sockets.Tests
                         Assert.IsType<OperationCanceledException>(error);
                         Assert.InRange(callbacks, 1, Connections);
                     }
+                    else if (ending == "discard-throws")
+                    {
+                        AggregateException failures = Assert.IsType<AggregateException>(error).Flatten();
+                        Assert.Contains(failure, failures.InnerExceptions);
+                        Assert.Equal(Connections, failures.InnerExceptions.Count);
+                        Assert.Equal(1, callbacks);
+                    }
                     else
                     {
                         Assert.Same(failure, error);
@@ -3898,7 +3863,8 @@ namespace System.Net.Sockets.Tests
                     }
                     foreach (int descriptor in descriptors)
                     {
-                        Assert.False(File.Exists($"/proc/self/fd/{descriptor}"));
+                        // Exception handling can load assemblies and reuse a closed descriptor.
+                        Assert.NotEqual(socketTargets[descriptor], new FileInfo($"/proc/self/fd/{descriptor}").LinkTarget);
                     }
                 }
                 finally
@@ -3911,6 +3877,86 @@ namespace System.Net.Sockets.Tests
                     }
                 }
             }, ending, CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ProvidedBuffers_EnforceTransferAndReturnUntakenBuffers(bool takeBuffer)
+        {
+            RemoteInvokeOptions options = CreateOptions(1);
+            options.StartInfo.Environment["DOTNET_IORING_RECV_BUFFER_COUNT"] = "1";
+            RemoteExecutor.Invoke(async takeText =>
+            {
+                const int Iterations = 16;
+                bool take = bool.Parse(takeText);
+                (Socket sender, Socket receiver) = SocketTestExtensions.CreateConnectedSocketPair();
+                using (sender)
+                using (receiver)
+                using (IoRingBoundHandle binding = IoUring.Bind(receiver.SafeHandle, ownsFileDescriptor: true))
+                using (SemaphoreSlim ready = new(0))
+                {
+                    TaskCompletionSource<Exception?> completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    IMemoryOwner<byte>? lastBuffer = null;
+                    int callbacks = 0;
+                    IoUringRequest request;
+                    unsafe
+                    {
+                        request = new IoUringRequest(IoUringOperationKind.ReceiveMultishot, null, 0);
+                    }
+                    CompletionActionOperation? operation = null;
+                    operation = new CompletionActionOperation(request, completion =>
+                    {
+                        const int NoBuffers = 105;
+                        if (completion.Result == -NoBuffers)
+                        {
+                            return IoUringCompletionAction.Resubmit(request);
+                        }
+                        Assert.Equal(1, completion.Result);
+                        ++callbacks;
+                        if (take)
+                        {
+                            IMemoryOwner<byte> buffer = Assert.IsAssignableFrom<IMemoryOwner<byte>>(operation!.TakeCurrentBuffer());
+                            Assert.Equal(42, buffer.Memory.Span[0]);
+                            Assert.Throws<InvalidOperationException>(() => operation.TakeCurrentBuffer());
+                            if (callbacks == Iterations)
+                            {
+                                lastBuffer = buffer;
+                            }
+                            else
+                            {
+                                buffer.Dispose();
+                            }
+                        }
+                        ready.Release();
+                        return callbacks == Iterations ? IoUringCompletionAction.Complete :
+                            completion.HasMore ? IoUringCompletionAction.Continue : IoUringCompletionAction.Resubmit(request);
+                    }, error => completed.SetResult(error));
+                    Assert.Throws<InvalidOperationException>(() => operation.TakeCurrentBuffer());
+                    binding.EnqueueForSubmission(operation);
+                    try
+                    {
+                        for (int i = 0; i < Iterations; i++)
+                        {
+                            Assert.Equal(1, sender.Send(new byte[] { 42 }));
+                            Assert.True(await ready.WaitAsync(TestSettings.PassingTestTimeout));
+                            Assert.Throws<InvalidOperationException>(() => operation.TakeCurrentBuffer());
+                        }
+                        Assert.Null(await completed.Task.WaitAsync(TestSettings.PassingTestTimeout));
+                        Assert.Equal(Iterations, callbacks);
+                        if (take)
+                        {
+                            Assert.NotNull(lastBuffer);
+                            Assert.Equal(42, lastBuffer.Memory.Span[0]);
+                        }
+                    }
+                    finally
+                    {
+                        operation.RequestCancellation();
+                        lastBuffer?.Dispose();
+                    }
+                }
+            }, takeBuffer.ToString(), options).Dispose();
         }
 
         [ConditionalTheory(nameof(IsSupported))]
@@ -3999,6 +4045,8 @@ namespace System.Net.Sockets.Tests
         [InlineData((byte)0, 0, 0, 1UL)]
         [InlineData((byte)6, 2, 0, 0UL)]
         [InlineData((byte)27, 0, 2, 0UL)]
+        [InlineData((byte)13, 1, 1, 0UL)]
+        [InlineData((byte)13, 0, 2, 0UL)]
         public void NativeSubmission_RejectsUnsupportedOwnershipModifiers(byte opcode, int length, int priority, ulong address3)
         {
             RemoteExecutor.Invoke((opcodeText, fieldsText) =>
@@ -4023,9 +4071,9 @@ namespace System.Net.Sockets.Tests
                 using IoRingBoundHandle binding = IoUring.Bind(socket.SafeHandle, ownsFileDescriptor: true);
                 Assert.True(binding.IsOperationSupported(CloseOpcode));
                 Assert.False(binding.IsOperationSupported(byte.MaxValue));
-                // Fixed reads, timeout/cancel, accept, close, registration updates, buffer-pool
+                // Fixed reads, timeout/cancel, close, registration updates, buffer-pool
                 // changes, and messaging another ring do not use this operation's ownership model.
-                byte[] forbiddenOpcodes = [4, 11, 13, 14, CloseOpcode, 20, 31, 32, 40, byte.MaxValue];
+                byte[] forbiddenOpcodes = [4, 11, 14, CloseOpcode, 20, 31, 32, 40, byte.MaxValue];
                 foreach (byte opcode in forbiddenOpcodes)
                 {
                     unsafe

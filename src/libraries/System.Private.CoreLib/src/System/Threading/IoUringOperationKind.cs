@@ -22,16 +22,14 @@ public enum IoUringOperationKind
     Receive = 6,
     /// <summary>Sends socket data.</summary>
     Send = 7,
+    /// <summary>Receives socket data repeatedly into runtime-provided buffers.</summary>
+    ReceiveMultishot = 9,
     /// <summary>Sends socket data from native iovec entries.</summary>
     SendGather = 10,
     /// <summary>Waits for a descriptor to become readable.</summary>
     PollRead = 11,
     /// <summary>Waits for a descriptor to become writable.</summary>
     PollWrite = 12,
-    /// <summary>Produces repeated descriptor-readiness notifications.</summary>
-    PollMultishot = 13,
-    /// <summary>Accepts repeated socket connections without shared address output storage.</summary>
-    AcceptMultishot = 14,
     /// <summary>Sends socket data while retaining the source buffer until the kernel's release notification.</summary>
     SendZeroCopy = 15,
 }

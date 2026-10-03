@@ -90,22 +90,6 @@ public sealed partial class IoRingBoundHandle
 
     internal bool IsDisposed => Volatile.Read(ref _state) < 0;
 
-    internal int GetSocketType()
-    {
-        lock (s_bindings)
-        {
-            // Promotion can release the old borrowed wrapper. Keep it alive through marshalling.
-            ObjectDisposedException.ThrowIf(IsDisposed, this);
-            Interop.Error error = Interop.Sys.GetIoRingSocketType(_handle,
-                out _, out int socketType, out _, out _);
-            if (error != Interop.Error.SUCCESS)
-            {
-                throw Interop.GetExceptionForIoErrno(new Interop.ErrorInfo(error));
-            }
-            return socketType;
-        }
-    }
-
     internal static IoRingBoundHandle GetOrCreate(SafeHandle handle, bool ownsFileDescriptor)
     {
         handle.DangerousAddRef();

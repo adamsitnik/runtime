@@ -2354,7 +2354,7 @@ c_static_assert(offsetof(IoRingSubmission, Address3) == 48);
 
 static bool IoRingSupportsNativeOpcode(int32_t opcode)
 {
-    // These operations use one completion, MORE-delimited multishot poll, or the
+    // These operations use one completion, MORE-delimited multishot requests, or the
     // SEND_ZC result/notification protocol. Extending this list requires lifetime review.
     switch (opcode)
     {
@@ -2365,6 +2365,7 @@ static bool IoRingSupportsNativeOpcode(int32_t opcode)
         case IORING_OP_WRITEV:
         case IORING_OP_FSYNC:
         case IORING_OP_CONNECT:
+        case IORING_OP_ACCEPT:
         case IORING_OP_POLL_ADD:
         case IORING_OP_SEND:
         case IORING_OP_RECV:
@@ -2487,20 +2488,6 @@ static int IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             sqe->buf_group = 0;
             sqe->msg_flags = (uint32_t)request->Flags;
             break;
-        case IoRingOp_PollMultishot:
-            sqe->opcode = IORING_OP_POLL_ADD;
-            sqe->len = IORING_POLL_ADD_MULTI;
-            // Linux poll32_events uses word-reversed storage on big-endian systems.
-            sqe->poll32_events = (uint32_t)request->Flags;
-#if defined(BIGENDIAN) && BIGENDIAN
-            sqe->poll32_events = (sqe->poll32_events << 16) | (sqe->poll32_events >> 16);
-#endif
-            break;
-        case IoRingOp_AcceptMultishot:
-            sqe->opcode = IORING_OP_ACCEPT;
-            sqe->ioprio = IORING_ACCEPT_MULTISHOT;
-            sqe->accept_flags = (uint32_t)request->Flags | SOCK_CLOEXEC;
-            break;
         case IoRingOp_SendZeroCopy:
             sqe->opcode = IORING_OP_SEND_ZC;
             sqe->addr = (uint64_t)(uintptr_t)request->Buffer;
@@ -2518,6 +2505,10 @@ static int IoRingFillSqe(struct io_uring_sqe* sqe, IoRingRequest* request)
             memcpy(sqe, submission, sizeof(*sqe));
             sqe->fd = (int32_t)request->Fd;
             sqe->user_data = request->UserData;
+            if (submission->Opcode == IORING_OP_ACCEPT)
+            {
+                sqe->accept_flags |= SOCK_CLOEXEC;
+            }
             if (submission->Opcode == IORING_OP_SEND || submission->Opcode == IORING_OP_SENDMSG ||
                 submission->Opcode == IORING_OP_SEND_ZC)
             {
@@ -2588,6 +2579,19 @@ int32_t SystemNative_IoRingValidateSubmission(const IoRingSubmission* submission
 #if defined(IORING_RECVSEND_POLL_FIRST)
         allowedIoPriority |= IORING_RECVSEND_POLL_FIRST;
 #endif
+    }
+    if (submission->Opcode == IORING_OP_ACCEPT)
+    {
+        allowedIoPriority = IORING_ACCEPT_MULTISHOT;
+        // Multishot address output would be overwritten by the kernel while a consumer
+        // reads a previous completion. The accepted descriptor is sufficient to query it.
+        if (submission->Length != 0 ||
+            ((submission->IoPriority & IORING_ACCEPT_MULTISHOT) != 0 &&
+             (submission->Address != 0 || submission->Offset != 0)))
+        {
+            errno = EINVAL;
+            return -1;
+        }
     }
     if ((submission->IoPriority & ~allowedIoPriority) != 0)
     {
@@ -2668,12 +2672,7 @@ int32_t SystemNative_IoRingIsAvailable(void)
 #endif
 }
 
-int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle)
-{
-    return SystemNative_IoRingCreateWithFlags(submissionQueueDepth, completionQueueDepth, singleIssuer, 0, ringHandle);
-}
-
-int32_t SystemNative_IoRingCreateWithFlags(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle)
+int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle)
 {
     assert(ringHandle != NULL);
     *ringHandle = 0;

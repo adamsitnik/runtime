@@ -2974,8 +2974,6 @@
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperation.Unsupported.cs" Condition="'$(TargetOS)' != 'linux' or '$(FeaturePortableThreadPool)' != 'true'" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringOperationKind.cs" />
-    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringPollOperation.cs" />
-    <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringReceiveOperation.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringRequest.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)System\Threading\IoUringSubmission.cs" />
   </ItemGroup>

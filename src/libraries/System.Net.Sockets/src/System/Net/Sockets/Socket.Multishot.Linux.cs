@@ -14,8 +14,7 @@ namespace System.Net.Sockets
     {
         /// <summary>
         /// Streams received data as an <see cref="IAsyncEnumerable{T}"/>, backed by a single persistent
-        /// multishot io_uring receive submitted for the enumeration - see
-        /// <see cref="IoUringReceiveOperation"/>. Unlike repeatedly calling
+        /// multishot io_uring receive submitted for the enumeration. Unlike repeatedly calling
         /// <see cref="ReceiveAsync(Memory{byte}, CancellationToken)"/> in a loop, there is normally one
         /// submission for as long as the caller keeps enumerating: the kernel delivers data into
         /// its own pool of buffers as it arrives, without this socket needing to re-arm a new read after
@@ -73,7 +72,7 @@ namespace System.Net.Sockets
             cancellationToken.ThrowIfCancellationRequested();
             TaskCompletionSource completed = new(TaskCreationOptions.RunContinuationsAsynchronously);
             Exception? callbackError = null;
-            CallbackReceiveOperation operation = new(OnNext, OnCompleted);
+            CallbackReceiveOperation operation = new(SocketType, cancellationToken, OnNext, OnCompleted);
             _handle.IoUringBinding.EnqueueForSubmission(operation, cancellationToken);
             await completed.Task.ConfigureAwait(false);
 
@@ -118,21 +117,20 @@ namespace System.Net.Sockets
             }
         }
 
-        private sealed class CallbackReceiveOperation : IoUringReceiveOperation
+        private sealed class CallbackReceiveOperation : IoUringMultishotReceiveOperation
         {
             private readonly Action<IMemoryOwner<byte>> _onNext;
             private readonly Action<Exception?> _onCompleted;
 
-            public CallbackReceiveOperation(Action<IMemoryOwner<byte>> onNext, Action<Exception?> onCompleted)
+            public CallbackReceiveOperation(SocketType socketType, CancellationToken cancellationToken,
+                Action<IMemoryOwner<byte>> onNext, Action<Exception?> onCompleted)
+                : base(socketType, cancellationToken)
             {
                 _onNext = onNext;
                 _onCompleted = onCompleted;
             }
 
             protected override void OnNext(IMemoryOwner<byte> result) => _onNext(result);
-
-            protected override Exception CreateException(int errorCode) =>
-                new SocketException((int)SocketPal.GetSocketErrorForErrorCode(new Interop.ErrorInfo(errorCode).Error));
 
             protected override void OnCompleted(Exception? error) => _onCompleted(error);
         }
@@ -170,7 +168,7 @@ namespace System.Net.Sockets
                 channel.Writer.TryComplete(error);
             }
 
-            CallbackReceiveOperation operation = new(OnNext, OnCompleted);
+            CallbackReceiveOperation operation = new(SocketType, cancellationToken, OnNext, OnCompleted);
             handle.IoUringBinding.EnqueueForSubmission(operation, cancellationToken);
 
             try

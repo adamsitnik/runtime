@@ -79,14 +79,6 @@ namespace System.Net.Sockets
         [System.Runtime.Versioning.SupportedOSPlatformAttribute("windows")]
         AddressListSort = (long)3355443225,
     }
-    [System.CLSCompliantAttribute(false)]
-    [System.Runtime.Versioning.SupportedOSPlatformAttribute("linux")]
-    public abstract partial class IoUringAcceptOperation : System.Threading.IoUringMultishotOperation<System.Net.Sockets.SafeSocketHandle>
-    {
-        protected IoUringAcceptOperation() { }
-        protected sealed override System.Threading.IoUringRequest PrepareRequest() { throw null; }
-        protected sealed override System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion) { throw null; }
-    }
     public partial struct IPPacketInformation : System.IEquatable<System.Net.Sockets.IPPacketInformation>
     {
         private object _dummy;

@@ -42,6 +42,20 @@ public abstract partial class IoUringOperation : IThreadPoolWorkItem
     /// </remarks>
     protected abstract IoUringCompletionAction ProcessCompletion(in IoUringCompletion completion);
 
+    /// <summary>Releases operation-specific resources belonging to a completion that is not delivered.</summary>
+    /// <param name="completion">A completion received after processing stopped.</param>
+    /// <remarks>
+    /// After <see cref="ProcessCompletion"/> throws or requests completion, cancellation can still
+    /// race successful native completions. This callback runs in order for those remaining completions,
+    /// before <see cref="OnCompleted"/>. Implementations of unsafe requests must release any resources
+    /// produced by them. Resources belonging to a delivered completion remain the implementation's
+    /// responsibility, including when <see cref="ProcessCompletion"/> throws.
+    /// Runtime-provided buffers are returned automatically and must not be released here.
+    /// </remarks>
+    protected virtual void OnCompletionDiscarded(in IoUringCompletion completion)
+    {
+    }
+
     /// <summary>Releases application reservations before the runtime releases request buffers.</summary>
     /// <remarks>
     /// Called after native retirement, while the logical operation is still active. This callback
@@ -61,10 +75,15 @@ public abstract partial class IoUringOperation : IThreadPoolWorkItem
     /// </remarks>
     protected abstract void OnCompleted(Exception? error);
 
-    /// <summary>Takes ownership of the descriptor produced by the current multishot accept completion.</summary>
-    /// <returns>An owning handle that the caller must dispose or transfer to another owning wrapper.</returns>
-    /// <exception cref="InvalidOperationException">No unclaimed accepted descriptor is available.</exception>
-    protected System.Runtime.InteropServices.SafeHandle TakeAcceptedHandle() => TakeAcceptedHandleCore();
+    /// <summary>Takes ownership of the runtime-provided buffer for the current completion.</summary>
+    /// <returns>A buffer lease, or <see langword="null"/> if the completion has no buffer.</returns>
+    /// <remarks>
+    /// Call only from <see cref="ProcessCompletion"/>. Each completion's buffer can be taken once.
+    /// The lease remains valid after cancellation or logical completion and must be disposed by its
+    /// recipient. Untaken buffers are returned automatically when the callback exits.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The caller is outside the completion callback or already took the buffer.</exception>
+    protected System.Buffers.IMemoryOwner<byte>? TakeBuffer() => TakeBufferCore();
 
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
 }

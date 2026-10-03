@@ -20,8 +20,7 @@ public readonly unsafe partial struct IoUringRequest
     }
 
     internal bool RequiresOrderedDelivery => _nativeRequest.OpCode is
-        Interop.Sys.IoRingOp.RecvMultishot or Interop.Sys.IoRingOp.PollMultishot or
-        Interop.Sys.IoRingOp.AcceptMultishot or Interop.Sys.IoRingOp.SendZeroCopy or Interop.Sys.IoRingOp.Native;
+        Interop.Sys.IoRingOp.RecvMultishot or Interop.Sys.IoRingOp.SendZeroCopy or Interop.Sys.IoRingOp.Native;
 
     private static Interop.Sys.IoRingRequest CreateNativeRequest(IoUringOperationKind kind,
         void* address, int length, long offset, int flags, int* addressLength)

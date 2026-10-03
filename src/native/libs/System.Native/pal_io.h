@@ -930,8 +930,6 @@ typedef enum
     IoRingOp_SendMsg = 10,       // gather socket send; Buffer points to an owned native msghdr
     IoRingOp_PollRead = 11,      // one-shot poll for readable data or a socket error/hangup
     IoRingOp_PollWrite = 12,     // one-shot poll for write readiness or a socket error/hangup
-    IoRingOp_PollMultishot = 13, // persistent poll; Flags is the native poll mask
-    IoRingOp_AcceptMultishot = 14, // persistent accept without peer address output
     IoRingOp_SendZeroCopy = 15,  // source buffer remains live through the final notification
     IoRingOp_Native = 16,       // private staged SQE, subject to PAL lifecycle validation
 } IoRingOp;
@@ -1043,11 +1041,10 @@ PALEXPORT uint8_t* SystemNative_IoRingCreateSendMessage(intptr_t socket, IOVecto
  * Returns 0 on success (with *ringHandle set to an opaque, non-zero handle);
  * otherwise, returns -1 and sets errno.
  */
-PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, intptr_t* ringHandle);
+PALEXPORT int32_t SystemNative_IoRingCreate(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle);
 
 // Opt-in creation flags; the existing creation entrypoint always uses zero.
 #define IoRingCreateFlags_Cqe32 1
-PALEXPORT int32_t SystemNative_IoRingCreateWithFlags(int32_t submissionQueueDepth, int32_t completionQueueDepth, int32_t singleIssuer, int32_t flags, intptr_t* ringHandle);
 
 /**
  * Reads cached kernel support for a native opcode. This does not bypass the Native path's

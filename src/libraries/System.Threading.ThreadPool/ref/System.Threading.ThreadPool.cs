@@ -64,11 +64,12 @@ namespace System.Threading
         protected bool IsCancellationRequested { get { throw null; } }
         protected abstract void OnCompleted(System.Exception? error);
         protected virtual void OnCompleting() { }
+        protected virtual void OnCompletionDiscarded(in System.Threading.IoUringCompletion completion) { }
         protected abstract System.Threading.IoUringRequest PrepareRequest();
         protected abstract System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion);
         public void RequestCancellation() { }
         void System.Threading.IThreadPoolWorkItem.Execute() { }
-        protected System.Runtime.InteropServices.SafeHandle TakeAcceptedHandle() { throw null; }
+        protected System.Buffers.IMemoryOwner<byte>? TakeBuffer() { throw null; }
     }
     public enum IoUringOperationKind
     {
@@ -80,39 +81,11 @@ namespace System.Threading
         Connect = 5,
         Receive = 6,
         Send = 7,
+        ReceiveMultishot = 9,
         SendGather = 10,
         PollRead = 11,
         PollWrite = 12,
-        PollMultishot = 13,
-        AcceptMultishot = 14,
         SendZeroCopy = 15,
-    }
-    [System.FlagsAttribute]
-    public enum IoUringPollEvents
-    {
-        None = 0,
-        Readable = 1,
-        Priority = 2,
-        Writable = 4,
-        Error = 8,
-        Hangup = 16,
-        Invalid = 32,
-        ReadHangup = 8192,
-    }
-    [System.CLSCompliantAttribute(false)]
-    public abstract partial class IoUringPollOperation : System.Threading.IoUringMultishotOperation<System.Threading.IoUringPollEvents>
-    {
-        protected IoUringPollOperation(System.Threading.IoUringPollEvents events) { }
-        protected sealed override System.Threading.IoUringRequest PrepareRequest() { throw null; }
-        protected sealed override System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion) { throw null; }
-    }
-    [System.CLSCompliantAttribute(false)]
-    public abstract partial class IoUringReceiveOperation : System.Threading.IoUringMultishotOperation<System.Buffers.IMemoryOwner<byte>>
-    {
-        protected IoUringReceiveOperation() { }
-        protected virtual System.Exception CreateException(int errorCode) { throw null; }
-        protected sealed override System.Threading.IoUringRequest PrepareRequest() { throw null; }
-        protected sealed override System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion) { throw null; }
     }
     [System.CLSCompliantAttribute(false)]
     public readonly partial struct IoUringRequest

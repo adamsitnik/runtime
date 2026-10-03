@@ -23,6 +23,7 @@
     <Compile Include="ExecutionContextFlowTest.cs" />
     <Compile Include="InlineCompletions.Unix.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix'"/>
     <Compile Include="IoUring.Linux.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
+    <Compile Include="IoUringOperations.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'" />
     <Compile Include="Connect.Unix.cs" Condition="'$(TargetPlatformIdentifier)' == 'unix'"/>
     <Compile Include="IPPacketInformationTest.cs" />
     <Compile Include="KeepAliveTest.cs" />
@@ -114,6 +115,7 @@
              Link="Common\Interop\Unix\System.Native\Interop.Fcntl.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(TargetPlatformIdentifier)' == 'unix' and '$(TargetOS)' == 'linux'">
+    <ProjectReference Include="$(LibrariesProjectRoot)System.Threading.ThreadPool\ref\System.Threading.ThreadPool.csproj" />
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.AdvanceIOVectors.cs"
              Link="Common\Interop\Unix\System.Native\Interop.AdvanceIOVectors.cs" />
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.IOVector.cs"

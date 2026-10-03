@@ -24,7 +24,8 @@ public readonly unsafe partial struct IoUringRequest
     /// <remarks>
     /// Pointer ownership remains the author's responsibility. Validation restricts operations to the
     /// completion and ownership protocols supported by this runtime; kernel opcode support alone
-    /// does not imply that a submission is permitted.
+    /// does not imply that a submission is permitted. Implementations must release resources produced
+    /// by undelivered completions in their <c>OnCompletionDiscarded</c> override.
     /// </remarks>
     /// <exception cref="ArgumentException">The submission violates the shared ring's ownership or completion protocol.</exception>
     /// <exception cref="PlatformNotSupportedException">The native operation is not supported by this runtime.</exception>
@@ -156,26 +157,31 @@ public readonly unsafe partial struct IoUringRequest
 
     /// <summary>Initializes a new instance of the <see cref="IoUringRequest"/> struct.</summary>
     /// <param name="kind">One of the enumeration values that specifies the operation.</param>
-    /// <param name="address">A pointer to the buffer, native iovec entries for a vectored operation, or native socket address for accept and connect.</param>
-    /// <param name="length">The buffer length, or the number of iovec entries. Ignored for accept and connect.</param>
+    /// <param name="address">A pointer to the buffer, native iovec entries for a vectored operation, or native socket address for accept and connect. Must be null for a provided-buffer receive.</param>
+    /// <param name="length">The buffer length, or the number of iovec entries. Ignored for accept and connect; must be zero for a provided-buffer receive.</param>
     /// <param name="offset">The file offset, or -1 for non-positional operations.</param>
     /// <param name="flags">The native socket flags.</param>
     /// <param name="addressLength">A pointer to the native socket address length for accept and connect. For accept, the value specifies the address capacity on input and receives the address length on completion.</param>
     /// <exception cref="ArgumentOutOfRangeException">The operation, length, or offset is invalid.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="address"/> is null for a vectored operation.</exception>
-    /// <exception cref="ArgumentException">An ordinary send requests socket error-queue zero-copy notifications.</exception>
+    /// <exception cref="ArgumentException">An ordinary send requests socket error-queue zero-copy notifications, or a provided-buffer receive specifies caller-owned storage.</exception>
     /// <exception cref="PlatformNotSupportedException">io_uring is unavailable on this platform.</exception>
     public IoUringRequest(IoUringOperationKind kind, void* address, int length, long offset = -1,
         int flags = 0, int* addressLength = null)
     {
         this = default;
         if (kind is < IoUringOperationKind.Read or > IoUringOperationKind.Send &&
-            kind is < IoUringOperationKind.SendGather or > IoUringOperationKind.SendZeroCopy)
+            kind is < IoUringOperationKind.ReceiveMultishot or > IoUringOperationKind.PollWrite &&
+            kind != IoUringOperationKind.SendZeroCopy)
         {
             throw new ArgumentOutOfRangeException(nameof(kind));
         }
         ArgumentOutOfRangeException.ThrowIfNegative(length);
         ArgumentOutOfRangeException.ThrowIfLessThan(offset, -1);
+        if (kind == IoUringOperationKind.ReceiveMultishot && (address != null || length != 0 || addressLength != null))
+        {
+            throw new ArgumentException(SR.Arg_IoUringProvidedBufferRequest);
+        }
         if (kind is IoUringOperationKind.ReadScatter or IoUringOperationKind.WriteGather or IoUringOperationKind.SendGather)
         {
             ArgumentOutOfRangeException.ThrowIfZero(length);

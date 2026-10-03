@@ -135,11 +135,11 @@
   <data name="InvalidOperation_IoUringCompletionAction" xml:space="preserve">
     <value>The completion action is incompatible with the native request lifetime. Continue requires more native completions; resubmission requires the terminal completion.</value>
   </data>
-  <data name="InvalidOperation_IoUringCompletionBacklog" xml:space="preserve">
-    <value>The multishot accept consumer did not keep up with incoming connections. The operation was canceled and undelivered connections were closed.</value>
+  <data name="Arg_IoUringProvidedBufferRequest" xml:space="preserve">
+    <value>A provided-buffer request must not specify caller-owned buffer or address storage.</value>
   </data>
-  <data name="InvalidOperation_IoUringAcceptedHandleRequired" xml:space="preserve">
-    <value>No unclaimed descriptor is available from the current multishot accept completion.</value>
+  <data name="InvalidOperation_IoUringBufferRequired" xml:space="preserve">
+    <value>Buffers can only be taken once from the current completion callback.</value>
   </data>
   <data name="Arg_IoUringInvalidSubmission" xml:space="preserve">
     <value>The native submission requires an ownership or completion protocol that is not permitted on a shared io_uring ring.</value>

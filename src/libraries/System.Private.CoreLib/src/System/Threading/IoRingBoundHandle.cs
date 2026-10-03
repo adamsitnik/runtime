@@ -18,9 +18,12 @@ public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
     /// <summary>Determines whether the kernel supports a native opcode on this binding's ring.</summary>
     /// <param name="opcode">The Linux io_uring opcode.</param>
     /// <returns><see langword="true"/> if the kernel supports the opcode; otherwise, <see langword="false"/>.</returns>
-    /// <remarks>This does not validate operation flags or authorize opcodes that violate the runtime's ownership protocol.</remarks>
+    /// <remarks>
+    /// External operations may require opcodes newer than the runtime's minimum kernel version.
+    /// This does not validate operation flags or authorize opcodes that violate the runtime's ownership protocol.
+    /// Returns <see langword="false"/> on platforms without io_uring support.
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The binding is disposed.</exception>
-    /// <exception cref="PlatformNotSupportedException">io_uring is unavailable.</exception>
     public bool IsOperationSupported(byte opcode)
     {
 #if FEATURE_IO_URING
@@ -32,7 +35,7 @@ public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
         }
         return result != 0;
 #else
-        throw new PlatformNotSupportedException();
+        return false;
 #endif
     }
 

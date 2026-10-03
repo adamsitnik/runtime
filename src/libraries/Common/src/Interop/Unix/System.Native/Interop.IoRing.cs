@@ -24,8 +24,6 @@ internal static partial class Interop
             SendMsg = 10,
             PollRead = 11,
             PollWrite = 12,
-            PollMultishot = 13,
-            AcceptMultishot = 14,
             SendZeroCopy = 15,
             Native = 16,
         }
@@ -164,10 +162,6 @@ internal static partial class Interop
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsAvailable")]
         internal static partial int IoRingIsAvailable();
 
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_GetSocketType")]
-        internal static partial Error GetIoRingSocketType(SafeHandle socket, out int addressFamily,
-            out int socketType, out int protocolType, out int isListening);
-
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreateSendMessage")]
         internal static unsafe partial byte* IoRingCreateSendMessage(IntPtr socket, IOVector* vectors, int vectorCount);
 
@@ -178,12 +172,9 @@ internal static partial class Interop
         // IoRingWaitForCompletions calls with nothing to submit; any other thread's call fails with
         // -EEXIST. Pass 0 for a plain ring that can be freely shared/rotated across threads instead.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreate", SetLastError = true)]
-        internal static partial int IoRingCreate(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, out IntPtr ringHandle);
+        internal static partial int IoRingCreate(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, int flags, out IntPtr ringHandle);
 
         internal const int IoRingCreateCqe32 = 1;
-
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreateWithFlags", SetLastError = true)]
-        internal static partial int IoRingCreateWithFlags(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, int flags, out IntPtr ringHandle);
 
         // Cached kernel opcode support, safe to query from any thread while the ring is kept alive.
         // Not a guarantee for all flags or permission to bypass Native-path validation.

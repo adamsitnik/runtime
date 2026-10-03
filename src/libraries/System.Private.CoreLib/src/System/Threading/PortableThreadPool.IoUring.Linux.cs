@@ -275,7 +275,7 @@ namespace System.Threading
                                 // Naming another pthread opens /proc; naming ourselves still
                                 // works when initialization is failing from descriptor exhaustion.
                                 Thread.CurrentThread.Name = $".NET IoUring Issuer #{ring.Index}";
-                                created = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, out IntPtr ringHandle) == 0;
+                                created = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, flags: 0, out IntPtr ringHandle) == 0;
                                 ring.RingHandle = ringHandle;
                                 if (created)
                                 {
