@@ -4,6 +4,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace System.Threading;
@@ -67,7 +68,6 @@ public abstract partial class IoUringOperation
     private bool _providedBufferTaken;
     private SingleProducerSingleConsumerQueue<IoUringCompletion>? _pending;
     private int _dispatchRequested;
-    private int _executionClaimed;
     private int _completionReady;
     private int _processingThreadId;
     private bool _tracksSend;
@@ -310,6 +310,8 @@ public abstract partial class IoUringOperation
         return error;
     }
 
+    // Keep native cleanup's P/Invoke frame out of the per-completion hot path.
+    [MethodImpl(MethodImplOptions.NoInlining)]
     internal unsafe void ReleaseNativeHeader()
     {
         if (_messageHeader != null)
@@ -332,11 +334,13 @@ public abstract partial class IoUringOperation
         }
     }
 
-    internal IThreadPoolWorkItem CompleteFromIoUring(in Interop.Sys.IoRingCompletion completion)
+    internal IThreadPoolWorkItem? CompleteFromIoUring(in Interop.Sys.IoRingCompletion completion)
     {
         _completion = new IoUringCompletion(completion.Result, completion.Flags, completion.Extra1, completion.Extra2);
         Volatile.Write(ref _completionReady, 1);
-        return this;
+        // A scalar continuation can complete while its previous callback's worker is
+        // still draining. Publish to that worker instead of starting another drainer.
+        return Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0 ? this : null;
     }
 
     internal void EnqueueFromIssuer(in Interop.Sys.IoRingCompletion completion)
@@ -356,12 +360,6 @@ public abstract partial class IoUringOperation
     {
         Thread currentThread = Thread.CurrentThread;
         Debug.Assert(currentThread.IsThreadPoolThread);
-        // A replacement worker can start during the handoff below. Only one worker
-        // may drain published completions.
-        if (Interlocked.CompareExchange(ref _executionClaimed, 1, 0) != 0)
-        {
-            return;
-        }
 
         while (true)
         {
@@ -390,9 +388,8 @@ public abstract partial class IoUringOperation
             // Relinquish dispatch before rechecking: an issuer racing this handoff either
             // queues another worker or leaves a completion for this worker to reclaim.
             Interlocked.Exchange(ref _dispatchRequested, 0);
-            Interlocked.Exchange(ref _executionClaimed, 0);
             if (Volatile.Read(ref _completionReady) == 0 ||
-                Interlocked.CompareExchange(ref _executionClaimed, 1, 0) != 0)
+                Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) != 0)
             {
                 return;
             }
@@ -483,7 +480,6 @@ public abstract partial class IoUringOperation
             ExecutionContext.ResetThreadPoolThread(currentThread);
             currentThread.ResetThreadPoolThread();
         }
-        Interlocked.Exchange(ref _executionClaimed, 0);
         CompleteOperationCore();
         OnCompleted(completionError);
         return true;
