@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 namespace System.Threading
 {
@@ -166,10 +167,10 @@ namespace System.Threading
                 // to make multiple issuer threads distinguishable in a debugger/process list.
                 public readonly int Index;
 
-                // This ring's handle, or IntPtr.Zero if unavailable/disabled. Assigned at most once, by
+                // This ring's handle. Assigned at most once, by
                 // this ring's own dedicated issuer thread, before that thread signals readiness back to
                 // the static constructor - see the static constructor's doc comment.
-                public IntPtr RingHandle;
+                public SafeRingHandle RingHandle = null!;
 
                 // Issuer-owned count of requests taken from PendingSubmissions whose CQEs have not
                 // been reaped. Managed callbacks need not finish before the issuer can park.
@@ -275,7 +276,7 @@ namespace System.Threading
                                 // Naming another pthread opens /proc; naming ourselves still
                                 // works when initialization is failing from descriptor exhaustion.
                                 Thread.CurrentThread.Name = $".NET IoUring Issuer #{ring.Index}";
-                                created = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, flags: 0, out IntPtr ringHandle) == 0;
+                                created = Interop.Sys.IoRingCreate(QueueDepth, QueueDepth, singleIssuer: 1, flags: 0, out SafeRingHandle ringHandle) == 0;
                                 ring.RingHandle = ringHandle;
                                 if (created)
                                 {
@@ -314,13 +315,9 @@ namespace System.Threading
                                 run = committed && created;
                             }
 
-                            if (!run && ring.RingHandle != IntPtr.Zero)
+                            if (!run)
                             {
-                                if (Interop.Sys.IoRingClose(ring.RingHandle) != 0)
-                                {
-                                    Environment.FailFast($"io_uring initialization cleanup failed: {Marshal.GetLastPInvokeError()}.");
-                                }
-                                ring.RingHandle = IntPtr.Zero;
+                                ring.RingHandle?.Dispose();
                             }
 
                             lock (initializationLock)

@@ -7,14 +7,13 @@
 namespace System.Threading
 {
     [System.CLSCompliantAttribute(false)]
-    public sealed partial class IoRingBoundHandle : System.IDisposable, System.Threading.IThreadPoolWorkItem
+    public sealed partial class IoRingBoundHandle : System.IDisposable
     {
         internal IoRingBoundHandle() { }
         public void Dispose() { }
         public bool DisposeAndWait() { throw null; }
         public void EnqueueForSubmission(System.Threading.IoUringOperation operation, System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken)) { }
         public bool IsOperationSupported(byte opcode) { throw null; }
-        void System.Threading.IThreadPoolWorkItem.Execute() { }
     }
     [System.CLSCompliantAttribute(false)]
     public static partial class IoUring
@@ -58,7 +57,7 @@ namespace System.Threading
         protected abstract void OnNext(T result);
     }
     [System.CLSCompliantAttribute(false)]
-    public abstract partial class IoUringOperation : System.Threading.IThreadPoolWorkItem
+    public abstract partial class IoUringOperation
     {
         protected IoUringOperation() { }
         protected bool IsCancellationRequested { get { throw null; } }
@@ -68,7 +67,6 @@ namespace System.Threading
         protected abstract System.Threading.IoUringRequest PrepareRequest();
         protected abstract System.Threading.IoUringCompletionAction ProcessCompletion(in System.Threading.IoUringCompletion completion);
         public void RequestCancellation() { }
-        void System.Threading.IThreadPoolWorkItem.Execute() { }
         protected System.Buffers.IMemoryOwner<byte>? TakeBuffer() { throw null; }
     }
     public enum IoUringOperationKind

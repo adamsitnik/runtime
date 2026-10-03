@@ -65,5 +65,6 @@ public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
     /// <exception cref="PlatformNotSupportedException">io_uring is unavailable.</exception>
     public bool DisposeAndWait() => DisposeAndWaitCore();
 
+    // Work-item dispatch is an implementation detail, omitted from the reference assembly.
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
 }

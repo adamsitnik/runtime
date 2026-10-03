@@ -355,12 +355,9 @@ public abstract partial class IoUringOperation
     private void ExecuteCore()
     {
         Thread currentThread = Thread.CurrentThread;
-        if (!currentThread.IsThreadPoolThread)
-        {
-            throw new InvalidOperationException(SR.InvalidOperation_IoUringThreadPoolRequired);
-        }
-        // The public work-item interface can be queued more than once. Only one worker
-        // may drain published completions; invoking it early must not fabricate a CQE.
+        Debug.Assert(currentThread.IsThreadPoolThread);
+        // A replacement worker can start during the handoff below. Only one worker
+        // may drain published completions.
         if (Interlocked.CompareExchange(ref _executionClaimed, 1, 0) != 0)
         {
             return;

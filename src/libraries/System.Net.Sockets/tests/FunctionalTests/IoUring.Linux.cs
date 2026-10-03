@@ -356,6 +356,104 @@ namespace System.Net.Sockets.Tests
             }, options).Dispose();
         }
 
+        [ConditionalTheory(nameof(IsSupported))]
+        [InlineData(0, false)]
+        [InlineData(0, true)]
+        [InlineData(1, false)]
+        [InlineData(1, true)]
+        public void RingHandle_ReleasesNativeRing(int flags, bool finalize)
+        {
+            RemoteExecutor.Invoke((flagsText, finalizeText) =>
+            {
+                Assert.True(IoUring.IsSupported);
+                int initialCount = CountNativeRings();
+                Assert.True(initialCount > 0);
+                Type interop = typeof(object).Assembly.GetType("Interop+Sys", throwOnError: true)!;
+                System.Reflection.MethodInfo create = interop.GetMethod(
+                    "IoRingCreate", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+                int creationFlags = int.Parse(flagsText);
+                if (bool.Parse(finalizeText))
+                {
+                    WeakReference reference = CreateUnrootedRing(create, creationFlags);
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    Assert.False(reference.IsAlive);
+                }
+                else
+                {
+                    using SafeHandle handle = CreateNativeRing(create, creationFlags);
+                    Assert.False(handle.IsInvalid);
+                    Assert.Equal(initialCount + 1, CountNativeRings());
+                    bool addedRef = false;
+                    try
+                    {
+                        handle.DangerousAddRef(ref addedRef);
+                        handle.Dispose();
+                        Assert.Equal(initialCount + 1, CountNativeRings());
+                    }
+                    finally
+                    {
+                        if (addedRef)
+                        {
+                            handle.DangerousRelease();
+                        }
+                    }
+                    Assert.True(handle.IsClosed);
+                    handle.Dispose();
+                    System.Reflection.MethodInfo probe = interop.GetMethod(
+                        "IoRingIsOpcodeSupported", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+                    System.Reflection.TargetInvocationException error = Assert.Throws<System.Reflection.TargetInvocationException>(
+                        () => probe.Invoke(null, [handle, 0]));
+                    Assert.IsType<ObjectDisposedException>(error.InnerException);
+                }
+                Assert.Equal(initialCount, CountNativeRings());
+
+                [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+                static WeakReference CreateUnrootedRing(System.Reflection.MethodInfo create, int flags) =>
+                    new WeakReference(CreateNativeRing(create, flags));
+            }, flags.ToString(), finalize.ToString(), CreateOptions(1)).Dispose();
+        }
+
+        [ConditionalFact(nameof(IsSupported))]
+        public void RingHandle_FailedCreationReturnsInvalidSafeHandle()
+        {
+            RemoteExecutor.Invoke(() =>
+            {
+                Assert.True(IoUring.IsSupported);
+                int initialCount = CountNativeRings();
+                System.Reflection.MethodInfo create = typeof(object).Assembly.GetType("Interop+Sys", throwOnError: true)!
+                    .GetMethod("IoRingCreate", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+                object?[] arguments = [16, 16, 0, int.MaxValue, null];
+                Assert.Equal(-1, create.Invoke(null, arguments));
+                using SafeHandle handle = Assert.IsAssignableFrom<SafeHandle>(arguments[4]);
+                Assert.True(handle.IsInvalid);
+                handle.Dispose();
+                Assert.True(handle.IsClosed);
+                Assert.Equal(initialCount, CountNativeRings());
+            }, CreateOptions(1)).Dispose();
+        }
+
+        private static SafeHandle CreateNativeRing(System.Reflection.MethodInfo create, int flags)
+        {
+            object?[] arguments = [16, 16, 0, flags, null];
+            Assert.Equal(0, create.Invoke(null, arguments));
+            return Assert.IsAssignableFrom<SafeHandle>(arguments[4]);
+        }
+
+        private static int CountNativeRings()
+        {
+            int count = 0;
+            foreach (string descriptor in Directory.EnumerateFiles("/proc/self/fd"))
+            {
+                if (new FileInfo(descriptor).LinkTarget == "anon_inode:[io_uring]")
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
         [ConditionalFact(nameof(IsSupported))]
         public void Initialization_DoesNotFlowCallerExecutionContext()
         {
@@ -3207,7 +3305,7 @@ namespace System.Net.Sockets.Tests
         }
 
         [ConditionalFact(nameof(IsSupported))]
-        public void LiveOperation_PublicExecuteCannotDispatchOrReleaseNativeResources()
+        public void LiveOperation_PreservesPinsUntilCompletionCallbackReturns()
         {
             RemoteExecutor.Invoke(async () =>
             {
@@ -3243,13 +3341,6 @@ namespace System.Net.Sockets.Tests
                     binding.EnqueueForSubmission(operation);
                     try
                     {
-                        await Task.Factory.StartNew(() =>
-                        {
-                            Assert.False(Thread.CurrentThread.IsThreadPoolThread);
-                            Assert.Throws<InvalidOperationException>(() => ((IThreadPoolWorkItem)operation).Execute());
-                        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)
-                            .WaitAsync(TestSettings.PassingTestTimeout);
-                        await InvokeConcurrently();
                         Assert.Equal(0, Volatile.Read(ref processed));
                         Assert.False(completed.Task.IsCompleted);
                         Assert.Equal(1, memory.PinCount);
@@ -3257,7 +3348,6 @@ namespace System.Net.Sockets.Tests
 
                         Assert.Equal(1, sender.Send(new byte[] { 42 }));
                         Assert.True(entered.Wait(TestSettings.PassingTestTimeout));
-                        await InvokeConcurrently();
                         Assert.Equal(1, Volatile.Read(ref processed));
                         Assert.Equal(1, Volatile.Read(ref activeCallbacks));
                         Assert.False(completed.Task.IsCompleted);
@@ -3272,16 +3362,6 @@ namespace System.Net.Sockets.Tests
                     Assert.Equal(0, activeCallbacks);
                     Assert.Equal(1, memory.PinCount);
                     Assert.Equal(1, memory.UnpinCount);
-
-                    Task InvokeConcurrently()
-                    {
-                        Task[] invocations = new Task[16];
-                        for (int i = 0; i < invocations.Length; i++)
-                        {
-                            invocations[i] = Task.Run(() => ((IThreadPoolWorkItem)operation).Execute());
-                        }
-                        return Task.WhenAll(invocations).WaitAsync(TestSettings.PassingTestTimeout);
-                    }
                 }
             }, CreateOptions(1)).Dispose();
         }

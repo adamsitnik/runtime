@@ -129,9 +129,6 @@
   <data name="Arg_IoUringZeroCopySendFlags" xml:space="preserve">
     <value>Use a zero-copy send operation instead of MSG_ZEROCOPY so that buffer-release notifications are tracked.</value>
   </data>
-  <data name="InvalidOperation_IoUringThreadPoolRequired" xml:space="preserve">
-    <value>io_uring completion work items must be executed by the ThreadPool.</value>
-  </data>
   <data name="InvalidOperation_IoUringCompletionAction" xml:space="preserve">
     <value>The completion action is incompatible with the native request lifetime. Continue requires more native completions; resubmission requires the terminal completion.</value>
   </data>

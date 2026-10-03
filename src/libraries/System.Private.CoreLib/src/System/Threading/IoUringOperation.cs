@@ -7,7 +7,7 @@ namespace System.Threading;
 /// <remarks>
 /// An instance supports one logical operation at a time. The runtime retains request resources until
 /// native completion and performs logical cleanup before invoking <see cref="OnCompleted"/>.
-/// Completion callbacks run on ThreadPool workers and must not invoke the work-item interface directly.
+/// Completion callbacks run on ThreadPool workers. Only the runtime may dispatch completion processing.
 /// </remarks>
 [CLSCompliant(false)]
 public abstract partial class IoUringOperation : IThreadPoolWorkItem
@@ -85,5 +85,6 @@ public abstract partial class IoUringOperation : IThreadPoolWorkItem
     /// <exception cref="InvalidOperationException">The caller is outside the completion callback or already took the buffer.</exception>
     protected System.Buffers.IMemoryOwner<byte>? TakeBuffer() => TakeBufferCore();
 
+    // Work-item dispatch is an implementation detail, omitted from the reference assembly.
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
 }

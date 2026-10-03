@@ -3,6 +3,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 internal static partial class Interop
 {
@@ -172,38 +173,38 @@ internal static partial class Interop
         // IoRingWaitForCompletions calls with nothing to submit; any other thread's call fails with
         // -EEXIST. Pass 0 for a plain ring that can be freely shared/rotated across threads instead.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingCreate", SetLastError = true)]
-        internal static partial int IoRingCreate(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, int flags, out IntPtr ringHandle);
+        internal static partial int IoRingCreate(int submissionQueueDepth, int completionQueueDepth, int singleIssuer, int flags, out SafeRingHandle ringHandle);
 
         internal const int IoRingCreateCqe32 = 1;
 
         // Cached kernel opcode support, safe to query from any thread while the ring is kept alive.
         // Not a guarantee for all flags or permission to bypass Native-path validation.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingIsOpcodeSupported", SetLastError = true)]
-        internal static partial int IoRingIsOpcodeSupported(IntPtr ringHandle, int opcode);
+        internal static partial int IoRingIsOpcodeSupported(SafeRingHandle ringHandle, int opcode);
 
         // Validate the immutable staging copy before enqueueing, on any thread. Does not probe the kernel.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingValidateSubmission", SetLastError = true)]
         internal static partial int IoRingValidateSubmission(in IoRingSubmission submission);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingSubmit", SetLastError = true)]
-        internal static unsafe partial int IoRingSubmit(IntPtr ringHandle, IoRingRequest* requests, int requestCount, out int submittedCount);
+        internal static unsafe partial int IoRingSubmit(SafeRingHandle ringHandle, IoRingRequest* requests, int requestCount, out int submittedCount);
 
         // Creates an eventfd and registers it with the ring (IORING_REGISTER_EVENTFD): the kernel then
         // bumps its counter whenever a CQE is posted. The returned fd is also safe for any other thread
         // to write to directly via EventFdWrite, piggybacking its own wake-up onto the same fd a single
         // waiter is blocked on in EventFdWait - see PortableThreadPool.IoUring.Unix.cs.
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterEventFd", SetLastError = true)]
-        internal static partial int IoRingRegisterEventFd(IntPtr ringHandle);
+        internal static partial int IoRingRegisterEventFd(SafeRingHandle ringHandle);
 
         // Allocates bufferCount page-aligned buffers of bufferSize bytes each, natively owned by
         // (and freed together with) the ring, registers them as provided-buffer group zero, and
         // publishes all of them. On success, *bufferStorage points at the base of that storage
         // (buffer i occupies [bufferStorage + i * bufferSize, bufferStorage + (i + 1) * bufferSize)).
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingRegisterBufferRing", SetLastError = true)]
-        internal static unsafe partial int IoRingRegisterBufferRing(IntPtr ringHandle, int bufferSize, int bufferCount, byte** bufferStorage);
+        internal static unsafe partial int IoRingRegisterBufferRing(SafeRingHandle ringHandle, int bufferSize, int bufferCount, byte** bufferStorage);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingReturnBuffers", SetLastError = true)]
-        internal static unsafe partial int IoRingReturnBuffers(IntPtr ringHandle, ushort* bufferIds, int count);
+        internal static unsafe partial int IoRingReturnBuffers(SafeRingHandle ringHandle, ushort* bufferIds, int count);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_EventFdWrite", SetLastError = true)]
         internal static partial int EventFdWrite(int eventFd);
@@ -215,9 +216,6 @@ internal static partial class Interop
         internal static partial int EventFdWait(int eventFd, int timeoutMilliseconds);
 
         [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingWaitForCompletions", SetLastError = true)]
-        internal static unsafe partial int IoRingWaitForCompletions(IntPtr ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, out int completedCount);
-
-        [LibraryImport(Libraries.SystemNative, EntryPoint = "SystemNative_IoRingClose", SetLastError = true)]
-        internal static partial int IoRingClose(IntPtr ringHandle);
+        internal static unsafe partial int IoRingWaitForCompletions(SafeRingHandle ringHandle, IoRingCompletion* completions, int maxCompletions, int minComplete, out int completedCount);
     }
 }

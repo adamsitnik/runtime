@@ -2629,6 +2629,9 @@
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.IoRing.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'">
       <Link>Common\Interop\Unix\System.Native\Interop.IoRing.cs</Link>
     </Compile>
+    <Compile Include="$(CommonPath)Microsoft\Win32\SafeHandles\SafeRingHandle.cs" Condition="'$(TargetOS)' == 'linux' and '$(FeaturePortableThreadPool)' == 'true'">
+      <Link>Common\Microsoft\Win32\SafeHandles\SafeRingHandle.cs</Link>
+    </Compile>
     <Compile Include="$(CommonPath)Interop\Unix\System.Native\Interop.ReadDir.cs">
       <Link>Common\Interop\Unix\System.Native\Interop.ReadDir.cs</Link>
     </Compile>
