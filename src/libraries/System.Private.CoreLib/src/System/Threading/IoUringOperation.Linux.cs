@@ -346,10 +346,10 @@ public abstract partial class IoUringOperation
     internal void EnqueueFromIssuer(in Interop.Sys.IoRingCompletion completion)
     {
         Debug.Assert(_pending is not null);
+        // Enqueue publishes the new item through the queue's own producer/consumer fences (see
+        // Segment._state); no separate ready counter is needed, and draining can rely on the
+        // queue's own batched-refresh fast path (see ExecuteOrdered) instead of an item-by-item one.
         _pending.Enqueue(new IoUringCompletion(completion.Result, completion.Flags, completion.Extra1, completion.Extra2));
-        // Enqueue may expose a new segment before updating its producer tail. Only expose a
-        // consumable completion after that update, so terminal callbacks can safely change issuers.
-        Interlocked.Increment(ref _completionReady);
         if (Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) == 0)
         {
             ThreadPool.UnsafeQueueUserWorkItem(this, preferLocal: false);
@@ -361,22 +361,18 @@ public abstract partial class IoUringOperation
         Thread currentThread = Thread.CurrentThread;
         Debug.Assert(currentThread.IsThreadPoolThread);
 
+        if (RequiresOrderedDelivery)
+        {
+            ExecuteOrdered(currentThread);
+            return;
+        }
+
         while (true)
         {
-            while (Volatile.Read(ref _completionReady) != 0)
+            if (Volatile.Read(ref _completionReady) != 0)
             {
-                IoUringCompletion completion;
-                if (RequiresOrderedDelivery)
-                {
-                    Debug.Assert(_pending is not null);
-                    bool dequeued = _pending.TryDequeue(out completion);
-                    Debug.Assert(dequeued);
-                }
-                else
-                {
-                    completion = _completion;
-                }
-                Interlocked.Decrement(ref _completionReady);
+                IoUringCompletion completion = _completion;
+                Volatile.Write(ref _completionReady, 0);
                 if (Process(completion))
                 {
                     // Final notification may already have reused this instance on a different ring.
@@ -390,6 +386,35 @@ public abstract partial class IoUringOperation
             Interlocked.Exchange(ref _dispatchRequested, 0);
             if (Volatile.Read(ref _completionReady) == 0 ||
                 Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) != 0)
+            {
+                return;
+            }
+        }
+    }
+
+    // Drains the queue directly via its own TryDequeue/IsEmpty, matching the drain idiom the
+    // specialized multishot-receive type used before this generic base class replaced it: a
+    // burst of completions queued ahead of this worker is consumed through the queue's cheap
+    // same-segment fast path, instead of forcing one producer/consumer handshake per item.
+    private void ExecuteOrdered(Thread currentThread)
+    {
+        Debug.Assert(_pending is not null);
+        while (true)
+        {
+            while (_pending.TryDequeue(out IoUringCompletion completion))
+            {
+                if (Process(completion))
+                {
+                    // Final notification may already have reused this instance on a different ring.
+                    return;
+                }
+                ExecutionContext.ResetThreadPoolThread(currentThread);
+                currentThread.ResetThreadPoolThread();
+            }
+            // Relinquish dispatch before rechecking: an issuer racing this handoff either
+            // queues another worker or leaves a completion for this worker to reclaim.
+            Interlocked.Exchange(ref _dispatchRequested, 0);
+            if (_pending.IsEmpty || Interlocked.CompareExchange(ref _dispatchRequested, 1, 0) != 0)
             {
                 return;
             }
