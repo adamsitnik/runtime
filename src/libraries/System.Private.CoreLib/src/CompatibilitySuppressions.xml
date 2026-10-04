@@ -29,4 +29,21 @@
     <DiagnosticId>CP0008</DiagnosticId>
     <Target>T:System.Collections.BitArray</Target>
   </Suppression>
+  <!-- IThreadPoolWorkItem is an implementation detail of io_uring dispatch, not a public contract. -->
+  <Suppression>
+    <DiagnosticId>CP0008</DiagnosticId>
+    <Target>T:System.Threading.IoRingBoundHandle</Target>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0008</DiagnosticId>
+    <Target>T:System.Threading.IoUringBufferOperation</Target>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0008</DiagnosticId>
+    <Target>T:System.Threading.IoUringMultishotOperation`1</Target>
+  </Suppression>
+  <Suppression>
+    <DiagnosticId>CP0008</DiagnosticId>
+    <Target>T:System.Threading.IoUringOperation</Target>
+  </Suppression>
 </Suppressions>

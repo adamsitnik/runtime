@@ -15,6 +15,30 @@ namespace System.Threading;
 [CLSCompliant(false)]
 public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
 {
+    /// <summary>Determines whether the kernel supports a native opcode on this binding's ring.</summary>
+    /// <param name="opcode">The Linux io_uring opcode.</param>
+    /// <returns><see langword="true"/> if the kernel supports the opcode; otherwise, <see langword="false"/>.</returns>
+    /// <remarks>
+    /// External operations may require opcodes newer than the runtime's minimum kernel version.
+    /// This does not validate operation flags or authorize opcodes that violate the runtime's ownership protocol.
+    /// Returns <see langword="false"/> on platforms without io_uring support.
+    /// </remarks>
+    /// <exception cref="ObjectDisposedException">The binding is disposed.</exception>
+    public bool IsOperationSupported(byte opcode)
+    {
+#if FEATURE_IO_URING
+        ObjectDisposedException.ThrowIf(IsDisposed, this);
+        int result = Interop.Sys.IoRingIsOpcodeSupported(_ring.RingHandle, opcode);
+        if (result < 0)
+        {
+            throw Interop.GetExceptionForIoErrno(Interop.Sys.GetLastErrorInfo());
+        }
+        return result != 0;
+#else
+        return false;
+#endif
+    }
+
     /// <summary>Enqueues an operation for submission by this handle's issuer.</summary>
     /// <param name="operation">The operation whose buffers remain valid through terminal completion.</param>
     /// <param name="cancellationToken">The token that requests cancellation of this logical operation.</param>
@@ -41,5 +65,6 @@ public sealed partial class IoRingBoundHandle : IDisposable, IThreadPoolWorkItem
     /// <exception cref="PlatformNotSupportedException">io_uring is unavailable.</exception>
     public bool DisposeAndWait() => DisposeAndWaitCore();
 
+    // Work-item dispatch is an implementation detail, omitted from the reference assembly.
     void IThreadPoolWorkItem.Execute() => ExecuteCore();
 }

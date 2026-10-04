@@ -209,6 +209,7 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(IsLinuxPlatform)' == 'true'">
+    <Compile Include="System\Net\Sockets\IoUringMultishotReceiveOperation.Linux.cs" />
     <Compile Include="System\Net\Sockets\SafeSocketHandle.Linux.cs" />
     <Compile Include="System\Net\Sockets\Socket.Multishot.Linux.cs" />
     <Compile Include="System\Net\Sockets\SocketAsyncContext.Linux.cs" />
